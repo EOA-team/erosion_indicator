@@ -11,7 +11,7 @@ import calendar
 import matplotlib.pyplot as plt
 import contextily as ctx
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, RandomizedSearchCV
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -19,6 +19,8 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.cluster import KMeans
+import warnings
+warnings.filterwarnings("ignore")
 
 # Check if data exists already
 # If not then call the function to prepare the data
@@ -253,7 +255,7 @@ def make_model(model_type="rf"):
                 n_estimators=300,
                 max_depth=None,
                 min_samples_leaf=2,
-                n_jobs=-1,
+                n_jobs=1,
                 random_state=42
             ))
         ])
@@ -263,10 +265,10 @@ def make_model(model_type="rf"):
         pipeline = Pipeline([
             ('scaler', StandardScaler()),
             ('model', MLPRegressor(
-                hidden_layer_sizes=(128, 64, 32),
+                hidden_layer_sizes=(64, 64, 32),
                 activation='relu',
                 learning_rate_init=0.001,
-                max_iter=1000,
+                max_iter=500,
                 early_stopping=True,
                 random_state=42
             ))
@@ -445,7 +447,7 @@ def split_stations(gdf, station_col, x_col, y_col, frac_train, frac_val, grid_si
     return gdf
 
 
-def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_file):
+def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_file, param_dist=None):
 
     # Split stations for train/val/test
     gdf_labeled = split_stations(gdf_labeled, 'station_abbr', 'station_coordinates_lv95_east', 'station_coordinates_lv95_north', 0.7, 0.15)
@@ -476,44 +478,51 @@ def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_fil
     groups_train = train_df['station_abbr'].values # Split according to station name
 
     pipeline = make_model(model_type)
-
     gkf = GroupKFold(n_splits=5)
 
-    rmse_scores = []
-    r2_scores = []
-    for fold, (train_idx, val_idx) in enumerate(
-            gkf.split(X_train, y_train, groups_train), 1): 
+    if param_dist is not None:
+        # Randomized hyperparameter tuning with spatial CV
+        gkf = GroupKFold(n_splits=5)
+        search = RandomizedSearchCV( # will update hyperparameters in pipeline
+            pipeline,
+            param_distributions=param_dist,
+            n_iter=20,
+            cv=gkf,
+            scoring="neg_root_mean_squared_error", # or cumsum rmse wrapped in make_scorer
+            n_jobs=8,
+            verbose=3
+        ) # refit is True by default, meaning that model is retrained with best estimators found
+        search.fit(X_train, y_train, groups=groups_train)
+        pipeline_to_use = search.best_estimator_
+        print("Best hyperparameters:", search.best_params_)
+    else:
+        # Train with Kfold CV
+        rmse_scores, r2_scores = [], []
+        for fold, (train_idx, val_idx) in enumerate(
+                gkf.split(X_train, y_train, groups_train), 1): 
 
-        print(f"Fold {fold}")
+            X_tr, X_val_fold = X_train[train_idx], X_train[val_idx]
+            y_tr, y_val_fold = y_train[train_idx], y_train[val_idx]
 
-        X_tr, X_val = X_train[train_idx], X_train[val_idx]
-        y_tr, y_val = y_train[train_idx], y_train[val_idx]
+            pipeline.fit(X_tr, y_tr)
+            y_pred = pipeline.predict(X_val_fold)
 
-        pipeline.fit(X_tr, y_tr)
-        y_pred = pipeline.predict(X_val)
+            if pred_col == 'EI_daily_cumsum':
+                y_pred = np.clip(y_pred, 0, 100)
 
-        if pred_col == 'EI_daily_cumsum':
-            y_pred = np.clip(y_pred, 0, 100)
-
-        rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-        r2 = r2_score(y_val, y_pred)
-        rmse_scores.append(rmse)
-        r2_scores.append(r2)
-        print(f"  RMSE: {rmse:.3f}, R²: {r2:.3f}")
-
-    # Print cross-validation results
-    print("\n===== Cross-Validation Results =====")
-    print(f"Mean RMSE: {np.mean(rmse_scores):.3f}")
-    print(f"Std RMSE:  {np.std(rmse_scores):.3f}")
-    print(f"Mean R²:   {np.mean(r2_scores):.3f}")
-    print(f"Std R²:    {np.std(r2_scores):.3f}")
+            rmse = np.sqrt(mean_squared_error(y_val_fold, y_pred))
+            r2 = r2_score(y_val_fold, y_pred)
+            rmse_scores.append(rmse)
+            r2_scores.append(r2)
+            print(f"Fold {fold}  RMSE: {rmse_scores[-1]:.3f}, R²: {r2_scores[-1]:.3f}")
+        
+        print(f"Mean RMSE: {np.mean(rmse_scores):.3f}, Mean R²: {np.mean(r2_scores):.3f}")
+        pipeline_to_use = pipeline
 
     # Evaluate on val stations
-    val_df = df_data[df_data['station_abbr'].isin(val_stations)]
     X_val = val_df[data_vars].values
     y_val = val_df[pred_col].values
-
-    y_val_pred = pipeline.predict(X_val)
+    y_val_pred = pipeline_to_use.predict(X_val)
     if pred_col == 'EI_daily_cumsum':
         y_val_pred = np.clip(y_val_pred, 0, 100)
 
@@ -522,13 +531,13 @@ def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_fil
     print(f"\nValidation set RMSE: {rmse_val:.3f}, R²: {r2_val:.3f}")
 
     # Train final model
-    print("\nTraining final model on the full training set...")
-    pipeline = make_model(model_type)
-    pipeline.fit(X_train, y_train)
-    joblib.dump(pipeline, model_file)
+    if param_dist is None:
+        print("\nTraining final model on the full training set...")
+        pipeline_to_use.fit(X_train, y_train)  # train default pipeline
+    joblib.dump(pipeline_to_use, model_file)
     print(f"Final model saved as {model_file}")
 
-    return pipeline
+    return pipeline_to_use
 
 
 def EI_to_cumul(df):
@@ -737,6 +746,16 @@ def predict_test_set(df_data, gdf_labeled, data_vars, pred_col, model_file):
 
     # Add predictions to the test DataFrame
     test_df['predicted_' + pred_col] = y_test_pred
+
+    # Evaluate the model: on the cumsum (easier to compare models)
+    test_rmse = np.sqrt(mean_squared_error(test_df[pred_col], test_df['predicted_' + pred_col]))
+    test_mae = mean_absolute_error(test_df[pred_col],test_df['predicted_' + pred_col])
+    test_r2 = r2_score(test_df[pred_col], test_df['predicted_' + pred_col])
+    print("\n===== Test Set Results =====")
+    print(f"Test RMSE: {test_rmse:.3f}")
+    print(f"Test MAE: {test_mae:.3f}")
+    print(f"Test NRMSE: {test_rmse / (test_df[pred_col].max() - test_df[pred_col].min()):.3f}")
+    print(f"Test R²:   {test_r2:.3f}")
     
     if pred_col != 'EI_daily_cumsum': # Cumulate to daily cumulative percent
         test_df = EI_to_cumul(test_df)
@@ -951,7 +970,7 @@ def main():
     model_file = f"models/{MODEL_TYPE}_{MODEL_SUFFIX}_model.joblib"
     if not os.path.exists(model_file):
         print("\nTraining model...")
-        pipeline = train_model(df_data, gdf_labeled, DATA_VARS, PRED_COL, MODEL_TYPE, model_file)
+        pipeline = train_model(df_data, gdf_labeled, DATA_VARS, PRED_COL, MODEL_TYPE, model_file, PARAM_DIST)
         # Evaluate on the test set
         predict_test_set(df_data, gdf_labeled, DATA_VARS, PRED_COL, model_file)
     else:
@@ -960,6 +979,7 @@ def main():
         # Evaluate on the test set
         predict_test_set(df_data, gdf_labeled, DATA_VARS, PRED_COL, model_file)
 
+    """
     # Check if NN under of overfitting
     if MODEL_TYPE == 'nn':
         model = pipeline.named_steps["model"]
@@ -970,6 +990,7 @@ def main():
         plt.title("NN Training Loss")
         plt.savefig(f'results/NN_training_{MODEL_SUFFIX}.png')
         plt.close()
+    """
 
     """
     # Inference: all grid cells
@@ -999,14 +1020,36 @@ if __name__ == "__main__":
     COVARIATES_DIR = 'covariates'
     DEM_FILE_PATTERN = 'dem'
     DATA_VARS = ['prec_daily_avg', 'prec_monthly_avg', 'elev', 'slope', 'aspect', 'doy', 'prec_daily_fraction'] 
-    PRED_COL = 'EI_daily_percent' #'EI_daily_avg' #'EI_daily_cumsum' # 
+    PRED_COL = 'EI_daily_avg' #'EI_daily_percent' #'EI_daily_cumsum' # 
     MODEL_TYPE = "nn"  # Options: "rf", "nn", "gpr
     if PRED_COL == 'EI_daily_avg':
-        MODEL_SUFFIX = "absEI_large" # model will be named f"{MODEL_TYPE}_{MODEL_SUFFIX}_model.joblib"
+        MODEL_SUFFIX = "absEI_tune" # model will be named f"{MODEL_TYPE}_{MODEL_SUFFIX}_model.joblib"
     elif PRED_COL == 'EI_daily_cumsum':
         MODEL_SUFFIX = "cumEI"
     else:
-        MODEL_SUFFIX = "percent_large"
+        MODEL_SUFFIX = "percent_tune"
+    TUNE = True
+
+    PARAM_DIST = None
+    if TUNE:
+        # Random Forest
+        param_dist_rf = {
+            'model__n_estimators': [100, 200, 300, 500],
+            'model__max_depth': [None, 10, 20, 30],
+            'model__min_samples_leaf': [1, 2, 4]
+        }
+
+        # Neural Network
+        param_dist_nn = {
+            'model__hidden_layer_sizes': [(64,32,32), (64,64,32), (128,64,32), (128,128,64)],
+            'model__learning_rate_init': [0.001, 0.005, 0.01],
+            'model__max_iter': [500, 1000]
+        }
+        
+        if MODEL_TYPE=='nn':
+            PARAM_DIST = param_dist_nn
+        else:
+            PARAM_DIST = param_dist_rf
 
     main()
 
