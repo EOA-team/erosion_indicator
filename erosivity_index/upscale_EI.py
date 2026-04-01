@@ -21,17 +21,14 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.cluster import KMeans
 import warnings
 warnings.filterwarnings("ignore")
+import optuna
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+from functools import reduce
+import operator
+import seaborn as sns
 
-# Check if data exists already
-# If not then call the function to prepare the data
-# - load the data (100m grids)
-# - comput additional variables (monthly mean precip, daily means)
-# - assign station location (intersection with 100m grids)
-# - save to csv: each grid has covariates and if applicable, an EI daily -> so different rows are different times. Maybe also encode time?
-
-# Train GPR
-# - take rows where there is labeled dat
-# -split into train/test/validation
 
 def load_stations_metadata(metadata_path):
     """Load station metadata."""
@@ -447,7 +444,64 @@ def split_stations(gdf, station_col, x_col, y_col, frac_train, frac_val, grid_si
     return gdf
 
 
-def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_file, param_dist=None):
+def objective(trial):
+    """
+    Objective function for Optuna hyperparameter tuning.
+
+    Parameters:
+    ----------
+    trial : optuna.trial.Trial
+        A single trial of hyperparameter combinations.
+
+    Returns:
+    -------
+    float
+        The evaluation metric (e.g., RMSE) to minimize.
+    """
+    # Define the hyperparameter search space
+    if MODEL_TYPE == "rf":
+        n_estimators = trial.suggest_int("n_estimators", 100, 500)
+        max_depth = trial.suggest_int("max_depth", 10, 50)
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10)
+        pipeline = make_model("rf")
+        pipeline.set_params(model__n_estimators=n_estimators,
+                            model__max_depth=max_depth,
+                            model__min_samples_leaf=min_samples_leaf)
+    elif MODEL_TYPE == "nn":
+        n_layers = trial.suggest_int("n_layers", 1, 3)
+        layer_sizes = []
+        for i in range(n_layers):
+            layer_size = trial.suggest_int(f"n_units_l{i}", 16, 256, log=True)
+            layer_sizes.append(layer_size)
+        hidden_layer_sizes = tuple(layer_sizes)
+        learning_rate_init = trial.suggest_float("learning_rate_init", 0.0001, 0.01, log=True)
+        max_iter = trial.suggest_int("max_iter", 500, 2000)
+        pipeline = make_model("nn")
+        pipeline.set_params(model__hidden_layer_sizes=hidden_layer_sizes,
+                            model__learning_rate_init=learning_rate_init,
+                            model__max_iter=max_iter)
+    else:
+        raise ValueError("Unsupported model type")
+
+    # Perform GroupKFold cross-validation
+    gkf = GroupKFold(n_splits=5)
+    rmse_scores = []
+    for train_idx, val_idx in gkf.split(X_train, y_train, groups_train):
+        X_tr, X_val = X_train[train_idx], X_train[val_idx]
+        y_tr, y_val = y_train[train_idx], y_train[val_idx]
+
+        pipeline.fit(X_tr, y_tr)
+        y_pred = pipeline.predict(X_val)
+
+        # Compute RMSE
+        rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+        rmse_scores.append(rmse)
+
+    # Return the mean RMSE across folds
+    return np.mean(rmse_scores)
+
+
+def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_file, tune=False):
 
     # Split stations for train/val/test
     gdf_labeled = split_stations(gdf_labeled, 'station_abbr', 'station_coordinates_lv95_east', 'station_coordinates_lv95_north', 0.7, 0.15)
@@ -469,60 +523,48 @@ def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_fil
     train_df = df_data[df_data['station_abbr'].isin(train_stations)]
     val_df = df_data[df_data['station_abbr'].isin(val_stations)]
 
-    # Combine train and validation data for k-fold cross-validation
-    combined_df = pd.concat([train_df, val_df], ignore_index=True)
-
-    # K fold CV: use only train
+    # Prepare data for training
+    global X_train, y_train, groups_train
     X_train = train_df[data_vars].values
     y_train = train_df[pred_col].values
-    groups_train = train_df['station_abbr'].values # Split according to station name
+    groups_train = train_df['station_abbr'].values
 
-    pipeline = make_model(model_type)
-    gkf = GroupKFold(n_splits=5)
+    if tune:
+        # Run Optuna study, wit Kfold CV that return mean fold RMSE 
+        print("\nRunning Optuna hyperparameter tuning...")
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=20)
 
-    if param_dist is not None:
-        # Randomized hyperparameter tuning with spatial CV
-        gkf = GroupKFold(n_splits=5)
-        search = RandomizedSearchCV( # will update hyperparameters in pipeline
-            pipeline,
-            param_distributions=param_dist,
-            n_iter=20,
-            cv=gkf,
-            scoring="neg_root_mean_squared_error", # or cumsum rmse wrapped in make_scorer
-            n_jobs=8,
-            verbose=3
-        ) # refit is True by default, meaning that model is retrained with best estimators found
-        search.fit(X_train, y_train, groups=groups_train)
-        pipeline_to_use = search.best_estimator_
-        print("Best hyperparameters:", search.best_params_)
-    else:
-        # Train with Kfold CV
-        rmse_scores, r2_scores = [], []
-        for fold, (train_idx, val_idx) in enumerate(
-                gkf.split(X_train, y_train, groups_train), 1): 
+        # Print the best hyperparameters
+        best_params = study.best_params
+        # Format to work with model
+        if "n_layers" in best_params:
+            n_layers = best_params.pop("n_layers")
+            layer_sizes = []
+            for i in range(n_layers):
+                layer_size = best_params.pop(f"n_units_l{i}")
+                layer_sizes.append(layer_size)
+            best_params["hidden_layer_sizes"] = tuple(layer_sizes)
+        print("\nBest hyperparameters:")
+        print(best_params)
 
-            X_tr, X_val_fold = X_train[train_idx], X_train[val_idx]
-            y_tr, y_val_fold = y_train[train_idx], y_train[val_idx]
-
-            pipeline.fit(X_tr, y_tr)
-            y_pred = pipeline.predict(X_val_fold)
-
-            if pred_col == 'EI_daily_cumsum':
-                y_pred = np.clip(y_pred, 0, 100)
-
-            rmse = np.sqrt(mean_squared_error(y_val_fold, y_pred))
-            r2 = r2_score(y_val_fold, y_pred)
-            rmse_scores.append(rmse)
-            r2_scores.append(r2)
-            print(f"Fold {fold}  RMSE: {rmse_scores[-1]:.3f}, R²: {r2_scores[-1]:.3f}")
+        # Train the final model on the full training set
+        print("\nTraining final model on the full training set...")
+        pipeline = make_model(model_type)
+        pipeline.set_params(**{f"model__{key}": value for key, value in best_params.items()})
         
-        print(f"Mean RMSE: {np.mean(rmse_scores):.3f}, Mean R²: {np.mean(r2_scores):.3f}")
-        pipeline_to_use = pipeline
+    else:
+        # Train with default hyperparameters
+        print("\nTraining with default hyperparameters...")
+        pipeline = make_model(model_type)
+
+    # Train final model
+    pipeline.fit(X_train, y_train)
 
     # Evaluate on val stations
     X_val = val_df[data_vars].values
     y_val = val_df[pred_col].values
-    y_val_pred = pipeline_to_use.predict(X_val)
+    y_val_pred = pipeline.predict(X_val)
     if pred_col == 'EI_daily_cumsum':
         y_val_pred = np.clip(y_val_pred, 0, 100)
 
@@ -530,14 +572,11 @@ def train_model(df_data, gdf_labeled, data_vars, pred_col, model_type, model_fil
     r2_val = r2_score(y_val, y_val_pred)
     print(f"\nValidation set RMSE: {rmse_val:.3f}, R²: {r2_val:.3f}")
 
-    # Train final model
-    if param_dist is None:
-        print("\nTraining final model on the full training set...")
-        pipeline_to_use.fit(X_train, y_train)  # train default pipeline
-    joblib.dump(pipeline_to_use, model_file)
+    # Save the trained model
+    joblib.dump(pipeline, model_file)
     print(f"Final model saved as {model_file}")
 
-    return pipeline_to_use
+    return pipeline
 
 
 def EI_to_cumul(df):
@@ -779,12 +818,12 @@ def predict_test_set(df_data, gdf_labeled, data_vars, pred_col, model_file):
     print("Std  NSE:", summary["std_NSE"])
 
     # Plot curves
-    plot_predictions(test_df, 'EI_daily_cumsum', f'results/predicted_test_{os.path.basename(model_file).split(".joblib")[0]}.png', num_stations=len(test_stations), random_seed=42)
+    plot_test_predictions(test_df, 'EI_daily_cumsum', f'results/predicted_test_{os.path.basename(model_file).split(".joblib")[0]}.png', num_stations=len(test_stations), random_seed=42)
 
     return test_df
 
 
-def plot_predictions(df, pred_col, save_path, num_stations=10, random_seed=42):
+def plot_test_predictions(df, pred_col, save_path, num_stations=10, random_seed=42):
     """
     Plot predictions for a random sample of stations on the same plot.
 
@@ -876,21 +915,30 @@ def prepare_full_grid(cov_files, data_vars, dem_file_pattern):
     return dem_gdf
 
 
-def predict_per_grid_cell(dem_gdf, pipeline, data_vars, pred_col, output_file):
+def predict_per_grid_cell(dem_gdf, pipeline, data_vars, pred_col, output_file, chunk_size=5000):
 
     # For a single grid cell: extract df with rows containing features for daily EI prediction
     static_cols = [c for c in data_vars if c in {'elev', 'aspect', 'slope'}]
+    daily_cols = [c for c in dem_gdf.columns if c.startswith("daily_avg_precip_")]
+    monthly_cols = [c for c in dem_gdf.columns if c.startswith("monthly_avg_precip_")]
 
-    predictions = []
+
     total_cells = len(dem_gdf)
-    for idx, row in dem_gdf.iterrows():
-        print(f"Predicting cell {idx}/{total_cells}")
-        single_cell = pd.DataFrame([row])
+    n_chunks = (total_cells + chunk_size - 1) // chunk_size
+    print(f"\nPredicting {total_cells} grid cells in {n_chunks} chunks of {chunk_size}...")
 
+    #all_predictions = []
+    writer = None  # parquet writer
+    for chunk_idx in range(n_chunks):
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size, total_cells)
+        print(f"Processing chunk {chunk_idx + 1}/{n_chunks}...")
+
+        chunk_gdf = dem_gdf.iloc[start:end]
+        
         # --- DAILY features ---
-        daily_cols = [c for c in single_cell.columns if c.startswith("daily_avg_precip_")]
         if len(daily_cols) > 0:
-            df_daily = single_cell.melt(
+            df_daily = chunk_gdf.melt(
                 id_vars=['x', 'y'] + static_cols,
                 value_vars=daily_cols,
                 var_name='doy',
@@ -902,9 +950,8 @@ def predict_per_grid_cell(dem_gdf, pipeline, data_vars, pred_col, output_file):
             df_daily = pd.DataFrame()
 
         # --- MONTHLY features ---
-        monthly_cols = [c for c in single_cell.columns if c.startswith("monthly_avg_precip_")]
         if len(monthly_cols) > 0:
-            df_monthly = single_cell.melt(
+            df_monthly = chunk_gdf.melt(
                 id_vars=['x', 'y'] + static_cols,
                 value_vars=monthly_cols,
                 var_name='monthnbr',
@@ -928,16 +975,58 @@ def predict_per_grid_cell(dem_gdf, pipeline, data_vars, pred_col, output_file):
         else:
             raise ValueError("No daily or monthly precipitation columns found.")
 
-        X = df_features[data_vars].values
-        cell_predictions = pipeline.predict(X)
+        # Add derived features
+        if 'aspect' in df_features.columns:
+            df_features["aspect_sin"] = np.sin(np.deg2rad(df_features["aspect"]))
+            df_features["aspect_cos"] = np.cos(np.deg2rad(df_features["aspect"]))
+        if 'doy' in df_features.columns:
+            df_features['sin_doy'] = np.sin(2 * np.pi * df_features['doy'] / 365)
+            df_features['cos_doy'] = np.cos(2 * np.pi * df_features['doy'] / 365)
+        if 'prec_daily_fraction' in data_vars and 'prec_daily_avg' in df_features.columns:
+            # Group by grid cell (x, y) for fraction computation
+            df_features["prec_daily_fraction"] = (
+                df_features["prec_daily_avg"] /
+                df_features.groupby(["x", "y"])["prec_daily_avg"].transform("sum")
+            )
+        
+        # Update feature list safely
+        vars_local = data_vars.copy()
+        if 'aspect' in vars_local:
+            vars_local.remove('aspect')
+            vars_local.extend(['aspect_sin', 'aspect_cos'])
+        if 'doy' in vars_local:
+            vars_local.remove('doy')
+            vars_local.extend(['sin_doy', 'cos_doy'])
+        
+        X = df_features[vars_local].values
+        chunk_predictions = pipeline.predict(X)
         if pred_col == 'EI_daily_cumsum': # Clip predictions if necessary
-            cell_predictions = np.clip(cell_predictions, 0, 100)
-        df_features['predicted_' + pred_col] = cell_predictions
-        predictions.append(df_features)
+            chunk_predictions = np.clip(chunk_predictions, 0, 100)
+        df_features['predicted_' + pred_col] = chunk_predictions
+
+        # --- Write chunk to parquet ---
+        table = pa.Table.from_pandas(df_features)
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_file,
+                table.schema
+            )
+        writer.write_table(table)
+
+        # free memory
+        del df_features, table
+        
+        """
+        all_predictions.append(df_features)
     
     
-    predictions_df = pd.concat(predictions, ignore_index=True)
-    predictions_df.to_csv(output_file, index=False)
+    predictions_df = pd.concat(all_predictions, ignore_index=True)
+    print(len(predictions_df))
+    #predictions_df.to_csv(output_file, index=False)
+    predictions_df.to_parquet(output_file, index=False, engine='pyarrow')
+    """
+    if writer:
+        writer.close()
     print(f"Predictions saved to {output_file}")
 
     return 
@@ -956,56 +1045,39 @@ def main():
 
     # Extract features for grid cells containing stations
     gdf_labeled = prepare_grid_labeled(stations, cov_files, DATA_VARS, DEM_FILE_PATTERN)
-
-    # Prepare data for training: per row there is 1 EI daily for 1 grid cell + features
-    df_data = prepare_training_data(gdf_labeled, DATA_VARS, ei_station_dict, PRED_COL)
-    if 'aspect' in DATA_VARS:
-        DATA_VARS.remove('aspect')
-        DATA_VARS.extend(['aspect_sin', 'aspect_cos'])
-    if 'doy' in DATA_VARS:
-        DATA_VARS.remove('doy')
-        DATA_VARS.extend(['sin_doy', 'cos_doy'])
    
     # Train model
     model_file = f"models/{MODEL_TYPE}_{MODEL_SUFFIX}_model.joblib"
     if not os.path.exists(model_file):
+        # Prepare data for training: per row there is 1 EI daily for 1 grid cell + features
+        df_data = prepare_training_data(gdf_labeled, DATA_VARS, ei_station_dict, PRED_COL)
+        if 'aspect' in DATA_VARS:
+            DATA_VARS.remove('aspect')
+            DATA_VARS.extend(['aspect_sin', 'aspect_cos'])
+        if 'doy' in DATA_VARS:
+            DATA_VARS.remove('doy')
+            DATA_VARS.extend(['sin_doy', 'cos_doy'])
+
         print("\nTraining model...")
-        pipeline = train_model(df_data, gdf_labeled, DATA_VARS, PRED_COL, MODEL_TYPE, model_file, PARAM_DIST)
+        pipeline = train_model(df_data, gdf_labeled, DATA_VARS, PRED_COL, MODEL_TYPE, model_file, TUNE)
         # Evaluate on the test set
         predict_test_set(df_data, gdf_labeled, DATA_VARS, PRED_COL, model_file)
-    else:
-        print(f"\nModel already trained. Loading from {model_file}...")
+
+
+    # Inference on whole grid
+    if not os.path.exists(SAVE_PATH):
+        print("\nPerforming inference for all grid cells...")
+
+        # Prepare or load data for the whole grid
+        if not os.path.exists('covariates/data_grid.pkl'):
+            gdf_grid = prepare_full_grid(cov_files, DATA_VARS, DEM_FILE_PATTERN)
+            gdf_grid.to_pickle('covariates/data_grid.pkl')
+        else:
+            gdf_grid = pd.read_pickle('covariates/data_grid.pkl')
+        
+        # Run model
         pipeline = joblib.load(model_file)
-        # Evaluate on the test set
-        predict_test_set(df_data, gdf_labeled, DATA_VARS, PRED_COL, model_file)
-
-    """
-    # Check if NN under of overfitting
-    if MODEL_TYPE == 'nn':
-        model = pipeline.named_steps["model"]
-        plt.figure(figsize=(6,4))   # ← create new figur
-        plt.plot(model.loss_curve_)
-        plt.xlabel("Iteration")
-        plt.ylabel("Loss")
-        plt.title("NN Training Loss")
-        plt.savefig(f'results/NN_training_{MODEL_SUFFIX}.png')
-        plt.close()
-    """
-
-    """
-    # Inference: all grid cells
-    print("\nPerforming inference for all grid cells...")
-    if not os.path.exists('covariates/data_grid.pkl'):
-        gdf_grid = prepare_full_grid(cov_files, DATA_VARS, DEM_FILE_PATTERN)
-        gdf_grid.to_pickle('covariates/data_grid.pkl')
-    else:
-        gdf_grid = pd.read_pickle('covariates/data_grid.pkl')
-
-    # Loop over grid cells to predict -> too big to load all at once
-    output_file = f'grid_{PRED_COL}_pred.csv'
-    predict_per_grid_cell(gdf_grid, pipeline, DATA_VARS, PRED_COL, output_file)
-    """
-    
+        predict_per_grid_cell(gdf_grid, pipeline, DATA_VARS, PRED_COL, SAVE_PATH)
 
 
 
@@ -1021,35 +1093,16 @@ if __name__ == "__main__":
     DEM_FILE_PATTERN = 'dem'
     DATA_VARS = ['prec_daily_avg', 'prec_monthly_avg', 'elev', 'slope', 'aspect', 'doy', 'prec_daily_fraction'] 
     PRED_COL = 'EI_daily_avg' #'EI_daily_percent' #'EI_daily_cumsum' # 
-    MODEL_TYPE = "nn"  # Options: "rf", "nn", "gpr
+    MODEL_TYPE = "rf"  # Options: "rf", "nn", "gpr
     if PRED_COL == 'EI_daily_avg':
-        MODEL_SUFFIX = "absEI_tune" # model will be named f"{MODEL_TYPE}_{MODEL_SUFFIX}_model.joblib"
+        MODEL_SUFFIX = "absEI_tuned" # model will be named f"{MODEL_TYPE}_{MODEL_SUFFIX}_model.joblib"
     elif PRED_COL == 'EI_daily_cumsum':
         MODEL_SUFFIX = "cumEI"
     else:
-        MODEL_SUFFIX = "percent_tune"
+        MODEL_SUFFIX = "percent_tuned"
+    
     TUNE = True
-
-    PARAM_DIST = None
-    if TUNE:
-        # Random Forest
-        param_dist_rf = {
-            'model__n_estimators': [100, 200, 300, 500],
-            'model__max_depth': [None, 10, 20, 30],
-            'model__min_samples_leaf': [1, 2, 4]
-        }
-
-        # Neural Network
-        param_dist_nn = {
-            'model__hidden_layer_sizes': [(64,32,32), (64,64,32), (128,64,32), (128,128,64)],
-            'model__learning_rate_init': [0.001, 0.005, 0.01],
-            'model__max_iter': [500, 1000]
-        }
-        
-        if MODEL_TYPE=='nn':
-            PARAM_DIST = param_dist_nn
-        else:
-            PARAM_DIST = param_dist_rf
+    SAVE_PATH = f'grid_{PRED_COL}_pred.parquet'
 
     main()
 
