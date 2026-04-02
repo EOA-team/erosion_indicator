@@ -41,7 +41,9 @@ if not os.path.exists(dem_grid_path):
     ds["height"] = ds["height"].where(ds["height"] < thresh)
     ds_100m = ds.interp(x=x, y=y, method="linear")
     highest_point_CH = 4634
-    ds_100m["height"] = ds_100m["height"].where(ds_100m["height"] < highest_point_CH) 
+    ds_100m["height"] = ds_100m["height"].where(
+        (ds_100m["height"] < highest_point_CH) & (ds_100m["height"] != 0) # Ensure 0 is written as nan
+    )
     ds_100m.to_zarr(dem_grid_path)
     print('Saved to', dem_grid_path)
 
@@ -50,8 +52,8 @@ if not os.path.exists(dem_grid_path):
 ds_dem = xr.open_zarr(dem_grid_path)
 
 dem = ds_dem['height']
-slope = xdem.terrain.slope(dem.values, resolution=out_res)
-aspect = xdem.terrain.aspect(dem)
+slope = xdem.terrain.slope(dem.values, resolution=out_res) #degrees
+aspect = xdem.terrain.aspect(dem) #degrees
 ds_dem['slope'] = (('y','x'), slope)
 ds_dem['aspect'] = (('y','x'), aspect)
 
@@ -60,3 +62,4 @@ ds_dem['aspect'].rio.to_raster('aspect_100m.tif')
 ds_dem['height'].rio.to_raster('dem_100m.tif')
 ds_dem.to_zarr(dem_grid_path, mode="a")
 print('Added slope/aspect to', dem_grid_path)
+
