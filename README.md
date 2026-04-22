@@ -1,162 +1,387 @@
-# Spectral unmixing
+# Soil Erosion Monitoring for Switzerland
+
+A remote sensing and machine learning pipeline for estimating soil erosion risk across Switzerland using Sentinel-2 imagery. The project derives key components of the **RUSLE** (Revised Universal Soil Loss Equation) — the **C-factor** (cover management) via spectral unmixing and the rainfall erosivity via station-based modelling — and analyses their spatial and temporal drivers at the municipal scale.
+
+For more detail, refer to the following documentation:
+
+> Ledain S., Gilgen A., Aasen H. (2026) "Prediction and monitoring of fractional cover of arable land from Sentinel-2." *Under review.*
+
+Or contact Anina Gilgen (anina.gilgen@agroscope.admin.ch) and Helge Aasen (helge.aasen@agroscope.admin.ch)
 
 
-## 1. Baresoil composite classification
+---
 
-Different soil groups (in terms of spectral properties) are determine using K-means clustering. The bare soil composite from the [DLR soilsuite](https://geoservice.dlr.de/web/datasets/soilsuite_eur_5y) is used. 
+## Overview
 
-In `baresoil/soilsuite.py` the following steps are performed:
-1. Download data
-    - The bare soil composite is downloaded for Switzerland
-2. Sample points
-    - The data is resampled to 10m resolution from 20m
-    - 250k points that fall within Swiss borders and where MASK is 1 (presence of baresoil) are sampled
-3. Cluster the samples
-    - The samples are then clustered using their bands
-    - Different numbers of clusters are tested, using silhouette score and elbow method to look at optimal cluster size
-4. The final Kmeans model is fitted and the soil groups are plotted
-    - We determined 5 groups to be enough to seperate the reflectectances and also discussed with soil scientists
-    - Plot of the clustered data: `baresoil/plots/sampled_pts_5_clusters_agri_v2.png`
-5. For each group, the 25/50/75th percentiles are determined
-    - Plot of the summarised spectra per soil group: `baresoil/plots/soil_endmembers_5_clusters_agri_v2.png`
-
-The soil clusters were then renamed:
 ```
+Sentinel-2 imagery
+        │
+        ▼
+  Spectral Unmixing  ──────────────►  Cover Fractions (PV / NPV / Soil)
+  (SVR / RF / NN)                              │
+        ▲                                      ├──► C-factor (SLR)
+        │                                      │
+  Synthetic mixtures                           └──► FC maps (weekly, municipal)
+  (soil + PV + NPV endmembers)                         │
+                                                       ▼
+                                             Driver Analysis
+                                         (climate, crop type, topography)
+
+MeteoSwiss rain-gauge stations
+        │
+        ▼
+  Erosivity Index (EI30)  ──────►  Daily rainfall erosivity grids (100 m, Switzerland)
+```
+
+---
+
+## Repository Structure
+
+```
+.
+├── baresoil/               # Soil group classification from bare soil composites
+├── pv_npv_members/         # PV and NPV spectral endmember sampling
+├── spectral_mixing/        # Synthetic spectral mixture generation
+├── spectral_unmixing/      # Model training, tuning, validation, inference
+├── FC_mapping/             # Nationwide FC prediction and aggregation
+├── erosivity_index/        # Rainfall erosivity (R-factor) from station data
+├── cfactor/                # C-factor / Soil Loss Ratio computation
+├── driver_analysis/        # Statistical and ML analysis of FC drivers (incomplete)
+├── timeseries_cleaning/    # GPR-based timeseries gapfilling
+└── requirements.txt
+```
+
+---
+
+## Pipeline
+
+Sections 1–4 develop the Fractional Cover (FC) models. Section 5 applies them across Switzerland to create FC products. Sections 6 derives the rainfall erosivity and Section 7 combines it with FC to produce the C-factor. Section 8 examines what drives FC spatially and temporally (incomplete). Section 9 describes the timeseries cleaning utilities.
+
+---
+
+### 1. Soil Group Classification (`baresoil/`)
+
+Bare soil spectra across Switzerland are clustered into 5 groups to capture variation in soil optical properties. These groups drive the soil-specific spectral unmixing models in step 4.
+
+**Script**: `baresoil/soilsuite.py`
+
+Steps:
+1. Download the [DLR SoilSuite](https://geoservice.dlr.de/web/datasets/soilsuite_eur_5y) bare soil composite for Switzerland
+2. Resample to 10 m resolution (from 20 m); sample 250k points within Swiss borders where `MASK == 1` (bare soil present) AND falling in agricultural areas
+3. Cluster using K-means; optimal cluster count determined via silhouette score, elbow method, and input from soil scientists — **5 groups** were selected
+4. Fit final K-means; the 25/50/75th percentile spectra per group serve as soil endmembers
+
+The cluster labels were remapped for interpretability:
+```python
 label_map = {0: 5, 1: 2, 2: 4, 3: 1, 4: 3}
 ```
-and the updated plots can be found in the following plots: `baresoil/plots/sampled_pts_5_clusters_agri_v2_renamed.png`, `baresoil/plots/soil_endmembers_5_clusters_agri_v2_renamed.png`
 
-### Description of soil groups
-- Soil clusters 4 and 5 are bright soils, 1 and 2 are darker soils and cluster 3 is a medium brightness soil
-- Cluster 1 are the darkest soils, primarily found in the plateau where SOC is high and otherwise found in alpine valleys
-- Cluster 2 are medium dark soils found in the plateau, the jura and alpine valleys. They have moderate SOC in the plateau and low-moderate SOC in the jura and alpine valleys. 
-- Cluster 3 are medium bright soils with low-moderate SOC and moderate-high silt contents
-- Cluster 4 are bright soils with low SOC, mainly in the plateau and in the jura range. They have moderate clay contents
-- Cluster 5 represents the brightest soils, mainly in the plateau and characterized by low SOC and low-moderate clay contents
+| Cluster | Description |
+|---------|-------------|
+| 1 | Darkest soils — plateau/alpine valleys, high SOC |
+| 2 | Medium-dark — plateau, Jura, alpine valleys, moderate SOC |
+| 3 | Medium brightness — low-moderate SOC, moderate-high silt |
+| 4 | Bright — low SOC, mainly plateau/Jura, moderate clay |
+| 5 | Brightest — low SOC, low-moderate clay, plateau |
 
+**Outputs**:
+- `baresoil/models/kmeans_5_clusters_agri_v2.pkl` — fitted K-means model
+- `baresoil/plots/soil_endmembers_5_clusters_agri_v2_renamed.png` — endmember spectra per group
+- `baresoil/plots/sampled_pts_5_clusters_agri_v2_renamed.png` — spatial distribution
+- `baresoil/summarised_soil_samples_renamed.pkl` — percentile spectra per group
 
-All soils will be classified to these groups. 
+**Additional scripts**:
+- `baresoil/create_qgis_layers.py` — shapefiles of predicted soil groups for QGIS visualisation
+- `baresoil/predict_SRC_soilgroup.py` — apply K-means to all SRC data
 
-### Additional scripts
-- `create_qgis_layers.py`: create shapefiles containing predicted soil groups for each sampled point
-- `predict_SRC_soilgroup.py`: apply K-means mode to all SRC data and save
-
-
-
-## 2. PV and NPV endmembers
-
-Different PV (photosynthetic vegetation) and NPV (non photosynthetic vegetation) are also sampled.
-
-In `pv_npv_members/sample_endmembers.py`
-- For each year between 2021 and 2023, we identified the top 15 crops types according to pixel count
-- We know the classification of each pixel thanks to crop maps (`pv_npv_members/crop_maps`) and we use the classification determined in `~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20250217.xlsx` (column "categories2024"). The crop type is thus a crop name or crop group.
-- 10k locations are sampled per crop type and year (saved in `pv_npv_members/sampled_coords`)
-- For each location, the yearly S2 data is extracted
-  - After data cleaning (missing data, clouds, snow...), we sample PV and NPV spectra if possible
-  - For PV it's when NDVI is max and SWIR ratio is min
-  - For NPV it's when NDVI and SWIR ratio are min. Additionally this must be between Jun. 1st and Nov. 15th
-- The spectra at these two moments are saved as examples of PV and NPV spectra (`pv_npv_members/pv_spectra_v2.pkl`, `pv_npv_members/npv_spectra_v2.pkl`)
-- For each crop type and year, the PV and NPV spectra are summarised according to the 25/50/75th percentiles (`pv_npv_members/summarised_npv_samples_pername.pkl`, `pv_npv_members/summarised_pv_samples_pername.pkl`)
-
-The summarised spectra will serve as endmembers for generating training data for a spectral unmixing model.
-These can be visualised in the plots `pv_npv_members/plots/pv_npv_summary_per_cropname_*.png` and `pv_npv_members/plots/pv_npv_samples_locations_per_crop.png`
-
-
-## 3. Spectral mixing
-
-Following the methodology in [Locher et al. (2025)](https://www.sciencedirect.com/science/article/pii/S0034425724006205?via%3Dihub#s0040):
-
-We created 1000 synthetic mixtures for each cover fraction based on the spectral library. Each synthetic mixture comprised two to three endmembers from the three cover fractions randomly sampled from the library. These were then linearly combined with random fractions assigned to each endmember class, ensuring the fractions always sum up to 1. The resulting synthetic spectrum was then added to the training dataset, with the six spectral bands as input variables and the share of the target cover fraction as the label. Additionally, we included a shade spectrum in the synthetic mixtures to represent direct and structural shade components (Shimabukuro and Smith, 1991). The shade endmember, with a near-zero reflectance of 0.01 across all bands, was treated like any other endmember during the mixing step but was not considered as target fraction.
-The pure endmemberes were also added to each dataset, and for the soil-specific datasets only the relevant soils were included.
-
-The mixing is done by providing paths to the soil, PV and NPV endmembers to the following script
+```bash
+python baresoil/soilsuite.py
 ```
+
+---
+
+### 2. PV and NPV Endmember Sampling (`pv_npv_members/`)
+
+Photosynthetic (PV) and non-photosynthetic (NPV) vegetation spectra are sampled from Sentinel-2 time series, stratified by crop type and year (2021–2023).
+
+**Script**: `pv_npv_members/sample_endmembers.py`
+
+Steps:
+- For each year 2021–2023, identify the top 15 crop types by pixel count using Swiss crop maps (`pv_npv_members/crop_maps/`) and the LNF classification (`LNF_code_classification_20251031.xlsx`)
+- Sample 10 000 locations per crop type and year (coordinates saved in `pv_npv_members/sampled_coords/`)
+- For each location, extract the full-year Sentinel-2 time series (after cloud/snow/shadow cleaning)
+- **PV sample**: spectrum at NDVI maximum and minimum SWIR ratio
+- **NPV sample**: spectrum at NDVI and SWIR ratio minimum, constrained to June 1 – November 15
+- For each crop type and year, summarise spectra as 25/50/75th percentiles
+
+**Outputs**:
+- `pv_npv_members/pv_spectra_v2.pkl`, `pv_npv_members/npv_spectra_v2.pkl` — raw sampled spectra
+- `pv_npv_members/summarised_pv_samples_pername.pkl`, `summarised_npv_samples_pername.pkl` — percentile endmembers per crop type
+- `pv_npv_members/plots/pv_npv_summary_per_cropname_*.png` — endmember visualisations
+- `pv_npv_members/plots/pv_npv_samples_locations_per_crop.png` — sampling locations
+
+```bash
+python pv_npv_members/sample_endmembers.py
+```
+
+---
+
+### 3. Synthetic Spectral Mixture Generation (`spectral_mixing/`)
+
+Synthetic training datasets are generated by linearly mixing endmembers from the spectral library, following the methodology of [Locher et al. (2025)](https://www.sciencedirect.com/science/article/pii/S0034425724006205).
+
+**Script**: `spectral_mixing/mix_spectra_composition.py`
+
+- 10 000 synthetic two- or three-component mixtures per cover fraction, per soil group, per iteration (×5 iterations)
+- Endmembers randomly sampled from the library; fractions assigned randomly, always summing to 1
+- A shade endmember (near-zero reflectance = 0.01 across all bands) is included as a mixing component but not as a prediction target
+- Pure endmembers are also added to each dataset; soil-specific datasets include only the relevant soil group
+- **Features**: 10 Sentinel-2 spectral bands; **Labels**: PV / NPV / Soil fractions
+
+Datasets are named:
+```
+SYNTHMIX_SOIL-00{soil_group}_SHADOW-TRUE_FEATURES_CLASS-00{class}_ITERATION-00{i}.txt
+SYNTHMIX_SOIL-00{soil_group}_SHADOW-TRUE_RESPONSE_CLASS-00{class}_ITERATION-00{i}.txt
+```
+where soil group `0` = global model, `1–5` = soil-specific; class `1`=NPV, `2`=PV, `3`=Soil.
+
+Saved to `spectral_mixing/synthetic_samples_composition_10k/`.
+
+```bash
 python spectral_mixing/mix_spectra_composition.py
 ```
 
-The synthetic mixtures (pairs of features/labels) are stored in the following way:
-```
-feat_filename = f'synthetic_samples_composition_10k/SYNTHMIX_SOIL-00{soil_group_nbr}_SHADOW-TRUE_FEATURES_CLASS-00{feature_class}_ITERATION-00{i}.txt'
-resp_filename = f'synthetic_samples_composition_10k/SYNTHMIX_SOIL-00{soil_group_nbr}_SHADOW-TRUE_RESPONSE_CLASS-00{feature_class}_ITERATION-00{i}.txt'
-```
+---
 
-where 0 means the global model, and the soil groups determined from the K-means clustering  are named 1 to 5. There are 3 feature classes (1=NPV, 2=PV, 3=Soil). Each dataset contains 10'000 mixtures, and these datasets are iterated 5 times.
+### 4. Spectral Unmixing — Model Training & Validation (`spectral_unmixing/`)
 
-The resonse contains the fractions of NPV, PV, Soil and shadow. 
+One model is trained per cover class (NPV / PV / Soil) × soil group (0=global, 1–5) × iteration (×5). Predictions are always reported as the mean over the 5 iterations.
 
+**Models tested**: SVR, Random Forest, Neural Network -> NN were found to be best
+**Hyperparameter tuning**: Optuna
 
-## 4. Spectral unmixing
-
-For each class (1=NPV, 2=PV, 3=Soil), each soil group (0=global, soil specific named 1-5) and iteration, and individual model is trained on its respective dataset generated above. Predictions and results are always presented as the mean over the 5 iterations.
-
-Three models are tested: SVR, RF, NN. Hyperparameter tuning is performed with Optuna (see script for precise hyperparameter space):
-```
+```bash
+# Tune hyperparameters (results saved per model/class/soil group)
 python spectral_unmixing/code/tune.py
-```
-Tuning scores for each model-class-soilgroup (averaged already over the iterations) are saved in `spectral_unmixing/results/{MODELTYPE}_tuning_{CLASSNAME}_soilgroup{j}.xlsx`.
 
-The best hyperparameters are manually saved in `code/tuned_hyperparameters.csv` and all these models are trained with
-```
+# Train all tuned models from saved hyperparameters
 python spectral_unmixing/code/train_tuned_from_csv.py
 ```
-which will save each model as `spectral_unmixing/models/{MODELTYPE}_CLASS{i}_SOIL{j}_ITER{N}.pkl` and the results (RMSE, R2, MAE) in `spectral_unmixing/results/{MODELTYPE}_CLASS{i}_SOIL{j}.csv`
 
-Plots on the test set (leave-out from train set) are save in `spectral_unmixing/results/test_preds_{MODELTYPE}.png`
+- Tuning scores (averaged over iterations) saved to `spectral_unmixing/results/{MODELTYPE}_tuning_{CLASSNAME}_soilgroup{j}.xlsx`
+- Best hyperparameters manually curated in `spectral_unmixing/code/tuned_hyperparameters.csv`
+- Trained models saved as `spectral_unmixing/models/{MODELTYPE}_CLASS{i}_SOIL{j}_ITER{N}.pkl`
+- Per-model results (RMSE, R², MAE) saved to `spectral_unmixing/results/{MODELTYPE}_CLASS{i}_SOIL{j}.csv`
+- Test-set prediction plots saved to `spectral_unmixing/results/test_preds_{MODELTYPE}.png`
 
-### Validation on drone data
-The FC models were run on high-resolution drone data, where PV fractions were availbale for the drone data and compared to the predictions after upsacling to the same resolution as Sentinel-2:
-```
+#### Validation on drone data
+
+PV fractions derived from high-resolution UAV imagery are compared to model predictions after upscaling to Sentinel-2 resolution.
+
+```bash
 python spectral_unmixing/code/UAV_validation.py
 ```
 
-
-### Validation on farm data
-The models are also evaulated on some georeferenced farm data with field calendars (ZA-AUI data).
-FC timeseries (only basic cloud cleaning done) with images were produced for farms over multiple years.
-
-- `spectral_unmixing/code/validation/za-aui_data.py`:  produces the timeseries and plots for the farms. Saves the results year by year, crop by crop in `spectral_unmixing/results/ZA-AUI/<year>/<crop_name>/<farm_id>/...png`. A visual/qualitative evaluation of the performance of the models based on these plots was done in `spectral_unmixing/code/validation/ZA-AUI_evaluation.xlsx` and these results were synthesised in `spectral_unmixing/code/za-aui.ipynb`
-- `spectral_unmixing/code/validation/za-aui_data_management.py`: produces the plots for a farms where theres was a specific management activity. Results saved to `spectral_unmixing/results/ZA-AUI/NPV_check`
-- `spectral_unmixing/code/validation/za-aui_data_fcprecompute.py`: Same as  `spectral_unmixing/code/za-aui_data.py` except that it uses precomputed FC data instead of running predictions on the fly.
-- `spectral_unmixing/code/validation/za-aui_data_animation.py`: Uses precomputed FC data instead of running predictions on the fly, create specific plot or animation for a single farm
+> [!WARNING]
+> This validation step had issues do to field boundaries in the drone data not being explicit and therefore making FC comparisons harder.
+> This would need to be improved, currently results from this validation were not taken into account.
 
 
+#### Validation on farm data (ZA-AUI)
 
-## 5. Timeseries cleaning
+The models are evaluated against georeferenced farms with known field management calendars (ZA-AUI dataset).
 
-Different timeseries cleaning and gapfilling algorithms were tested, using the ZA-AUI data.
-- `timeseries_cleaning/clean_zaaui.py`: timeseries for the farm data, and its field calendar
-- `timeseries_cleaning/clean_fulltime.py`: timeseries for the farm data, on a single year
+- `spectral_unmixing/code/validation/za-aui_data.py` — produces FC time series and plots per farm/year/crop; basic cloud cleaning only. Results saved to `spectral_unmixing/results/ZA-AUI/<year>/<crop_name>/<farm_id>/`
+- `spectral_unmixing/code/validation/za-aui_data_management.py` — plots for farms with a specific management event; results saved to `spectral_unmixing/results/ZA-AUI/NPV_check/`
+- `spectral_unmixing/code/validation/za-aui_data_fcprecompute.py` — same as above but uses precomputed FC instead of on-the-fly predictions
+- `spectral_unmixing/code/validation/za-aui_data_animation.py` — creates plots/animations for a single farm using precomputed FC
+- Qualitative evaluation summarised in `spectral_unmixing/code/validation/ZA-AUI_evaluation.xlsx` and `spectral_unmixing/code/za-aui.ipynb`
 
-The best pipeline seems to be:
-1. Apply strict cloud cleaning `clean_dataset(ds, cloud_thresh=0.05, snow_thresh=0.1, shadow_thresh=0.1, cirrus_thresh=800)`
-2. Use GPR to gapfill and get uncertainty on a single year of data
-
-To generate a single farm plot (no gapfilling, just timeseries cleaning) use `timeseries_cleaning/generate_plot.py`
-
-
-## 6. FC product
-
-The following steps were followed to obtain weekly municipal mean FC values:
-
-First, predict FC for every available S2 pixel: 
+To create an MP4 animation of FC predictions for any shapefile:
+```bash
+python animation_FC_from_shapefile.py
 ```
-python FC_mapping/predict_FC_CH.py #runs on multi-CPU and needs GPU
-``` 
-Prediction with global model and determined soil group will be saved in zarr files (same naming as Sentinel-2 files) top `~/mnt/eo-nas1/data/satellite/sentinel2/FC'
 
-Then extract valid data points per municipality (in fields, cloud free...), and save to .gpkg for each week. These are saved in yearly folders as `CH_fraction_weekly_{yr}/CH_fraction_{weeknbr}_soil_arable_raw.gpkg`.  The `soil` (vs `global`) in the name means predictions from soil specific models are taken, and `arable` (vs `grassland`) means grassland LNF areas are left out. 
-```
+---
+
+### 5. Nationwide FC Mapping (`FC_mapping/`)
+
+Applies trained models to all available Sentinel-2 scenes over Switzerland. Requires multi-CPU and GPU.
+
+```bash
+# Step 1 – predict FC for every S2 pixel; saved as zarr files
+# (same naming convention as S2 input files)
+python FC_mapping/predict_FC_CH.py
+
+# Step 2 – extract valid in-field, cloud-free data per municipality
+# and save weekly .gpkg files in CH_fraction_weekly_{yr}/
+# File naming: CH_fraction_{weeknbr}_soil_arable_raw.gpkg
+#   'soil'   = predictions from soil-specific models (vs 'global')
+#   'arable' = grassland LNF areas excluded
 python FC_mapping/create_datalayers.py
-```
 
-Finally, to produce specific aggregated plots, use the script. At this step, speicifc LNF codes can be passed to the main fucntion to filter for specific crop(s).
-```
+# Step 3 – aggregate to municipality level and produce plots
+# Optional: pass specific LNF codes to filter for particular crop(s)
 python FC_mapping/aggregate_FC.py
 ```
-This contains several functions:
-- `plot_median_of_pixelmean`: get the weekly mean of each pixel, and aggregate with median over municipality. Consider only if >50% of the arable land of that muncipialtiy is covered by valid data. Results are saved to `CH_fraction_weekly_{yr}/CH_fraction_{weeknbr}_soil_arable_COMMUNE.gpkg` and `CH_fraction_weekly_{yr}/CH_fraction_{weeknbr}_soil_arable_COMMUNE.png`
-- `count_fraction_soil_above_50percent`: get the weekly mean of each pixel. Per municipality count the fraction of pixels in arable land that have FC soil >0.5. Consider only if >50% of the arable land of that muncipialtiy is covered by valid data. Results are saved to CH_fraction_soilthresh_{weeknbr}_COMMUNE.gpkg
-- `avg_baresoil_days`: get the weekly mean of each pixel. Over a year, compute how many days the pixel is bare (ie. FC soil > 0.5). Per municipality compute the average bare soil days. Results are saved to `CH_fraction_weekly_{yr}/CH_baredays_{level.upper()}.gpkg`
 
+Key functions in `aggregate_FC.py`:
 
-Additional functions to create specific plots (including weekly fraction of bare soil per municipality) are provided in the script `report_plots.py`.
+| Function | Description | Output |
+|----------|-------------|--------|
+| `plot_median_of_pixelmean` | Weekly pixel mean → municipal median; requires >50% arable land covered | `CH_fraction_{weeknbr}_soil_arable_COMMUNE.gpkg/.png` |
+| `count_fraction_soil_above_50percent` | Fraction of arable pixels per municipality with FC soil > 0.5 | `CH_fraction_soilthresh_{weeknbr}_COMMUNE.gpkg` |
+| `avg_baresoil_days` | Average annual bare-soil days per municipality (pixel bare if FC soil > 0.5) | `CH_baredays_{level}.gpkg` |
+
+Additional plot functions (weekly bare soil fraction per municipality, etc.) are provided in `FC_mapping/report_plots.py`.
+
+FC predictions are stored as zarr at `~/mnt/eo-nas1/data/satellite/sentinel2/FC/`.  
+Weekly aggregated products are stored in `FC_mapping/CH_fraction_weekly_{yr}/`.
+
+---
+
+### 6. Rainfall Erosivity Index (`erosivity_index/`)
+
+Derives long-term climatological daily rainfall erosivity (EI30) from MeteoSwiss station records and spatially upscales it to a 100 m grid across Switzerland for every day of year (DOY 1–365). The EI30 computation follows the methodology from [Schmidt et al. (2016)](https://hess.copernicus.org/articles/20/4359/2016/hess-20-4359-2016.pdf).
+
+#### Step 1 — Prepare covariate grids: `precipitation_daily_grids.py`
+
+Reprojects and resamples MeteoSwiss gridded climate data (NetCDF, LV95) to 100 m resolution aligned to the Sentinel-2 grid (EPSG:32632), saving one zarr per variable per year to `erosivity_index/covariates/`. Supported variables: daily precipitation (`RhiresD`), daily mean/min/max temperature (`TabsD`, `TminD`, `TmaxD`), relative sunshine duration (`SrelD`).
+
+```bash
+taskset -c 40-45 python erosivity_index/precipitation_daily_grids.py \
+    --year_start 2004 --year_end 2026 \
+    --out_dir covariates/precip --var RhiresD --out_res 100
+```
+
+#### Step 2 — Compute station-level EI30: `compute_EIdaily.py`
+
+Processes 10-minute station CSVs from `stations_data/stations_csv/` through three steps:
+
+1. **`compute_EI30_fast`** — detects rainfall events (separated by ≥ 6 dry hours, minimum event precipitation 12.7 mm), computes unit rainfall energy per 10-minute interval (Brown & Foster 1987) and I30 (max rolling 30-minute intensity, computed per event to avoid boundary bleed), then saves EI30 = E × I30 per event to `stations_data/stations_EI30/`
+2. **`compute_EIdaily_avg`** — distributes each event's EI30 proportionally across the days it spans, then averages over all years to produce a long-term mean EI per DOY (1–365) per station; DOY 366 is merged into DOY 365 to avoid underrepresentation in non-leap years; saved to `stations_data/stations_EIdaily/`
+3. **`compute_EI_daily_percent`** — converts daily averages to fractional and cumulative percentage of annual EI per station, saved to `stations_data/stations_EIdaily_percent/`
+
+```bash
+python erosivity_index/compute_EIdaily.py
+```
+
+#### Step 3 — Spatial upscaling to 100 m grid: `upscale_EI.py`
+
+Trains a Random Forest to predict the long-term daily average EI for every DOY at every 100 m grid cell across Switzerland.
+
+**Target**: `EI_daily_avg` (long-term mean EI per DOY per station, from step 2)
+
+**Features** (all at 100 m, EPSG:32632):
+- Terrain: elevation, slope, aspect (encoded as sin/cos)
+- Daily precipitation climatology (DOY 1–365)
+- Monthly precipitation climatology (avg, min, max)
+- Monthly average temperature
+- DOY (encoded as sin/cos)
+
+**Spatial train/val/test split**: stations assigned to 25 km grid cells; entire cells assigned to one split to prevent spatial autocorrelation leakage (≈70/15/15%)
+
+**Tuning**: Optuna (20 trials), minimising spatially cross-validated RMSE
+
+**Inference**: predictions made for all Swiss 100 m grid cells, one row per (grid cell × DOY); saved in chunks to parquet
+
+```bash
+taskset -c 0-10 python erosivity_index/upscale_EI.py
+```
+
+**Outputs**:
+- `erosivity_index/models/rf_absEI_tuned_model_{date}.joblib` — trained RF model
+- `erosivity_index/grid_EI_daily_avg_pred.parquet` — predicted long-term daily average EI for every 100 m grid cell × DOY (1–365) across Switzerland
+
+---
+
+### 7. C-factor / Soil Loss Ratio (`cfactor/`)
+
+Converts the FC predictions to the Soil Loss Ratio (SLR), which is the core of the RUSLE C-factor.
+
+The SLR formula applied at each pixel and timestamp:
+
+```
+slr = exp(fc_total × β)    β = to calibrate
+fc_total = PV + NPV × 100
+```
+
+- `cfactor/SLR.py` — 
+- `cfactor/calibrate_SLR.py` — 
+
+```bash
+python cfactor/SLR.py
+python cfactor/calibrate_SLR.py
+```
+
+---
+
+### 8. Driver Analysis (`driver_analysis/`) *(incomplete)*
+
+Investigates which factors explain spatial and temporal variation in fractional cover at the municipal scale.
+
+**Script**: `driver_analysis/prepare_data.py` (data preparation) and `driver_analysis/model_fc_drivers.py` (modelling)
+
+**Features used**:
+- Lagged and rolling climate variables up to 12 weeks (temperature `Tabs`, precipitation `Rhires`, sunshine duration `Srel`)
+- Topography: elevation, slope, aspect
+- Current and previous crop type (from LNF classification)
+
+**Models evaluated**: GLM, LASSO, Random Forest, XGBoost, MLP, GWR (Geographically Weighted Regression)  
+**Interpretability**: SHAP values (bar, beeswarm, waterfall plots saved to `driver_analysis/shap_*.png`)
+
+```bash
+python driver_analysis/prepare_data.py
+python driver_analysis/model_fc_drivers.py
+python driver_analysis/spatial_analysis.py   # Moran's I spatial autocorrelation, GWR
+```
+
+---
+
+### 9. Timeseries Cleaning (`timeseries_cleaning/`)
+
+Utilities for cleaning and gapfilling FC timeseries, developed using the ZA-AUI farm data.
+
+**Best pipeline**:
+1. Strict cloud/snow/shadow cleaning: `clean_dataset(ds, cloud_thresh=0.05, snow_thresh=0.1, shadow_thresh=0.1, cirrus_thresh=800)`
+2. Gaussian Process Regression (GPR) for gapfilling and uncertainty estimation on a single-year window
+
+**Scripts**:
+- `timeseries_cleaning/clean_zaaui.py` — timeseries + field calendar for farm data
+- `timeseries_cleaning/clean_fulltime.py` — timeseries for a single year
+- `timeseries_cleaning/generate_plot.py` — produce a single-farm plot (cloud cleaning only, no gapfilling)
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+Core dependencies: `numpy`, `pandas`, `xarray`, `geopandas`, `rasterio`, `scikit-learn`, `torch`, `tensorflow`, `optuna`, `shap`, `dask`, `zarr`, `stackstac`
+
+A GPU is required for `FC_mapping/predict_FC_CH.py`.
+
+---
+
+## Data
+
+| Data | Source | Location |
+|------|--------|----------|
+| Sentinel-2 (L2A) | Planetary Computer / ODC | `~/mnt/eo-nas1/data/satellite/sentinel2/` |
+| FC predictions (zarr) | This pipeline | `~/mnt/eo-nas1/data/satellite/sentinel2/FC/` |
+| DLR SoilSuite bare soil composite | [DLR Geoservice](https://geoservice.dlr.de/web/datasets/soilsuite_eur_5y) | Downloaded by `baresoil/soilsuite.py` |
+| Swiss crop maps (LNF) | swisstopo / cantonal | `pv_npv_members/crop_maps/`; classification in `LNF_code_classification_20251031.xlsx` |
+| MeteoSwiss rain gauges (10 min) | MeteoSwiss | `erosivity_index/stations_data/` |
+| MeteoSwiss station metadata | MeteoSwiss | `erosivity_index/stations_data/metadata/ogd-smn_meta_stations.csv` |
+| SwissBOUNDARIES3D | swisstopo | `FC_mapping/swissBOUNDARIES3D_1_5_LV95_LN02.gpkg` |
+| ZA-AUI farm/field calendar data | ZA-AUI | used in `spectral_unmixing/code/validation/` |
+
+---
+
+## Reference
+
+The spectral unmixing methodology follows:
+
+> Locher et al. (2025). *Remote sensing of fractional cover in heterogeneous agricultural landscapes.* Remote Sensing of Environment. [DOI](https://www.sciencedirect.com/science/article/pii/S0034425724006205)
