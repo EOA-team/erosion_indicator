@@ -1,6 +1,6 @@
 # Soil Erosion Monitoring for Switzerland
 
-A remote sensing and machine learning pipeline for estimating soil erosion risk across Switzerland using Sentinel-2 imagery. The project derives key components of the **RUSLE** (Revised Universal Soil Loss Equation) — the **C-factor** (cover management) via spectral unmixing and the rainfall erosivity via station-based modelling — and analyses their spatial and temporal drivers at the municipal scale.
+A remote sensing and machine learning pipeline for estimating soil erosion risk across Switzerland using Sentinel-2 imagery. The project derives key components of the **RUSLE** (Revised Universal Soil Loss Equation) — the **C-factor** (cover management) —  via satellite-based fractional cover and rainfall erosivity.
 
 For more detail, refer to the following documentation:
 
