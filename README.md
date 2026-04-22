@@ -14,23 +14,27 @@ Or contact Anina Gilgen (anina.gilgen@agroscope.admin.ch) and Helge Aasen (helge
 ## Overview
 
 ```
-Sentinel-2 imagery
+Sentinel-2 imagery              MeteoSwiss rain-gauge stations
+        │                                       │
+        ▼                                       ▼
+  Synthetic mixtures                  Erosivity Index (EI30)
+  (soil+PV+NPV endmembers)                      │
+        │                                       ▼
+        ▼                          Daily rainfall erosivity grids
+  Spectral Unmixing                       (100 m, Switzerland)
+       (NN)                                     │
+        │                                       │
+        ▼                                       │
+  Cover Fractions (PV/NPV/Soil) ───────────────►┘
+        │                                       │
+        ▼                                       ▼
+    FC maps                                  C-factor
+  (weekly, municipal)
         │
         ▼
-  Spectral Unmixing  ──────────────►  Cover Fractions (PV / NPV / Soil)
-  (SVR / RF / NN)                              │
-        ▲                                      ├──► C-factor (SLR)
-        │                                      │
-  Synthetic mixtures                           └──► FC maps (weekly, municipal)
-  (soil + PV + NPV endmembers)                         │
-                                                       ▼
-                                             Driver Analysis
-                                         (climate, crop type, topography)
-
-MeteoSwiss rain-gauge stations
-        │
-        ▼
-  Erosivity Index (EI30)  ──────►  Daily rainfall erosivity grids (100 m, Switzerland)
+   Driver Analysis
+   (climate, crop
+    type, topography)
 ```
 
 ---
@@ -340,7 +344,7 @@ python driver_analysis/spatial_analysis.py   # Moran's I spatial autocorrelation
 
 ### 9. Timeseries Cleaning (`timeseries_cleaning/`)
 
-Utilities for cleaning and gapfilling FC timeseries, developed using the ZA-AUI farm data.
+Utilities for cleaning and gapfilling FC timeseries, developed using the ZA-AUI farm data. This code was used for testing different smoothing and gapfilling options.
 
 **Best pipeline**:
 1. Strict cloud/snow/shadow cleaning: `clean_dataset(ds, cloud_thresh=0.05, snow_thresh=0.1, shadow_thresh=0.1, cirrus_thresh=800)`
