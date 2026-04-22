@@ -17,7 +17,7 @@ Or contact Anina Gilgen (anina.gilgen@agroscope.admin.ch) and Helge Aasen (helge
 Sentinel-2 imagery              MeteoSwiss rain-gauge stations
         │                                       │
         ▼                                       ▼
-  Synthetic mixtures                  Erosivity Index (EI30)
+  Synthetic mixtures                  Erosivity Index (EI daily)
   (soil+PV+NPV endmembers)                      │
         │                                       ▼
         ▼                          Daily rainfall erosivity grids
