@@ -18,7 +18,6 @@ if not os.path.exists(dem_grid_path):
 
     sentinel_grid = "/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp"
     grid = gpd.read_file(sentinel_grid)
-    grid_lv95 = grid.to_crs(2056)
         
     # Define final grid
     minx, miny, maxx, maxy = grid.total_bounds
