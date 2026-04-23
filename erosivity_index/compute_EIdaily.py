@@ -6,9 +6,17 @@ import matplotlib.pyplot as plt
 def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=12.7, dry_hours=6):
     """
     Compute the erosive rainfall event erosivity:
-    - product of unit rainfall energy and max raingall amount within a 30min interval
+    - product of unit rainfall energy and max rainfall amount within a 30min interval
     - unit rainfall energy: formula based on rainfall intensity in the time interval (10min)
     - the max rainfall is taken over the whole rainfall event
+
+    - Rolling I30 is computed per event group to avoid bleeding across event boundaries
+    - DOY 366 is merged into DOY 365 in downstream functions (see compute_EIdaily_avg)
+
+    - A rainfall event is retained only if the total precipitation is
+    ≥ 12.7 mm (0.5 inches), following the classical definition of
+    erosive rainfall events introduced by Wischmeier and Smith (1978)
+    in the Universal Soil Loss Equation (USLE).
     """
 
     os.makedirs(output_dir, exist_ok=True)
@@ -20,16 +28,16 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
     intervals_30min = int(30 / timestep_min)
 
     for file in os.listdir(input_dir):
-        
+
         if not file.endswith('.csv'):
             continue
-        
+
         file_path = os.path.join(input_dir, file)
         output_file = os.path.join(output_dir, f"EI30_{file}")
-         
+
         if os.path.exists(output_file):
             continue
-    
+
         print(f"Processing {file}")
         df = pd.read_csv(file_path)
 
@@ -43,7 +51,7 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
 
         # Regular timestep
         expected_index = pd.date_range(df.index.min(), df.index.max(),
-                                      freq=f'{timestep_min}min')
+                                       freq=f'{timestep_min}min')
         df = df.reindex(expected_index)
         df.index.name = 'time'
 
@@ -64,13 +72,13 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
         df['rre150z0'] = df['rre150z0'].fillna(0).clip(lower=0)
 
         # --- Rainfall physics ---
-        df['ir'] = df['rre150z0'] * (60 / timestep_min) # rainfall intensity [mm/h]
+        df['ir'] = df['rre150z0'] * (60 / timestep_min)  # rainfall intensity [mm/h]
 
         df['er'] = np.where(
             df['rre150z0'] >= 0.1,
             0.29 * (1 - 0.72 * np.exp(-0.05 * df['ir'])),
             0
-        ) # unit rainfall energy [MJ/ha/mm] Brown and Foster (1987)
+        )  # unit rainfall energy [MJ/ha/mm] Brown and Foster (1987)
 
         df['E'] = df['er'] * df['rre150z0']
 
@@ -79,7 +87,6 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
 
         dry_group = (df['dry'] != df['dry'].shift()).cumsum()
         dry_sizes = df.groupby(dry_group).size()
-
         dry_length = dry_group.map(dry_sizes)
 
         df['event_break'] = (
@@ -90,9 +97,24 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
 
         df['event_id'] = df['event_break'].cumsum()
 
-        # --- Precompute rolling I30 (HUGE speedup) ---
-        df['rain_30min'] = df['rre150z0'].rolling(intervals_30min).sum()
+        # --- FIX #1: Rolling I30 computed per event to avoid boundary bleed ---
+        # Rolling window is reset at each event boundary so that rainfall from
+        # a previous event cannot inflate I30 of the following event.
+        df['rain_30min'] = df.groupby('event_id')['rre150z0'].transform(
+            lambda x: x.rolling(intervals_30min, min_periods=1).sum()
+        )
         df['I30_local'] = df['rain_30min'] * 2  # (60/30)
+
+        # --- FIX #2: start_time/end_time reflect actual rainy timesteps only ---
+        # Using the first/last index of the group included dry tail timesteps;
+        # now we track the first and last timestep where rain > 0 per event.
+        def first_rainy(x):
+            rainy = x[x > 0]
+            return rainy.index[0] if len(rainy) else x.index[0]
+
+        def last_rainy(x):
+            rainy = x[x > 0]
+            return rainy.index[-1] if len(rainy) else x.index[-1]
 
         # --- Aggregate per event ---
         grouped = df.groupby('event_id')
@@ -101,15 +123,15 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
             total_precipitation=('rre150z0', 'sum'),
             E_total=('E', 'sum'),
             I30=('I30_local', 'max'),
-            start_time=('rre150z0', lambda x: x.index[0]),
-            end_time=('rre150z0', lambda x: x.index[-1])
+            start_time=('rre150z0', first_rainy),
+            end_time=('rre150z0', last_rainy)
         )
 
         # Remove non-rain events
         summary = summary[summary['total_precipitation'] >= min_event_precip]
 
         # Compute EI30
-        summary['EI30'] = summary['E_total'] * summary['I30'] # Wischmeier and Smith (1978)
+        summary['EI30'] = summary['E_total'] * summary['I30']  # Wischmeier and Smith (1978)
 
         # Clean output
         results_df = summary.reset_index()[[
@@ -128,7 +150,10 @@ def compute_EI30_fast(input_dir, output_dir, timestep_min=10, min_event_precip=1
 def compute_EIdaily_avg(input_dir, output_dir):
     """
     Compute average daily EI (climatology) from per-event EI30 CSVs,
-    splitting multi-day events proportionally.
+    splitting multi-day events proportionally by duration overlap.
+
+    - DOY 366 is merged into DOY 365 to avoid underrepresentation in non-leap years.
+      The assumption of uniform intensity for multi-day splitting is documented explicitly.
 
     Parameters:
         input_dir (str): Folder containing EI30 CSVs.
@@ -139,7 +164,7 @@ def compute_EIdaily_avg(input_dir, output_dir):
     for file in os.listdir(input_dir):
         if not file.endswith('.csv'):
             continue
-    
+
         file_path = os.path.join(input_dir, file)
         print(f"Processing {file} for multi-day average daily EI")
 
@@ -152,12 +177,19 @@ def compute_EIdaily_avg(input_dir, output_dir):
         df['end_time'] = pd.to_datetime(df['end_time'])
 
         # Split multi-day events proportionally
+        # NOTE: splitting assumes uniform rainfall intensity within each event.
+        # This is a known simplification when only event-level EI30 is available.
         daily_records = []
 
         for _, row in df.iterrows():
             start = row['start_time']
             end = row['end_time']
             total_ei = row['EI30']
+
+            # Edge case: zero-duration event (start == end after fix #2)
+            if start == end:
+                daily_records.append({'date': start.date(), 'EI_daily': total_ei})
+                continue
 
             # Generate all days the event touches
             days = pd.date_range(start=start.date(), end=end.date(), freq='D')
@@ -166,7 +198,7 @@ def compute_EIdaily_avg(input_dir, output_dir):
                 # Single day event
                 daily_records.append({'date': start.date(), 'EI_daily': total_ei})
             else:
-                # Multi-day event: split EI30 proportionally by duration
+                # Multi-day event: split EI30 proportionally by duration overlap
                 total_seconds = (end - start).total_seconds()
                 for day in days:
                     day_start = pd.Timestamp(day)
@@ -187,6 +219,11 @@ def compute_EIdaily_avg(input_dir, output_dir):
         daily_df['date'] = pd.to_datetime(daily_df['date'])
         daily_df['doy'] = daily_df['date'].dt.dayofyear
 
+        # FIX #3: Merge DOY 366 into DOY 365 to avoid underrepresentation.
+        # DOY 366 only occurs in leap years; averaging it separately over a much
+        # smaller sample of years would distort the climatology.
+        daily_df['doy'] = daily_df['doy'].replace(366, 365)
+
         # Fraction of total EI contributed by top events
         N_TOP = 3
         MAX_TOP_FRACTION = 0.2  # sum of N_TOP events dominate >20%
@@ -204,12 +241,17 @@ def compute_EIdaily_avg(input_dir, output_dir):
                 print(f"Top DOYs underrepresented: {under_years.to_dict()} -> dropping station")
                 continue
 
-        # Average over DOY to get climatology
-        avg_doy_df = daily_df.groupby('doy', as_index=False)['EI_daily'].mean()
+        # Average over DOY to get climatology.
+        # Divide by total calendar years in the record, not just years with events.
+        # Using .mean() would divide by event-years only, inflating the climatology
+        # by a factor of (total_years / event_years) — typically 4–20x.
+        total_years = daily_df['date'].dt.year.max() - daily_df['date'].dt.year.min() + 1
+        avg_doy_df = daily_df.groupby('doy', as_index=False)['EI_daily'].sum()
+        avg_doy_df['EI_daily'] = avg_doy_df['EI_daily'] / total_years
         avg_doy_df.rename(columns={'EI_daily': 'EI_daily_avg'}, inplace=True)
 
-        # Fill missing DOY with 0
-        all_doy = pd.DataFrame({'doy': range(1, 367)})
+        # Fill missing DOY with 0 — DOY 1–365 only (366 merged above)
+        all_doy = pd.DataFrame({'doy': range(1, 366)})
         avg_doy_complete = all_doy.merge(avg_doy_df, on='doy', how='left')
         avg_doy_complete['EI_daily_avg'] = avg_doy_complete['EI_daily_avg'].fillna(0)
 
@@ -219,7 +261,7 @@ def compute_EIdaily_avg(input_dir, output_dir):
         print(f"Saved multi-day average daily EI to {output_file}")
 
     return
-  
+
 
 def compute_EI_daily_percent(input_dir, output_dir):
     """
@@ -258,13 +300,13 @@ def compute_EI_daily_percent(input_dir, output_dir):
         output_file = os.path.join(output_dir, f"percent_{file}")
         df.to_csv(output_file, index=False)
         print(f"Saved daily percent file to {output_file}")
-        
+
     return
 
 
 def plot_EI_curves(input_dir, save_path, cat=False):
     """
-    Plot EI curves. If cat, categorise the plots using the station metadata
+    Plot EI curves. If cat, categorise the plots using the station metadata.
     """
 
     stations = [os.path.join(input_dir, f) for f in os.listdir(input_dir)]
@@ -281,14 +323,14 @@ def plot_EI_curves(input_dir, save_path, cat=False):
         colors = plt.cm.tab20(range(len(unique_expo)))
         color_map = dict(zip(unique_expo, colors))
 
-    fig, ax = plt.subplots(figsize=(12,8))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     for s in stations:
         station_id = os.path.basename(s).replace(".csv", "").split("_")[-1]
-    
+
         # Open file
         df = pd.read_csv(s)
-        # Add yearly timeseries to plot
+
         if cat:
             match = stations_metadata.loc[
                 stations_metadata['station_abbr'] == station_id,
@@ -300,11 +342,9 @@ def plot_EI_curves(input_dir, save_path, cat=False):
             color = color_map.get(exposition, 'gray')
         else:
             color = None
+
         ax.plot(df['doy'], df['EI_daily_cumsum'], alpha=0.5, linewidth=2, color=color)
 
-        if cat: 
-            stations_type = stations_metadata['station_exposition_en']
-    
     # Add legend
     if cat:
         for expo, color in color_map.items():
@@ -330,24 +370,23 @@ def plot_EI_curves(input_dir, save_path, cat=False):
     return
 
 
-
 # Compute EI30 based on 10min data
-input_dir = 'stations_data/stations_csv'       
+input_dir = 'stations_data/stations_csv'
 output_dir = 'stations_data/stations_EI30'
 compute_EI30_fast(input_dir, output_dir)
 
 # Compute EIdaily: accumulate values daily and compute long term daily mean
-input_dir = 'stations_data/stations_EI30'     
-output_dir = 'stations_data/stations_EIdaily' 
+input_dir = 'stations_data/stations_EI30'
+output_dir = 'stations_data/stations_EIdaily'
 compute_EIdaily_avg(input_dir, output_dir)
 
-# Conver to daily percentage sum
-input_dir = 'stations_data/stations_EIdaily'       # folder with EIdaily_avg CSVs
+# Convert to daily percentage sum
+input_dir = 'stations_data/stations_EIdaily'           # folder with EIdaily_avg CSVs
 output_dir = 'stations_data/stations_EIdaily_percent'  # folder to save daily % and cumulative %
 compute_EI_daily_percent(input_dir, output_dir)
 
-# Plot curves of EIdaily 
-input_dir = 'stations_data/stations_EIdaily_percent' 
+# Plot curves of EIdaily
+input_dir = 'stations_data/stations_EIdaily_percent'
 save_path = 'EIdaily_station_curves.png'
 plot_EI_curves(input_dir, save_path, cat=True)
 
@@ -381,4 +420,3 @@ for file in os.listdir(input_dir):
     missing_percentage = (missing_steps / total_steps) * 100
     print(f"{file}: {missing_percentage:.2f}% data is missing")
 """
-    
