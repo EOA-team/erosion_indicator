@@ -9,3 +9,4 @@ Philippa
 spectral_mixing/synthetic_samples/*
 spectral_unmixing/results/UAV_validation/*png
 erosivity_index/covariates
+erosivity_index/results/
