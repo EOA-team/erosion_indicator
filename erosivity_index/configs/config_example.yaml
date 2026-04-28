@@ -1,0 +1,150 @@
+# =============================================================================
+# upscale_EI_edit.py — full reference config
+# All parameters are listed here with their defaults and accepted values.
+# Copy this file, rename it, and uncomment/edit what you need.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Paths  (required)
+# -----------------------------------------------------------------------------
+
+# CSV with station metadata (coordinates, height, etc.).
+# Delimiter: ';'  Encoding: latin1
+stations_metadata_path: stations_data/metadata/ogd-smn_meta_stations.csv
+
+# Directory of per-station EI climatology CSVs.
+# Each file must be named *_<STATION_ABBR>.csv
+ei_dir: stations_data/stations_EIdaily_percent
+
+# Root directory that contains the covariate zarr stores.
+# Expected sub-structure:
+#   covariates/dem_100m.zarr          — DEM (height, slope, aspect variables)
+#   covariates/precip/               — yearly precipitation zarrs (MeteoSwiss naming)
+#   covariates/temp/                 — yearly temperature zarrs
+covariates_dir: covariates
+
+# Substring used to identify the DEM zarr inside the resolved covariate file list.
+# Change only if you rename dem_100m.zarr.
+dem_file_pattern: dem
+
+# -----------------------------------------------------------------------------
+# Covariates  (required)
+# -----------------------------------------------------------------------------
+# List of raw feature names to include in training and inference.
+# Order does not matter for model accuracy; derived names are computed internally.
+#
+# Derived transformations (handled automatically, no extra config needed):
+#   aspect              -> aspect_sin, aspect_cos   (circular encoding)
+#   doy                 -> sin_doy,   cos_doy        (circular encoding)
+#   prec_daily_fraction -> prec_daily_avg / annual_sum per cell
+#                          NOTE: requires prec_daily_avg to be present
+#
+# Available options:
+#   prec_daily_avg      — climatological daily mean precipitation (DOY 1–365)
+#   prec_monthly_avg    — climatological monthly mean precipitation (months 1–12)
+#   prec_monthly_min    — climatological monthly minimum precipitation
+#   prec_monthly_max    — climatological monthly maximum precipitation
+#   monthly_avg_temp    — climatological monthly mean temperature
+#   elev                — elevation from DEM [m a.s.l.]
+#   slope               — terrain slope from DEM [degrees]
+#   aspect              — terrain aspect from DEM [degrees] → sin/cos at model time
+#   doy                 — day of year (1–365) → sin/cos at model time
+#   prec_daily_fraction — daily precip as fraction of cell's annual total
+#   x                   — LV95 easting [m] — use as explicit spatial predictor
+#   y                   — LV95 northing [m] — use as explicit spatial predictor
+data_vars:
+  - prec_daily_avg
+  - prec_monthly_avg
+  # - prec_monthly_min
+  # - prec_monthly_max
+  # - monthly_avg_temp
+  - elev
+  - slope
+  - aspect
+  - doy
+  - prec_daily_fraction
+  # - x
+  # - y
+
+# -----------------------------------------------------------------------------
+# Target variable  (optional, default: EI_daily_avg)
+# -----------------------------------------------------------------------------
+# Column from the per-station EI CSVs to use as the regression target.
+#   EI_daily_avg     — absolute daily mean EI  (recommended)
+#   EI_daily_percent — daily EI as percent of annual total
+#   EI_daily_cumsum  — cumulative percent of annual EI (predictions clipped 0–100)
+pred_col: EI_daily_avg
+
+# -----------------------------------------------------------------------------
+# Model  (optional, defaults shown)
+# -----------------------------------------------------------------------------
+# Regression model family.
+#   rf  — Random Forest (default; supports Optuna tuning)
+#   nn  — MLP neural network (supports Optuna tuning)
+#   gpr — Gaussian Process Regressor (no Optuna tuning; slow on large datasets)
+model_type: rf
+
+# Whether to run Optuna hyperparameter search before final training.
+# Ignored for gpr (always uses fixed kernel parameters).
+# Can be overridden on the CLI with --tune / --no-tune.
+tune: true
+
+# Number of Optuna trials to run when tune: true.
+# Higher values improve the search but increase wall time linearly.
+optuna_trials: 20
+
+# -----------------------------------------------------------------------------
+# Output paths  (optional, defaults shown)
+# -----------------------------------------------------------------------------
+# Directory where trained model (.joblib) and feature list (.json) are saved.
+models_dir: models
+
+# Directory where evaluation plots and metrics are saved.
+results_dir: results
+
+# Directory where the final prediction Parquet file is written.
+predictions_dir: .
+
+# -----------------------------------------------------------------------------
+# Spatial train/val/test split  (optional, defaults shown)
+# -----------------------------------------------------------------------------
+# Fraction of spatial grid cells assigned to training.
+# Remaining fraction after train + val goes to the test set.
+train_frac: 0.70
+
+# Fraction of spatial grid cells assigned to validation.
+val_frac: 0.15
+
+# Side length [m] of the overlay grid used to define spatial blocks for splitting.
+# For Switzerland (~220 × 350 km), 25 000 m yields ~50–60 blocks.
+# Increase for coarser spatial separation; decrease for finer.
+split_grid_size: 25000
+
+# Global random seed — controls station shuffle for the spatial split and
+# the sample of stations shown in the test-set prediction plot.
+random_seed: 42
+
+# -----------------------------------------------------------------------------
+# Inference  (optional, defaults shown)
+# -----------------------------------------------------------------------------
+# Number of 100 m grid cells processed per chunk during full-grid inference.
+# Reduce if you run out of memory; increase to speed up I/O-bound runs.
+chunk_size: 5000
+
+# -----------------------------------------------------------------------------
+# Run identification  (optional)
+# -----------------------------------------------------------------------------
+# Date string in YYYYMMDD format.
+# Used to name model files and prediction outputs, e.g.:
+#   models/rf_absEI_tuned_model_20260419.joblib
+#   grid_EI_daily_avg_pred_20260419.parquet
+# Set to null (or omit) to reuse the latest existing model on disk, or fall
+# back to today's date if no model exists.
+# Can be overridden on the CLI with --date YYYYMMDD.
+date_str: null
+
+# Optional free-form label appended to model and prediction filenames to
+# disambiguate multiple runs on the same date, e.g. "v2" or "exp1".
+# Produces names like: rf_absEI_tuned_v2_model_20260419.joblib
+# Can be overridden on the CLI with --version-tag LABEL.
+version_tag: null
