@@ -1158,7 +1158,7 @@ def main():
                 monthly_df['x'], monthly_df['y'],
                 c=monthly_df['predicted_EI_monthly'],
                 cmap='inferno', s=2, alpha=0.7,
-                #vmin=vmin, vmax=vmax
+                vmin=vmin, vmax=vmax
             )
             ax1.set_title(f"Predictions — {month_labels[month]}", fontsize=14)
             ax1.set_xlabel("X")
@@ -1170,7 +1170,7 @@ def main():
                 bafu_xs, bafu_ys,
                 c=bafu_vals,
                 cmap='inferno', s=2, alpha=0.7,
-                #vmin=vmin, vmax=vmax
+                vmin=vmin, vmax=vmax
             )
             ax2.set_title(f"BAFU — {month_labels[month]}", fontsize=14)
             ax2.set_xlabel("X")
@@ -1439,17 +1439,17 @@ def main():
 
 if __name__ == "__main__":
     
-    SAVE_PATH = 'grid_EI_daily_avg_pred_20260424_nn.parquet'
-    SUFFIX = "20260424_nn"
+    SAVE_PATH = 'predictions/grid_EI_daily_avg_pred_20260424_nn3.parquet'
+    SUFFIX = "20260424_nn3"
     
-    plot_curves = True
-    check_corr = True
-    check_distr = True
-    check_spatial = True
-    compare_bafu = True
+    plot_curves = False
+    check_corr = False
+    check_distr = False
+    check_spatial = False
+    compare_bafu = False
     compare_bafu_maps = True
-    compare_cumul_pct = True    # Check #1: cumulative % curves vs BAFU
-    check_spatial_corr = True   # Check spatial correlation (scatter) vs BAFU
-    check_station_stats = True
+    compare_cumul_pct = False    # Check #1: cumulative % curves vs BAFU
+    check_spatial_corr = False   # Check spatial correlation (scatter) vs BAFU
+    check_station_stats = False
 
     main()
