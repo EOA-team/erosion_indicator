@@ -248,17 +248,28 @@ Weekly aggregated products are stored in `FC_mapping/CH_fraction_weekly_{yr}/`.
 
 Derives long-term climatological daily rainfall erosivity (EI30) from MeteoSwiss station records and spatially upscales it to a 100 m grid across Switzerland for every day of year (DOY 1–365). The EI30 computation follows the methodology from [Schmidt et al. (2016)](https://hess.copernicus.org/articles/20/4359/2016/hess-20-4359-2016.pdf).
 
-#### Step 1 — Prepare covariate grids: `precipitation_daily_grids.py`
+#### Step 1 — Download precipitation data from weather stations `download_meteo_stations.py`
+Through the MeteoSwiss API, download the precipitation data:
+```bash
+python erosivity_index/download_meteo_stations.py
+```
+Each station's data is saved to `stations_data/stations_csv/`
 
-Reprojects and resamples MeteoSwiss gridded climate data (NetCDF, LV95) to 100 m resolution aligned to the Sentinel-2 grid (EPSG:32632), saving one zarr per variable per year to `erosivity_index/covariates/`. Supported variables: daily precipitation (`RhiresD`), daily mean/min/max temperature (`TabsD`, `TminD`, `TmaxD`), relative sunshine duration (`SrelD`).
+#### Step 2 — Prepare covariate grids:
+The DEM and weather covariates are prepared. The DEM data is rescaled to a 100m grid, slope and aspect are computed, and the produt is saved to `covariates/dem_100m.zarr`. The DEM grid serves as reference for the upscaling.
+```bash
+python erosivity_index/dem_grid.py
+```
+
+The MeteoSwiss gridded climate data (NetCDF, LV95) is reprojected and resampled  to 100 m resolution aligned to the Sentinel-2 grid (EPSG:32632), saving one zarr per variable per year to `erosivity_index/covariates/`. Supported variables: daily precipitation (`RhiresD`), daily mean/min/max temperature (`TabsD`, `TminD`, `TmaxD`), relative sunshine duration (`SrelD`).
 
 ```bash
-taskset -c 40-45 python erosivity_index/precipitation_daily_grids.py \
+python erosivity_index/meteo_daily_grids.py \
     --year_start 2004 --year_end 2026 \
     --out_dir covariates/precip --var RhiresD --out_res 100
 ```
 
-#### Step 2 — Compute station-level EI30: `compute_EIdaily.py`
+#### Step 3 — Compute station-level EI30: `compute_EIdaily.py`
 
 Processes 10-minute station CSVs from `stations_data/stations_csv/` through three steps:
 
@@ -271,8 +282,7 @@ python erosivity_index/compute_EIdaily.py
 ```
 
 #### Step 3 — Spatial upscaling to 100 m grid: `upscale_EI.py`
-
-Trains a Random Forest to predict the long-term daily average EI for every DOY at every 100 m grid cell across Switzerland.
+Train a model to predict the long-term daily average EI for every DOY at every 100 m grid cell across Switzerland.
 
 **Target**: `EI_daily_avg` (long-term mean EI per DOY per station, from step 2)
 
@@ -282,20 +292,25 @@ Trains a Random Forest to predict the long-term daily average EI for every DOY a
 - Monthly precipitation climatology (avg, min, max)
 - Monthly average temperature
 - DOY (encoded as sin/cos)
+- position (x,y)
 
 **Spatial train/val/test split**: stations assigned to 25 km grid cells; entire cells assigned to one split to prevent spatial autocorrelation leakage (≈70/15/15%)
 
 **Tuning**: Optuna (20 trials), minimising spatially cross-validated RMSE
 
 **Inference**: predictions made for all Swiss 100 m grid cells, one row per (grid cell × DOY); saved in chunks to parquet
-
+All model parameters can be set up in the config file, see `configs/config_example.yaml` for all options.
 ```bash
-taskset -c 0-10 python erosivity_index/upscale_EI.py
+python erosivity_index/upscale_EI.py --config configs/config_example.yaml
 ```
 
 **Outputs**:
-- `erosivity_index/models/rf_absEI_tuned_model_{date}.joblib` — trained RF model
-- `erosivity_index/grid_EI_daily_avg_pred.parquet` — predicted long-term daily average EI for every 100 m grid cell × DOY (1–365) across Switzerland
+- `erosivity_index/models/{model}_absEI_tuned_model_{suffix}.joblib` — trained model
+- `erosivity_index/predictions/grid_EI_daily_avg_pred_{suffix}.parquet` — predicted long-term daily average EI for every 100 m grid cell × DOY (1–365) across Switzerland
+
+**Analyse models and prediction**:
+- `erosivity_index/check_predictions.py` — spatial and temporal patterns in predictions, plotting. Saves in `erosivity_index/results`
+- `erosivity_index/extract_model_info.py` — extract test scores from a trained model.
 
 ---
 

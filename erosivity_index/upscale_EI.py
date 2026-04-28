@@ -153,9 +153,10 @@ class Config:
 
     def predictions_path(self) -> str:
         tag = f"_{self.version_tag}" if self.version_tag else ""
+        os.makedirs('predictions', exist_ok=True)
         return os.path.join(
             self.predictions_dir,
-            f"grid_{self.pred_col}_pred_{self.date_str}{tag}.parquet",
+            f"predictions/grid_{self.pred_col}_pred_{self.date_str}{tag}.parquet",
         )
 
 

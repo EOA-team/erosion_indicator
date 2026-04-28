@@ -83,7 +83,7 @@ collections = {
 'precip': 'ch.meteoschweiz.ogd-smn-precip', #https://data.geo.admin.ch/browser/index.html#/collections/ch.meteoschweiz.ogd-smn-precip?.language=en
 #'tower': 'ch.meteoschweiz.ogd-smn-tower', #https://data.geo.admin.ch/browser/index.html#/collections/ch.meteoschweiz.ogd-smn-tower?.language=en
 }
-"""
+
 # Download data
 for station in stations_list:
     output_file =  os.path.join(output_dir, f"{station.upper()}.csv")
@@ -146,7 +146,7 @@ for station in stations_list:
         print(f'Saved for {station.upper()}:', save_path)
     else:
         print('No 10min precip data in time frame for station:', station.upper())
-"""
+
 
 
 
