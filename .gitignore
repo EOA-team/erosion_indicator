@@ -10,3 +10,8 @@ spectral_mixing/synthetic_samples/*
 spectral_unmixing/results/UAV_validation/*png
 erosivity_index/covariates
 erosivity_index/results/
+erosivity_index/stations_data/station_csv
+erosivity_index/stations_data/station_EI30
+erosivity_index/stations_data/station_EIdaily
+erosivity_index/stations_data/station_EIdaily_percent
+erosivity_index/stations_data/metadata
