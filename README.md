@@ -298,17 +298,21 @@ Train a model to predict the long-term daily average EI for every DOY at every 1
 
 **Tuning**: Optuna (20 trials), minimising spatially cross-validated RMSE
 
-**Inference**: predictions made for all Swiss 100 m grid cells, one row per (grid cell × DOY); saved in chunks to parquet
-All model parameters can be set up in the config file, see `configs/config_example.yaml` for all options.
+**Model selection**: Multiple model types and configurations were evaluated, including XGBoost (`config_xgb1.yaml`) and several neural network variants (`config_nn.yaml`, `config_nn2.yaml` through `config_nn5.yaml`), as well as earlier feature/preprocessing variants (`config_v1.yaml`–`config_v3.yaml`). Selection was based on test set scores extracted with `extract_model_info.py` and visual inspection of spatial and temporal prediction patterns produced by `check_predictions.py`. The model trained with **`config_nn3.yaml`** was chosen as the final model.
+
+**Inference**: predictions made for all Swiss 100 m grid cells, one row per (grid cell × DOY); saved in chunks to parquet.
+All model parameters can be set up in a config file; see `configs/config_example.yaml` for all options.
 ```bash
-python erosivity_index/upscale_EI.py --config configs/config_example.yaml
+python erosivity_index/upscale_EI.py --config configs/config_nn3.yaml
 ```
 
 **Outputs**:
 - `erosivity_index/models/{model}_absEI_tuned_model_{suffix}.joblib` — trained model
 - `erosivity_index/predictions/grid_EI_daily_avg_pred_{suffix}.parquet` — predicted long-term daily average EI for every 100 m grid cell × DOY (1–365) across Switzerland
 
-**Analyse models and prediction**:
+The final predictions are saved as `grid_EI_daily_avg_pred_20260424_nn3.parquet`.
+
+**Analyse models and predictions**:
 - `erosivity_index/check_predictions.py` — spatial and temporal patterns in predictions, plotting. Saves in `erosivity_index/results`
 - `erosivity_index/extract_model_info.py` — extract test scores from a trained model.
 
