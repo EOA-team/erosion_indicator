@@ -1,0 +1,26 @@
+stations_metadata_path: stations_data/metadata/ogd-smn_meta_stations.csv
+ei_dir: stations_data/stations_EIdaily_percent
+covariates_dir: covariates
+dem_file_pattern: dem
+
+data_vars:
+  - prec_daily_avg
+  - prec_monthly_avg
+  - prec_monthly_min
+  - prec_monthly_max
+  - monthly_avg_temp
+  - elev
+  - slope
+  - aspect
+  - doy
+  - prec_daily_fraction
+  - x
+  - y
+
+pred_col: EI_daily_avg
+model_type: xgb
+tune: true
+log_transform: true
+
+date_str: "20260428"
+version_tag: xgb

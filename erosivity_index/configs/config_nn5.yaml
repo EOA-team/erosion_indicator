@@ -1,0 +1,27 @@
+stations_metadata_path: stations_data/metadata/ogd-smn_meta_stations.csv
+ei_dir: stations_data/stations_EIdaily_percent
+covariates_dir: covariates
+dem_file_pattern: dem
+
+# All covariates except monthly min/max precip and monthly avg temperature.
+data_vars:
+  - prec_daily_avg
+  - prec_monthly_avg
+  - prec_monthly_min
+  - prec_monthly_max
+  - monthly_avg_temp
+  - elev
+  - slope
+  - aspect
+  - doy
+  - prec_daily_fraction
+  - snow_depth
+  - x
+  - y
+
+pred_col: EI_daily_avg
+model_type: nn
+tune: true
+
+date_str: "20260501"
+version_tag: nn5
