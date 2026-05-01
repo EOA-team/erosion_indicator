@@ -34,6 +34,7 @@ A minimal YAML config looks like:
       - aspect
       - doy
       - prec_daily_fraction
+      - snow_depth
     pred_col: EI_daily_avg     # EI_daily_avg | EI_daily_percent | EI_daily_cumsum
     model_type: rf              # rf | nn | gpr
     tune: true
@@ -72,6 +73,7 @@ from sklearn.model_selection import GroupKFold
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBRegressor
 
 warnings.filterwarnings("ignore")
 
@@ -89,6 +91,7 @@ MONTHLY_PREFIX: dict[str, str] = {
     "prec_monthly_min": "monthly_min_precip_",
     "prec_monthly_max": "monthly_max_precip_",
     "monthly_avg_temp": "monthly_avg_temp_",
+    "snow_depth": "monthly_avg_snow_depth_",
 }
 DAILY_PREFIX = {"prec_daily_avg": "daily_avg_precip_"}
 
@@ -107,6 +110,7 @@ class Config:
     pred_col: str = "EI_daily_avg"
     model_type: str = "rf"
     tune: bool = True
+    log_transform: bool = False
     models_dir: str = "models"
     results_dir: str = "results"
     predictions_dir: str = "."
@@ -341,6 +345,27 @@ def prep_monthly_temp(covariates_dir: str) -> str:
     return _prep_monthly(covariates_dir, "temp", "monthly_avg_temp.zarr", "mean", False)
 
 
+def prep_snow_depth(covariates_dir: str) -> str:
+    """
+    Prepare the monthly avg snow depth climatology for use as a covariate.
+
+    The source zarr (HSCLQMD_monthly_climatology.zarr) uses datetime64 time
+    coordinates; we convert them to integer month numbers (1–12) so the pivot
+    in extract_features() produces column names consistent with other monthly
+    covariates (e.g. monthly_avg_snow_depth_1 … monthly_avg_snow_depth_12).
+    """
+    src = os.path.join(covariates_dir, "HSCLQMD_monthly_climatology.zarr")
+    out_path = os.path.join(covariates_dir, "snow_depth_monthly_avg.zarr")
+    if os.path.exists(out_path):
+        return out_path
+
+    ds = xr.open_zarr(src)[["HSCLQMD"]].rename({"HSCLQMD": "snow_depth"})
+    ds = ds.assign_coords(time=ds.time.dt.month)
+    _write_zarr_atomic(ds, out_path)
+    print(f"Saved snow depth monthly climatology -> {out_path}")
+    return out_path
+
+
 def prepare_covariates(data_vars: list[str], covariates_dir: str) -> list[str]:
     """
     Build/return paths to every covariate zarr needed to service ``data_vars``.
@@ -370,6 +395,8 @@ def prepare_covariates(data_vars: list[str], covariates_dir: str) -> list[str]:
         files.append(prep_monthly_max_prec(covariates_dir))
     if "monthly_avg_temp" in data_vars:
         files.append(prep_monthly_temp(covariates_dir))
+    if "snow_depth" in data_vars:
+        files.append(prep_snow_depth(covariates_dir))
 
     return files
 
@@ -379,11 +406,12 @@ def prepare_covariates(data_vars: list[str], covariates_dir: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Maps zarr path tokens -> output column prefix in the wide features table.
 _EXTRACT_VAR_PREFIX: list[tuple[str, str]] = [
-    ("precip/daily_avg",   "daily_avg_precip"),
-    ("precip/monthly_avg", "monthly_avg_precip"),
-    ("precip/monthly_min", "monthly_min_precip"),
-    ("precip/monthly_max", "monthly_max_precip"),
-    ("temp/monthly_avg_temp", "monthly_avg_temp"),
+    ("precip/daily_avg",        "daily_avg_precip"),
+    ("precip/monthly_avg",      "monthly_avg_precip"),
+    ("precip/monthly_min",      "monthly_min_precip"),
+    ("precip/monthly_max",      "monthly_max_precip"),
+    ("temp/monthly_avg_temp",   "monthly_avg_temp"),
+    ("snow_depth_monthly_avg",  "monthly_avg_snow_depth"),
 ]
 
 
@@ -457,7 +485,23 @@ def make_model(model_type: str = "rf") -> Pipeline:
             )),
         ])
 
-    raise ValueError("model_type must be one of 'gpr', 'rf', 'nn'")
+    if model_type == "xgb":
+        return Pipeline([
+            ("model", XGBRegressor(
+                n_estimators=500,
+                learning_rate=0.05,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=3,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                random_state=42,
+                n_jobs=-1,
+            )),
+        ])
+
+    raise ValueError("model_type must be one of 'gpr', 'rf', 'nn', 'xgb'")
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +811,18 @@ def objective(
             ),
             model__max_iter=trial.suggest_int("max_iter", 500, 2000),
         )
+    elif model_type == "xgb":
+        pipeline = make_model("xgb")
+        pipeline.set_params(
+            model__n_estimators=trial.suggest_int("n_estimators", 200, 1000),
+            model__learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            model__max_depth=trial.suggest_int("max_depth", 3, 10),
+            model__subsample=trial.suggest_float("subsample", 0.5, 1.0),
+            model__colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            model__min_child_weight=trial.suggest_int("min_child_weight", 1, 10),
+            model__reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 1.0, log=True),
+            model__reg_lambda=trial.suggest_float("reg_lambda", 0.1, 10.0, log=True),
+        )
     else:
         raise ValueError(f"Tuning not supported for model_type={model_type!r}")
 
@@ -831,15 +887,28 @@ def train_model(
     train_df = df_data[df_data["split"] == "train"]
     val_df = df_data[df_data["split"] == "val"]
 
+    for label, split_df in (("train", train_df), ("val", val_df)):
+        n_nan = split_df[feature_names].isna().any(axis=1).sum()
+        if n_nan:
+            print(f"Dropping {n_nan} {label} rows with NaN in feature columns.")
+    train_df = train_df.dropna(subset=feature_names)
+    val_df   = val_df.dropna(subset=feature_names)
+
     X_train = train_df[feature_names].values
     y_train = train_df[cfg.pred_col].values
     groups_train = train_df[STATION_COL].values
 
-    if cfg.tune and cfg.model_type in {"rf", "nn"}:
+    if cfg.log_transform:
+        y_train_fit = np.log1p(y_train)
+        print("Log-transforming target (log1p) for training.")
+    else:
+        y_train_fit = y_train
+
+    if cfg.tune and cfg.model_type in {"rf", "nn", "xgb"}:
         print("\nRunning Optuna hyperparameter tuning...")
         study = optuna.create_study(direction="minimize")
         study.optimize(
-            lambda t: objective(t, X_train, y_train, groups_train, cfg.model_type),
+            lambda t: objective(t, X_train, y_train_fit, groups_train, cfg.model_type),
             n_trials=cfg.optuna_trials,
         )
         best = study.best_params
@@ -854,12 +923,14 @@ def train_model(
         print("\nTraining with default hyperparameters...")
         pipeline = make_model(cfg.model_type)
 
-    pipeline.fit(X_train, y_train)
+    pipeline.fit(X_train, y_train_fit)
 
     # Quick validation sanity check
     X_val = val_df[feature_names].values
     y_val = val_df[cfg.pred_col].values
     y_val_pred = pipeline.predict(X_val)
+    if cfg.log_transform:
+        y_val_pred = np.expm1(y_val_pred)
     if cfg.pred_col == "EI_daily_cumsum":
         y_val_pred = np.clip(y_val_pred, 0, 100)
     rmse_val = np.sqrt(mean_squared_error(y_val, y_val_pred))
@@ -998,11 +1069,17 @@ def predict_test_set(
         df_data = df_data.merge(splits, on=STATION_COL, how="left")
 
     test_df = df_data[df_data["split"] == "test"].copy()
+    n_nan = test_df[feature_names].isna().any(axis=1).sum()
+    if n_nan:
+        print(f"Dropping {n_nan} test rows with NaN in feature columns.")
+    test_df = test_df.dropna(subset=feature_names)
     X_test = test_df[feature_names].values
     y_test = test_df[cfg.pred_col].values
 
     pipeline = joblib.load(cfg.model_file())
     y_pred = pipeline.predict(X_test)
+    if cfg.log_transform:
+        y_pred = np.expm1(y_pred)
     if cfg.pred_col == "EI_daily_cumsum":
         y_pred = np.clip(y_pred, 0, 100)
     test_df["predicted_" + cfg.pred_col] = y_pred
@@ -1116,6 +1193,8 @@ def predict_per_grid_cell(
 
             X = df_features[feature_names].values
             preds = pipeline.predict(X)
+            if cfg.log_transform:
+                preds = np.expm1(preds)
             if cfg.pred_col == "EI_daily_cumsum":
                 preds = np.clip(preds, 0, 100)
             df_features[f"predicted_{cfg.pred_col}"] = preds
@@ -1238,7 +1317,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version-tag", dest="version_tag", default=None,
                         help="Optional version label (e.g. v2, exp1) appended to model and prediction filenames.")
     parser.add_argument("--model-type", dest="model_type", default=None,
-                        choices=["rf", "nn", "gpr"])
+                        choices=["rf", "nn", "gpr", "xgb"])
     parser.add_argument("--pred-col", dest="pred_col", default=None,
                         choices=["EI_daily_avg", "EI_daily_percent", "EI_daily_cumsum"])
     tune = parser.add_mutually_exclusive_group()
