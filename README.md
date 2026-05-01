@@ -293,6 +293,9 @@ Train a model to predict the long-term daily average EI for every DOY at every 1
 - Monthly average temperature
 - DOY (encoded as sin/cos)
 - position (x,y)
+- monthly average snow depth 
+
+See the config files for the actually used features in the final model (`config_nn3.yaml`).
 
 **Spatial train/val/test split**: stations assigned to 25 km grid cells; entire cells assigned to one split to prevent spatial autocorrelation leakage (≈70/15/15%)
 
