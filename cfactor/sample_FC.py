@@ -17,12 +17,12 @@ sys.path.insert(0, os.path.expanduser('~/mnt/eo-nas1/eoa-share/projects/012_EO_d
 from src.model_utils import compute_FC, compute_FC_grassland
 
 
-def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, seed=42):
+def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps) (EPSG:2056)"""
 
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
     n_years = len(lnf_files)
-    n_crops = len(top_lnfs_arable)
+    n_crops = len(lnf_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -32,14 +32,14 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, seed=42):
         yr = lnf_yr.split('lnf')[-1].split('.gpkg')[0]
         lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
         # Set all grasslands to same class
-        lnf.loc[lnf['lnf_code'].isin(lnfs_grassland), 'lnf_code'] = lnfs_grassland[0]
+        lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
-        lnf = lnf[lnf.lnf_code.isin(top_lnfs_arable)]
+        lnf = lnf[lnf.lnf_code.isin(lnf_codes)]
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
         seed += 1 # so that among differetn years it varies
-        for crop in top_lnfs_arable:
+        for crop in lnf_codes:
             crop_polys = lnf[lnf.lnf_code == crop]
 
             sampled_polys = crop_polys.sample(
@@ -73,12 +73,15 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, seed=42):
     return
 
 
-def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, target_crs=32632, seed=42):
+def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, target_crs=32632, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps)"""
 
+    # Consider only 2021-2025 (to match LNF code)
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
+    lnf_files = [f for f in lnf_files if 2021 <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= 2024]
+    
     n_years = len(lnf_files)
-    n_crops = len(top_lnfs_arable)
+    n_crops = len(lnf_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -88,16 +91,17 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ta
         yr = lnf_yr.split('lnf')[-1].split('.gpkg')[0]
         lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
         # Set all grasslands to same class
-        lnf.loc[lnf['lnf_code'].isin(lnfs_grassland), 'lnf_code'] = lnfs_grassland[0]
+        lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
-        lnf = lnf[lnf.lnf_code.isin(top_lnfs_arable)]
+        lnf = lnf[lnf.lnf_code.isin(lnf_codes)]
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
-        seed += 1 # so that among differetn years it varies
-        for crop in top_lnfs_arable:
+        seed += 1 # so that among different years it varies
+        for crop in lnf_codes:
             crop_polys = lnf[lnf.lnf_code == crop].to_crs(target_crs)
-
+            if len(crop_polys) == 0:
+                continue
             sampled_polys = crop_polys.sample(
                 n=samples_per_crop,
                 weights=crop_polys.area,
@@ -155,7 +159,7 @@ def snap_to_grid(x, y, ds):
 
 
 def extract_s2_data(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, save_path_sampledloc_S2):
-    print('Extract S2 (30 Jun previous yr to 1 Jul current yr) and Soil data')
+    print('Extract S2 (01 Dec previous yr to 31 Jan next yr) and Soil data')
     samples = pd.read_pickle(save_path_sampledloc).to_crs(32632)
 
     # Intersect S2 grid with locations of samples to get list of files and coords concerned
@@ -265,8 +269,8 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
             print('No files found for polygon')
             continue
 
-        # Extract S2 data
-        ds_s2 = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
+        # Extract S2 data: add a month before and after
+        ds_s2 = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-12-01', f'{int(yr)+1}-01-31')) #.sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
         try:
             mask = ds_s2.rename({'lat':'y', 'lon':'x'}).rio.write_crs(32632).rio.clip([polygon], ds_s2.rio.crs, drop=True)  # Clip S2 data to the polygon
         except:
@@ -281,6 +285,7 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
 
         # Extract soil data for the polygon
         soil_files = [os.path.join(soil_dir, f'SRC_{int(left)}_{int(top)}.zarr') for left, right in tiles]
+        soil_files = [f for f in soil_files if os.path.exists(f)]
         if not len(soil_files):
             soil_group = 0
         else:
@@ -677,242 +682,154 @@ def plot_field_timeseries(keys, group_raw, group_clean, df_gapfilled, pixel_cols
     return
 
 
-def _gapfill_one_field_alr(keys, group_raw, group_clean, ts_cols, value_cols, pixel_cols, alpha, max_train_points=1000):
-    """Process a single field — designed to be called in parallel."""
+def _gapfill_one_field_alr(keys, group_clean, ts_cols, value_cols, pixel_cols, alpha, max_gap_days=15, max_train_points=1000):
+    """Return cleaned observations + GPR fill-points (only where gap > max_gap_days) for the sampled pixel.
+
+    Training uses all clean field pixels; prediction is performed only at synthetic dates
+    inserted in gaps longer than max_gap_days in the target pixel's clean timeseries.
+    """
     if len(group_clean) < 3:
         return None
 
-    # Prepare output dataframe
-    res = group_raw[ts_cols + pixel_cols + ["time", "is_sample_pixel"]].copy()
+    target_clean = group_clean[group_clean["is_sample_pixel"]].copy()
+    if len(target_clean) == 0:
+        return None
 
-    # Replace doy with continuous (cyclical) time
-    dates_pred = pd.to_datetime(group_raw["time"])
+    # Cleaned observations for the target pixel — always kept as-is
+    keep_cols = ts_cols + pixel_cols + ["time"] + value_cols
+    result_clean = target_clean[keep_cols].copy()
+    result_clean["is_gapfilled"] = False
+    result_clean["fc_quality_flag"] = 0
+
+    # Dates to insert within gaps > max_gap_days
+    clean_times = pd.DatetimeIndex(pd.to_datetime(target_clean["time"]).sort_values().unique())
+    fill_dates = generate_fill_dates(clean_times, max_gap_days)
+
+    if len(fill_dates) == 0:
+        return result_clean.sort_values("time").reset_index(drop=True)
+
+    # --- Feature engineering (train on all field pixels) ---
     dates_train = pd.to_datetime(group_clean["time"])
     t0 = dates_train.min()
-    t_pred = (dates_pred - t0).dt.days.values.reshape(-1, 1)
     t_train = (dates_train - t0).dt.days.values.reshape(-1, 1)
 
-    # Add seasonal phase
-    t_year_train = t_train % 365
-    t_year_pred  = t_pred % 365
-    sin_train = np.sin(2 * np.pi * t_year_train / 365)
-    cos_train = np.cos(2 * np.pi * t_year_train / 365)
-    sin_pred = np.sin(2 * np.pi * t_year_pred / 365)
-    cos_pred = np.cos(2 * np.pi * t_year_pred / 365)
+    t_fill = np.array([(d - t0).days for d in fill_dates], dtype=float).reshape(-1, 1)
 
-    # Normalise time
-    t_train = t_train / 365.0
-    t_pred  = t_pred  / 365.0
-    
-    # Spatial features
+    sin_train = np.sin(2 * np.pi * (t_train % 365) / 365)
+    cos_train = np.cos(2 * np.pi * (t_train % 365) / 365)
+    sin_fill  = np.sin(2 * np.pi * (t_fill  % 365) / 365)
+    cos_fill  = np.cos(2 * np.pi * (t_fill  % 365) / 365)
+
+    t_train_norm = t_train / 365.0
+    t_fill_norm  = t_fill  / 365.0
+
     p_scaler    = StandardScaler()
     pixel_train = p_scaler.fit_transform(group_clean[pixel_cols].values)
-    pixel_pred  = p_scaler.transform(group_raw[pixel_cols].values)
-    
-    # --- final features ---
-    n_time_dims  = 3                    # t, sin, cos
+    # Fill dates all belong to the single target pixel
+    target_pixel = target_clean[pixel_cols].values[:1]
+    pixel_fill   = p_scaler.transform(np.repeat(target_pixel, len(fill_dates), axis=0))
+
     n_pixel_dims = pixel_train.shape[1]
-    n_features   = n_time_dims + n_pixel_dims
- 
-    X_train_full = np.hstack([t_train, sin_train, cos_train, pixel_train]).astype(np.float32)
-    X_pred = np.hstack([t_pred,  sin_pred,  cos_pred,  pixel_pred ]).astype(np.float32)
+    n_features   = 3 + n_pixel_dims   # t, sin, cos, spatial
 
-    # --- ALR transform: fit GPR in unconstrained space ---
-    fc_train_full = group_clean[value_cols].values.astype(np.float32)
-    alr_train_full = alr_transform(fc_train_full)   # (n, 2)
- 
-    """
-    # Subsample if needed
-    if len(group_clean) > max_train_points:
-        sample_pixel = (
-            group_clean[group_clean["is_sample_pixel"]][pixel_cols].drop_duplicates()
-        )
-        other_pixels = (
-            group_clean[~group_clean["is_sample_pixel"]][pixel_cols].drop_duplicates()
-        )
+    X_train_full = np.hstack([t_train_norm, sin_train, cos_train, pixel_train]).astype(np.float32)
+    X_pred       = np.hstack([t_fill_norm,  sin_fill,  cos_fill,  pixel_fill ]).astype(np.float32)
 
-        n_sample_pixels = len(sample_pixel)
-        n_other_pixels = len(other_pixels)
-        print("Total pixels in field:", n_sample_pixels+n_other_pixels)
+    fc_train_full  = group_clean[value_cols].values.astype(np.float32)
+    alr_train_full = alr_transform(fc_train_full)
 
-        # Average points per pixel
-        total_unique_pixels = (
-            group_clean[pixel_cols]
-            .drop_duplicates()
-            .shape[0]
-        )
-        total_unique_pixels = len(group_clean[pixel_cols].drop_duplicates())
-        avg_points_per_pixel = len(group_clean) / total_unique_pixels
-        max_pixels_allowed = max(1, int(max_train_points / avg_points_per_pixel))
-        remaining_pixels = max(0, max_pixels_allowed - n_sample_pixels)
-
-        # --- Step 3: sample additional non-sample pixels ---
-        if remaining_pixels > 0 and n_other_pixels > 0:
-            selected_other_pixels = other_pixels.sample(
-                n=min(remaining_pixels, n_other_pixels),
-                random_state=42
-            )
-            selected_pixels = pd.concat(
-                [sample_pixel, selected_other_pixels],
-                ignore_index=True
-            )
-        else:
-            selected_pixels = sample_pixel.copy()
-        print("Total pixels after subsampling:", len(selected_pixels))
-
-        # --- Step 4: build subsample mask ---
-        merged = group_clean[pixel_cols].merge(
-            selected_pixels,
-            on=pixel_cols,
-            how='left',
-            indicator=True
-        )
-        subsample_idx = (merged["_merge"] == "both").values
-        X_train = X_train_full[subsample_idx]
-        y_train_mask = subsample_idx
-    else:
-        X_train = X_train_full
-        y_train_mask = np.ones(len(group_clean), dtype=bool)
-    """
-
-    # -------------------------------------------------------------------------
-    # Subsmaple data to fit in GPR
-    # stratify in time, so that new data contributes new information (underepresented timestamps)
-    # ensuring the target pixel's full time series is always present
-    # then fills the budget with other-pixel observations spread evenly across time.
-    # -------------------------------------------------------------------------
+    # --- Stratified subsample: always keep target pixel, fill budget from others ---
     target_mask = group_clean["is_sample_pixel"].values.astype(bool)
- 
+
     if len(group_clean) > max_train_points:
-        n_target = target_mask.sum()
-        budget   = max(0, max_train_points - n_target)
- 
+        n_target  = target_mask.sum()
+        budget    = max(0, max_train_points - n_target)
         other_idx = np.where(~target_mask)[0]
- 
+
         if budget > 0 and len(other_idx) > 0:
-            # Stratified: pick other pixels so that their time distribution
-            # mirrors the full dataset (preserves temporal coverage).
-            other_times   = t_train[other_idx, 0]
-            n_bins        = min(10, budget)
-            bin_edges     = np.linspace(other_times.min(), other_times.max(), n_bins + 1)
-            bin_ids       = np.digitize(other_times, bin_edges) - 1
-            chosen_other  = []
-            per_bin       = max(1, budget // n_bins)
-            rng           = np.random.default_rng(42)
+            other_times = t_train_norm[other_idx, 0]
+            n_bins      = min(10, budget)
+            bin_edges   = np.linspace(other_times.min(), other_times.max(), n_bins + 1)
+            bin_ids     = np.digitize(other_times, bin_edges) - 1
+            per_bin     = max(1, budget // n_bins)
+            rng         = np.random.default_rng(42)
+            chosen_other = []
             for b in range(n_bins):
                 in_bin = other_idx[bin_ids == b]
                 if len(in_bin) > 0:
-                    chosen_other.append(
-                        rng.choice(in_bin, size=min(per_bin, len(in_bin)), replace=False)
-                    )
+                    chosen_other.append(rng.choice(in_bin, size=min(per_bin, len(in_bin)), replace=False))
             chosen_other = np.concatenate(chosen_other) if chosen_other else np.array([], dtype=int)
- 
             keep = np.concatenate([np.where(target_mask)[0], chosen_other])
         else:
             keep = np.where(target_mask)[0]
- 
-        X_train    = X_train_full[keep]
-        alr_train  = alr_train_full[keep]
-        print(f"Subsampled: {len(keep)} pts ({target_mask.sum()} target, {len(keep)-target_mask.sum()} other)")
+
+        X_train   = X_train_full[keep]
+        alr_train = alr_train_full[keep]
     else:
         X_train   = X_train_full
         alr_train = alr_train_full
- 
-    # -------------------------------------------------------------------------
-    # Per-field noise estimation for alpha
-    # Use ~5% of the ALR signal variance as nugget — adapts to field variability
-    # instead of a fixed global constant.
-    # -------------------------------------------------------------------------
-    """
-    target_alr = alr_train_full[target_mask]   # target pixel rows only
-    target_t   = X_train_full[target_mask, 0]  # time column
 
-    # Linear detrend per ALR component, take residual std
-    residual_vars = []
-    for j in range(2):
-        coeffs   = np.polyfit(target_t, target_alr[:, j], deg=2)
-        trend    = np.polyval(coeffs, target_t)
-        residual_vars.append(np.var(target_alr[:, j] - trend))
-
-    estimated_alpha = float(np.mean(residual_vars)) * 0.5  # 50% of residual variance
-    estimated_alpha = float(np.clip(estimated_alpha, 1e-4, 0.5))
-    """
     estimated_alpha = float(np.var(alr_train, axis=0).mean()) * 0.05
     estimated_alpha = float(np.clip(estimated_alpha, 1e-4, 0.5))
 
     ls_init   = [1.0] * n_features
     ls_bounds = (
-        [(0.1,  5.0)]  * 1              +   # t: absolute time
-        [(0.5, 10.0)]  * 2              +   # sin, cos: seasonal period
-        [(0.05, 10.0)] * n_pixel_dims       # pixel / spatial dims
+        [(0.1,  5.0)]  * 1           +   # t
+        [(0.5, 10.0)]  * 2           +   # sin, cos
+        [(0.05, 10.0)] * n_pixel_dims    # spatial
     )
     base_kernel = ConstantKernel(1.0, (0.1, 5.0)) * Matern(
         length_scale=ls_init,
         length_scale_bounds=ls_bounds,
         nu=1.5
-    ) + WhiteKernel(
-        noise_level=estimated_alpha,
-        noise_level_bounds=(1e-5, 0.5)
-    )
- 
+    ) + WhiteKernel(noise_level=estimated_alpha, noise_level_bounds=(1e-5, 0.5))
+
     alr_preds = np.zeros((len(X_pred), 2))
-    alr_unc = np.zeros((len(X_pred), 2))
+    alr_unc   = np.zeros((len(X_pred), 2))
     for j in range(2):
         y_train = alr_train[:, j]
- 
         if j == 0:
-            # Full hyperparameter optimisation for first component
             gp = GaussianProcessRegressor(
-                kernel=base_kernel,
-                alpha=estimated_alpha,
-                normalize_y=True,
-                n_restarts_optimizer=5      # increased from 3
+                kernel=base_kernel, alpha=estimated_alpha,
+                normalize_y=True, n_restarts_optimizer=5
             )
             gp.fit(X_train, y_train)
-            fitted_kernel = gp.kernel_      # save for reuse
+            fitted_kernel = gp.kernel_
         else:
-            # Reuse optimized kernel from component 0 — fewer restarts needed
             gp = GaussianProcessRegressor(
-                kernel=fitted_kernel,
-                alpha=estimated_alpha,
-                normalize_y=True,
-                n_restarts_optimizer=2
+                kernel=fitted_kernel, alpha=estimated_alpha,
+                normalize_y=True, n_restarts_optimizer=2
             )
             gp.fit(X_train, y_train)
- 
+
         mean, std = gp.predict(X_pred, return_std=True)
         alr_preds[:, j] = mean
         alr_unc[:, j]   = std
- 
 
-    # Back-transform to simplex — guaranteed to sum to 1 and be positive
-    fc_pred = alr_inverse(alr_preds)  # (n, 3)
-    for i, col in enumerate(value_cols):
-        res[col] = fc_pred[:, i]
+    fc_pred = alr_inverse(alr_preds)
 
-    # Plot some pixels to check
-    df_gapfilled = res.copy()
-    """
-    plot_field_timeseries(
-        keys, group_raw, group_clean, df_gapfilled,
-        pixel_cols, value_col="pv", n_ts=5
-    )
-    """
-
-    # Add uncertainty as quality indicator (still in ALR space)
-    total_unc = np.linalg.norm(alr_unc, axis=1) # normalise per field
+    # Quality flag on fill points (based on ALR uncertainty)
+    total_unc = np.linalg.norm(alr_unc, axis=1)
     p80 = np.percentile(total_unc, 80)
     p95 = np.percentile(total_unc, 95)
     qflag = np.zeros(len(total_unc), dtype=int)
-    qflag[total_unc > p80] = 1   # medium
-    qflag[total_unc > p95] = 2   # low confidence
-    res["fc_quality_flag"] = qflag  # 0: high conf, 1: medium conf, 2: low conf
+    qflag[total_unc > p80] = 1
+    qflag[total_unc > p95] = 2
 
-    # Return only the sampled pixel (not the whole field)
-    res = res[res["is_sample_pixel"]].copy()
-    res = res.drop(columns="is_sample_pixel")
- 
-    return res
+    # Build fill-points dataframe
+    ts_dict    = dict(zip(ts_cols, keys if isinstance(keys, tuple) else (keys,)))
+    pixel_dict = dict(zip(pixel_cols, target_clean[pixel_cols].iloc[0]))
+    fill_result = pd.DataFrame({"time": fill_dates.astype("datetime64[ns]"), **ts_dict, **pixel_dict})
+    for i, col in enumerate(value_cols):
+        fill_result[col] = fc_pred[:, i]
+    fill_result["is_gapfilled"]    = True
+    fill_result["fc_quality_flag"] = qflag
+
+    return (
+        pd.concat([result_clean, fill_result], ignore_index=True)
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
 
 
 def _gapfill_one_field_alr_median(keys, group_raw, group_clean, ts_cols, value_cols, pixel_cols, alpha, max_train_points=1000):
@@ -1127,32 +1044,20 @@ def _gapfill_one_field(keys, group_raw, group_clean, ts_cols, value_cols, pixel_
     return res
 
 
-def gapfill_dataframe_gpr_per_field_parallel(df_raw, df_clean, ts_cols, value_cols, pixel_cols, alpha=1e-2, n_jobs=1):
-    
-    # Pre-group both DataFrames (avoids repeated full-DataFrame scans)
-    raw_groups = {keys: group for keys, group in df_raw.groupby(ts_cols)}
-    clean_groups = {keys: group for keys, group in df_clean.groupby(ts_cols)}
-    
-    # Build task list: only fields that exist in both raw and clean
-    tasks = []
-    for keys, group_raw in raw_groups.items():
-        group_clean = clean_groups.get(keys, pd.DataFrame())
-        tasks.append((keys, group_raw, group_clean))
+def gapfill_dataframe_gpr_per_field_parallel(df_clean, ts_cols, value_cols, pixel_cols, alpha=1e-2, max_gap_days=15, n_jobs=1):
 
+    tasks = [(keys, group) for keys, group in df_clean.groupby(ts_cols)]
     print(f"To process: {len(tasks)} fields using {n_jobs} workers")
 
-    # Run in parallel
     results = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(_gapfill_one_field_alr)(
-            keys, group_raw, group_clean,
-            ts_cols, value_cols, pixel_cols, alpha
+            keys, group_clean,
+            ts_cols, value_cols, pixel_cols, alpha, max_gap_days
         )
-        for keys, group_raw, group_clean in tasks
+        for keys, group_clean in tasks
     )
 
-    # Filter None results and concatenate
     results = [r for r in results if r is not None]
-
     return pd.concat(results, ignore_index=True)
 
 
@@ -1205,288 +1110,225 @@ def gapfill_dataframe_gpr_per_field(df_raw, df_clean, ts_cols, value_cols, pixel
     return pd.concat(results, ignore_index=True)
 
 
+def run_sampling_pipeline(config: dict) -> None:
+    """Run the full sampling + gapfilling pipeline. Skips steps whose output already exists."""
 
-# =====================================
-# Find top crops in Switzerland
-#top_crops = None
-top_crops = ['Winter wheat (excluding Swiss Granum fodder wheat)', 'Silage and green maize', 'Winter rapeseed for edible oil', 'Winter barley', 'Sugar beets',\
-    'Grain maize', 'Annual open-field vegetables, excluding preserved vegetables', 'Potatoes', 'Fodder wheat according to Swiss Granum list',\
-    'Sunflower for edible oil', 'Spelt', 'Triticale', 'Spring wheat (excluding Swiss Granum fodder wheat)', 'Soybean', 'Peas for grain production (e.g., protein peas)',\
-    'Oats', 'Rye', 'Open-field vegetables for preservation', 'Seed potatoes (contract farming)', 'Spring wheat (excluding Swiss Granum fodder wheat)',\
-    'Beans and vetches for grain production (e.g., field beans)', 'Mixtures of beans, vetch, peas, chickpeas, and lupins with cereals or camelina, minimum 30% legumes at harvest (for grain)',\
-    'Spring barley', 'Annual berries (e.g., strawberries)']
+    # =====================================
+    # Identify main crops to consider: use only areas stats from 2021-2024
+    lnf_labels_path = os.path.expanduser(config['lnf_labels_path'])
+    lnf_dir         = os.path.expanduser(config['lnf_dir'])
+    exclude_codes = config['lnf_ignore_codes']
 
-if top_crops is None:
-    top_crops = []
-    lnf_labels = os.path.expanduser('~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx')
-    df_labels = pd.read_excel(lnf_labels, sheet_name='label_sheet')
-    df_labels = df_labels[df_labels['Crop_Label_lv3'].isin(['Arable Land'])]
-    for c in df_labels.columns:
-        print(c)
-        if 'Area' not in c:
-            continue
-        top_yr = df_labels.sort_values(by=c, ascending=False)[:20]
-        top_crops.extend(top_yr['Crop_EN'].tolist())
-    top_crops = set(top_crops)
-    top_lnfs_arable = df_labels[df_labels['Crop_EN'].isin(top_crops)]['LNF_code'].unique().tolist()
-else:
-    lnf_labels = os.path.expanduser('~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx')
-    df_labels = pd.read_excel(lnf_labels, sheet_name='label_sheet')
-    top_lnfs_arable = df_labels[df_labels['Crop_EN'].isin(top_crops)]['LNF_code'].unique().tolist()
+    # Resolve LNF codes for top arable crops + grassland
+    top_crops = config.get('top_crops')
+    df_labels = pd.read_excel(lnf_labels_path, sheet_name='label_sheet')
+    if top_crops is None:
+        df_arable = df_labels[df_labels['Crop_Label_lv3'].isin(['Arable Land'])]
+        df_grass = df_labels[df_labels['Crop_Label_lv3'].isin(['Grassland'])]
+        top_crops = set()
+        top_grass = set()
+        for c in ['2022_Area_m23', '2023_Area_m24', '2024_Area_m25']:
+            top_crops.update(df_arable.sort_values(by=c, ascending=False)[:20]['Crop_EN'].tolist())
+            top_grass.update(df_grass.sort_values(by=c, ascending=False)[:5]['Crop_EN'].tolist())
 
+    arable_codes      = df_labels[df_labels['Crop_EN'].isin(top_crops)]['LNF_code'].unique().tolist()
+    arable_codes      = [c for c in arable_codes if c not in exclude_codes]
+    grass_codes       = df_labels[df_labels['Crop_EN'].isin(top_grass)]['LNF_code'].unique().tolist()
+    grass_codes       = [c for c in grass_codes if c not in exclude_codes]
+    lnf_codes = arable_codes + grass_codes
+    print(f"LNF codes (crops: {len(arable_codes)}, grass: {len(grass_codes)}): {lnf_codes}")
 
-lnfs_grassland = df_labels[df_labels['Crop_Label_lv3'].isin(['Grassland'])]['LNF_code'].tolist()
-top_lnfs_arable += [lnfs_grassland[0]]
-print("Will use folowwing LNF codes (and mixed grassland):\n", top_lnfs_arable)
-print(top_crops)
-
-# =====================================
-# Sample main crops locations (per year, across space) and save
-crop_labels = os.path.expanduser('~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20250217.xlsx')
-lnf_dir = os.path.expanduser('~/mnt/eo-nas1/data/landuse/raw')
-tot_samples = 1000
-save_path_sampledloc = 'samples.pkl'
-if not os.path.exists(save_path_sampledloc):
-    sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path_sampledloc)
-
-# =====================================
-# Extract S2 and Soil data
-save_path_sampledloc_S2 = 'samples_data.pkl'
-if not os.path.exists(save_path_sampledloc_S2):
-
-    s2_grid_path = os.path.expanduser('~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp')
-    s2_dir = os.path.expanduser('~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH')
-    soil_dir = os.path.expanduser('~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/')
-
-    extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, save_path_sampledloc_S2)
-
-# =====================================
-# Predict FC using right soil model
-
-save_path_FCpreds = 'samples_data_pred.pkl'
-if not os.path.exists(save_path_FCpreds):
-    predict_FC(save_path_sampledloc_S2, save_path_FCpreds)
-
-# =====================================
-# Count how many available timeseries per crop and year
-
-df_samples = pd.read_pickle(save_path_FCpreds)
-
-counts = (
-    df_samples
-    .drop_duplicates(['lnf_code', 'yr', 'sampled_x', 'sampled_y'])
-    .groupby(['lnf_code', 'yr'])
-    .size()
-    .rename('n_samples')
-)
-#print("Number of samples per year and crop:\n", counts)
-
-# TO DO: if needed, cap the number per crop/year -> perhaps wait unitl cleaning to do that, to see how many avlid tiemseries there will be
-
-
-# =====================================
-# Cleaning per field
-df_clean = (
-    df_samples.groupby(['lnf_code', 'yr', 'poly_id'], group_keys=False)
-            .apply(clean_timeseries_field)
-            .reset_index(drop=True)
-)
-
-# Get stats on cleaning
-ts_cols = ['lnf_code', 'yr', 'poly_id'] # to do: check per field or just per "is_sampled"
-n_before = (
-    df_samples
-    .groupby(ts_cols)
-    .size()
-    .rename("n_total")
-)
-n_after = (
-    df_clean
-    .groupby(ts_cols)
-    .size()
-    .rename("n_kept")
-)
-df_drop_stats = (
-    pd.concat([n_before, n_after], axis=1)
-    .fillna(0)
-)
-df_drop_stats["n_kept"] = df_drop_stats["n_kept"].astype(int)
-df_drop_stats["n_dropped"] = df_drop_stats["n_total"] - df_drop_stats["n_kept"]
-df_drop_stats["drop_fraction"] = df_drop_stats["n_dropped"] / df_drop_stats["n_total"]
-df_drop_stats = df_drop_stats.reset_index()
-
-# =====================================
-# Filter timeseries: only keep if enough data points
-
-#print(df_drop_stats.drop_fraction.describe())
-
-drop_fraction_threshold = 0.7 # max fraction dropped
-filtered_stats = df_drop_stats[df_drop_stats["drop_fraction"] <= drop_fraction_threshold]
-keys_to_keep = filtered_stats[ts_cols]
-df_clean_filtered = df_clean.merge(keys_to_keep, on=ts_cols, how="inner")
-df_samples_filtered = df_samples.merge(keys_to_keep, on=ts_cols, how="inner")
-print(f"Number of fields retained: {len(filtered_stats)}/{len(df_drop_stats)}")
-
-# TO DO: could cap the number of samples per crop/year
-
-# ====================
-# Deal with duplicated satellite pixels
-group_cols = ['poly_id', 'x', 'y', 'time', 'yr', 'sampled_x', 'sampled_y', 'lnf_code', 'is_sample_pixel'] # same as ['poly_id', 'x', 'y', 'time']
-
-df_clean_filtered = (
-    df_clean_filtered
-    .groupby(group_cols, as_index=False)
-    .mean(numeric_only=True)
-)
-df_samples_filtered = (
-    df_samples_filtered
-    .groupby(group_cols, as_index=False)
-    .mean(numeric_only=True)
-)
-
-
-# ====================
-# Plot cleaned timeseries (before gapfilling)
-
-ts_cols = ['lnf_code', 'poly_id', 'x', 'y', 'yr', 'sampled_x', 'sampled_y'] 
-for yr, df_year in df_clean_filtered.groupby('yr'):
-
-    # --- Select 10 random time series ---
-    unique_ts = df_year[ts_cols].drop_duplicates()
-
-    n_select = min(5, len(unique_ts))  # safe if <10 exist
-
-    selected_ts = unique_ts.sample(
-        n=n_select,
-        random_state=42
+    code_name_map = dict(
+        df_labels[df_labels['LNF_code'].isin(lnf_codes)]
+        [['LNF_code', 'Crop_EN']]
+        .drop_duplicates()
+        .values
     )
+    print("Code → Crop name mapping:")
+    for code, name in code_name_map.items():
+        print(f"{code}: {name}")
 
-    # Keep only selected time series
-    df_subset = df_year.merge(
-        selected_ts,
-        on=ts_cols,
-        how='inner'
-    )
-
-    unique_codes = df_subset['lnf_code'].unique()
-    cmap = plt.get_cmap('tab20')
-    color_dict = {
-        code: cmap(i % 10)
-        for i, code in enumerate(unique_codes)
-    }
-
-    fig, ax = plt.subplots(figsize=(10,6))
-
-    for keys, group in df_subset.groupby(ts_cols):
-        lnf_code = keys[0]
-        group = group.sort_values('time')
-
-        ax.plot(
-            group['time'],
-            group['pv'],   # change if needed
-            alpha=0.3,
-            color=color_dict[lnf_code]
+    # =====================================
+    # Sample main crops locations (per year, across space) and save
+    # Consider only 2021-2024. All grassland classes collapsed to single class
+    samples_path = config['samples_path']
+    if not os.path.exists(samples_path):
+        sample_locations_with_field(
+            lnf_labels_path, lnf_dir,
+            config['tot_samples'], samples_path,
+            lnf_codes, grass_codes
         )
 
-    ax.set_xlabel("Time")
-    ax.set_ylabel("PV")
-    ax.set_title(f"Example of cleaned pixel time series — Year {yr}")
+    # =====================================
+    # Extract S2 and Soil data (extract whole year + a month before/after)
+    samples_s2_path = config['samples_s2_path']
+    if not os.path.exists(samples_s2_path):
+        extract_s2_data_field(
+            samples_path,
+            os.path.expanduser(config['s2_grid_path']),
+            os.path.expanduser(config['s2_dir']),
+            os.path.expanduser(config['soil_dir']),
+            samples_s2_path 
+        )
 
-    # --- Add legend (one per lnf_code) ---
-    handles = [
-        plt.Line2D([0], [0], color=color_dict[c], lw=2)
-        for c in unique_codes
-    ]
-    ax.legend(handles, unique_codes, title="lnf_code")
+    # =====================================
+    # Predict FC
+    fc_preds_path = config['fc_preds_path']
+    if not os.path.exists(fc_preds_path):
+        predict_FC(samples_s2_path, fc_preds_path)
 
+    # =====================================
+    # Clean and filter timeseries
+    df_samples = pd.read_pickle(fc_preds_path)
+
+    ts_cols = ['lnf_code', 'yr', 'poly_id']
+    df_clean = (
+        df_samples.groupby(ts_cols, group_keys=False)
+                  .apply(clean_timeseries_field)
+                  .reset_index(drop=True)
+    )
+
+    n_before = df_samples.groupby(ts_cols).size().rename("n_total")
+    n_after  = df_clean.groupby(ts_cols).size().rename("n_kept")
+    df_drop_stats = pd.concat([n_before, n_after], axis=1).fillna(0)
+    df_drop_stats["n_kept"]        = df_drop_stats["n_kept"].astype(int)
+    df_drop_stats["n_dropped"]     = df_drop_stats["n_total"] - df_drop_stats["n_kept"]
+    df_drop_stats["drop_fraction"] = df_drop_stats["n_dropped"] / df_drop_stats["n_total"]
+    df_drop_stats = df_drop_stats.reset_index()
+
+    drop_fraction_threshold = config.get('drop_fraction_threshold', 0.7)
+    filtered_stats    = df_drop_stats[df_drop_stats["drop_fraction"] <= drop_fraction_threshold]
+    keys_to_keep      = filtered_stats[ts_cols]
+    df_clean_filtered = df_clean.merge(keys_to_keep, on=ts_cols, how="inner")
+    df_samples_filtered = df_samples.merge(keys_to_keep, on=ts_cols, how="inner")
+    print(f"Fields retained: {len(filtered_stats)}/{len(df_drop_stats)}")
+
+    # De-duplicate overlapping satellite pixels
+    group_cols = ['poly_id', 'x', 'y', 'time', 'yr', 'sampled_x', 'sampled_y', 'lnf_code', 'is_sample_pixel']
+    df_clean_filtered   = df_clean_filtered.groupby(group_cols, as_index=False).mean(numeric_only=True)
+    df_samples_filtered = df_samples_filtered.groupby(group_cols, as_index=False).mean(numeric_only=True)
+
+    # ====================
+    # Plot cleaned timeseries (before gapfilling)
+    plot_ts_cols = ['lnf_code', 'poly_id', 'x', 'y', 'yr', 'sampled_x', 'sampled_y']
+    for yr, df_year in df_clean_filtered.groupby('yr'):
+        unique_ts   = df_year[plot_ts_cols].drop_duplicates()
+        selected_ts = unique_ts.sample(n=min(5, len(unique_ts)), random_state=42)
+        df_subset   = df_year.merge(selected_ts, on=plot_ts_cols, how='inner')
+
+        unique_codes = df_subset['lnf_code'].unique()
+        cmap         = plt.get_cmap('tab20')
+        color_dict   = {code: cmap(i % 10) for i, code in enumerate(unique_codes)}
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for keys, group in df_subset.groupby(plot_ts_cols):
+            ax.plot(group.sort_values('time')['time'], group.sort_values('time')['pv'],
+                    alpha=0.3, color=color_dict[keys[0]])
+
+        ax.set_xlabel("Time")
+        ax.set_ylabel("PV")
+        ax.set_title(f"Cleaned pixel time series — Year {yr}")
+        handles = [plt.Line2D([0], [0], color=color_dict[c], lw=2) for c in unique_codes]
+        ax.legend(handles, unique_codes, title="lnf_code")
+        plt.tight_layout()
+        plt.savefig(f'plots/cleaned_timeseries_{yr}.png')
+        plt.close()
+
+    # =====================================
+    # GPR gapfilling
+    gapfilled_path = config['gapfilled_fc_path']
+    if not os.path.exists(gapfilled_path):
+        value_cols = ["pv", "npv", "soil"]
+        pixel_cols = ["x", "y"]
+
+        df_gpr = gapfill_dataframe_gpr_per_field_parallel(
+            df_clean_filtered,
+            ts_cols, value_cols, pixel_cols,
+            alpha=1e-4,
+            max_gap_days=config.get('max_gap_days', 15),
+            n_jobs=config.get('n_jobs', 1)
+        )
+
+        df_gpr['time'] = pd.to_datetime(df_gpr['time'])
+        start_dates = pd.to_datetime((df_gpr['yr'].astype(int) - 1).astype(str) + '-07-01')
+        end_dates   = pd.to_datetime(df_gpr['yr'].astype(str) + '-06-30')
+        df_gpr = df_gpr[(df_gpr['time'] >= start_dates) & (df_gpr['time'] <= end_dates)]
+        df_gpr['fc_total'] = (df_gpr['pv'] + df_gpr['npv']) * 100
+        df_gpr.to_parquet(gapfilled_path, index=False)
+
+    # =====================================
+    # Diagnostic plot: sample of gapfilled timeseries
+    df_gpr = pd.read_parquet(gapfilled_path)
+    plot_cols = ['lnf_code', 'yr', 'poly_id', 'x', 'y']
+
+    unique_ts  = df_gpr[plot_cols].drop_duplicates()
+    sampled_ts = unique_ts.sample(min(10, len(unique_ts)))
+
+    nrows = len(sampled_ts)
+    fig, axes = plt.subplots(nrows, 1, figsize=(10, 4 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    for idx, (_, row) in enumerate(sampled_ts.iterrows()):
+        ax         = axes[idx]
+        mask_raw   = (df_samples_filtered[plot_cols] == row[plot_cols]).all(axis=1)
+        mask_clean = (df_clean_filtered[plot_cols]   == row[plot_cols]).all(axis=1)
+        mask_gpr   = (df_gpr[plot_cols]              == row[plot_cols]).all(axis=1)
+        df_raw_ts   = df_samples_filtered[mask_raw].sort_values('time')
+        df_clean_ts = df_clean_filtered[mask_clean].sort_values('time')
+        df_gpr_ts   = df_gpr[mask_gpr].sort_values('time')
+        df_filled   = df_gpr_ts[df_gpr_ts['is_gapfilled']]
+        print(f"TS {idx}: clean pts={len(df_clean_ts)}, fill pts={len(df_filled)}")
+
+        ax.plot(df_raw_ts['time'],   df_raw_ts['pv'],   'o',  alpha=0.25, color='gray',      label='Raw PV')
+        ax.scatter(df_clean_ts['time'], df_clean_ts['pv'],  marker='s', alpha=0.8,  color='steelblue', label='Cleaned PV')
+        ax.scatter(df_filled['time'], df_filled['pv'], marker='x', s=80, color='red', zorder=5, label='GPR fill pts')
+        ax.plot(df_gpr_ts['time'], df_gpr_ts['pv'], linestyle='--', alpha=0.8,  color='orange', label='Final')
+        ax.set_title(f"{row['lnf_code']} - {row['yr']}  ({row['x']}, {row['y']})", fontsize=8)
+
+    for j in range(nrows, len(axes)):
+        fig.delaxes(axes[j])
+    fig.supxlabel("Time")
+    fig.supylabel("PV fraction")
+    # Collect legend handles across all active subplots so entries are not missed
+    # when the first subplot happens to have no GPR fill points
+    legend_entries = {}
+    for ax_i in axes[:nrows]:
+        for handle, label in zip(*ax_i.get_legend_handles_labels()):
+            if label not in legend_entries:
+                legend_entries[label] = handle
+    fig.legend(list(legend_entries.values()), list(legend_entries.keys()), loc='upper right')
     plt.tight_layout()
-    plt.savefig(f'cleaned_timeseries_{yr}.png')
+    plt.savefig("plots/gpr_all_timeseries_subplots.png")
     plt.close()
 
 
-# =====================================
-# GPR gapfilling 
-
-gapfilled_path = 'samples_data_gpr.pkl'
-
-if 1: #not os.path.exists(gapfilled_path):
-    
-    # Train per field and apply GPR to sampled pixel timeseries
-    ts_cols = ['lnf_code', 'yr', 'poly_id']
-    value_cols = ["pv", "npv", "soil"]
-    pixel_cols = ["x","y"] 
-    
-    df_gpr = gapfill_dataframe_gpr_per_field_parallel(
-        df_samples_filtered, df_clean_filtered, 
-        ts_cols, value_cols, pixel_cols, 
-        alpha=1e-4, n_jobs=1  # control parallelisation
-    )
-    df_gpr.to_pickle('samples_data_gpr.pkl')
-
-
-# =====================================
-# Check some gapfilled timeseries
-
-df_gpr = pd.read_pickle(gapfilled_path)
-
-# Filter for time (1st Jul prev yr - 30 Jun current yr)
-df_gpr['time'] = pd.to_datetime(df_gpr['time'])
-start_dates = pd.to_datetime((df_gpr['yr'].astype(int) - 1).astype(str) + '-07-01')
-end_dates   = pd.to_datetime(df_gpr['yr'].astype(str) + '-06-30')
-df_gpr = df_gpr[
-    (df_gpr['time'] >= start_dates) &
-    (df_gpr['time'] <= end_dates)
-]
+DEFAULT_CONFIG = {
+    'lnf_labels_path': '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
+    'lnf_dir':         '~/mnt/eo-nas1/data/landuse/raw',
+    'top_crops': [
+        'Winter wheat (excluding Swiss Granum fodder wheat)', 'Silage and green maize',
+        'Winter rapeseed for edible oil', 'Winter barley', 'Sugar beets', 'Grain maize',
+        'Annual open-field vegetables, excluding preserved vegetables', 'Potatoes',
+        'Fodder wheat according to Swiss Granum list', 'Sunflower for edible oil', 'Spelt',
+        'Triticale', 'Spring wheat (excluding Swiss Granum fodder wheat)', 'Soybean',
+        'Peas for grain production (e.g., protein peas)', 'Oats', 'Rye',
+        'Open-field vegetables for preservation', 'Seed potatoes (contract farming)',
+        'Beans and vetches for grain production (e.g., field beans)',
+        'Mixtures of beans, vetch, peas, chickpeas, and lupins with cereals or camelina, minimum 30% legumes at harvest (for grain)',
+        'Spring barley', 'Annual berries (e.g., strawberries)',
+    ],
+    'tot_samples':    1000,
+    'samples_path':   'samples.pkl',
+    'samples_s2_path': 'samples_data.pkl',
+    's2_grid_path':   '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
+    's2_dir':         '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
+    'soil_dir':       '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',
+    'fc_preds_path':  'samples_data_pred.pkl',
+    'gapfilled_fc_path': 'samples_data_gpr.parquet',
+    'max_gap_days':   15,
+    'n_jobs':         1,
+}
 
 
-ts_cols = ['lnf_code', 'yr', 'x', 'y']
-
-#  Sample 5 random timeseries
-unique_ts = df_gpr[ts_cols].drop_duplicates()
-sampled_ts = unique_ts.sample(10)
-
-nrows = len(sampled_ts)
-fig, axes = plt.subplots(nrows, 1, figsize=(10, 4*nrows))
-axes = axes.flatten()
-
-for idx, (_, row) in enumerate(sampled_ts.iterrows()):
-    ax = axes[idx]
-
-    # Masks
-    mask_raw = (df_samples_filtered[ts_cols] == row[ts_cols]).all(axis=1)
-    mask_clean = (df_clean_filtered[ts_cols] == row[ts_cols]).all(axis=1)
-    mask_gpr = (df_gpr[ts_cols] == row[ts_cols]).all(axis=1)
-    
-    # Select and sort
-    df_raw_ts = df_samples_filtered[mask_raw].sort_values('time')
-    df_clean_ts = df_clean_filtered[mask_clean].sort_values('time')
-    df_gpr_ts = df_gpr[mask_gpr].sort_values('time')
-
-    variability = df_clean_ts["pv"].std()
-    print(f"Timeseries {idx}: Variability = {variability:.4f}")
-
-    # Plot
-    ax.plot(df_raw_ts['time'], df_raw_ts['pv'], 'o-', alpha=0.4, label='Raw PV')
-    ax.plot(df_clean_ts['time'], df_clean_ts['pv'], 's-', alpha=0.6, label='Cleaned PV')
-    ax.plot(df_gpr_ts['time'], df_gpr_ts['pv'], 'x--', alpha=0.8, label='GPR PV')
-
-    ax.set_title(
-        f"{row['lnf_code']} - {row['yr']}\n({row['x']},{row['y']})",
-        fontsize=8
-    )
-
-# Remove unused subplots (if grid > number of TS)
-for j in range(nrows, len(axes)):
-    fig.delaxes(axes[j])
-
-# Common labels
-fig.supxlabel("Time")
-fig.supylabel("PV fraction")
-
-# Single legend for whole figure
-handles, labels = axes[0].get_legend_handles_labels()
-fig.legend(handles, labels, loc='upper right')
-
-plt.tight_layout()
-plt.savefig("gpr_all_timeseries_subplots_claude.png")
-
+if __name__ == '__main__':
+    run_sampling_pipeline(DEFAULT_CONFIG)
