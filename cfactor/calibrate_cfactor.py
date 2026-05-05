@@ -455,6 +455,7 @@ def run_calibration(config: dict) -> None:
     ts_cols                 = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
     crop_col                = config.get('crop_col', 'lnf_code')
     beta_bounds             = config.get('beta_bounds', (1e-4, 0.1))
+    exclude_lnf_codes       = config.get('exclude_calibration_lnf_codes', []) or [] 
  
     # Load gapfilled FC timeseries
     print("Loading gapfilled FC timeseries...")
@@ -467,6 +468,19 @@ def run_calibration(config: dict) -> None:
                                      lnf_classification_path,
                                      sampled_lnf_codes,
                                      manual_overrides_path=manual_overrides_path)
+    
+    # Drop crops excluded from calibration (e.g. permanent grasslands like
+    # Kunstwiesen / Extensiv genutzte Wiesen, where exp(-β·FC) is the wrong
+    # functional form). These crops still appear in the per-field operational
+    # output below — they're only removed from the loss function.
+    if exclude_lnf_codes:
+        before = len(df_ref)
+        excluded = df_ref[df_ref[crop_col].isin(exclude_lnf_codes)]
+        df_ref = df_ref[~df_ref[crop_col].isin(exclude_lnf_codes)].reset_index(drop=True)
+        print(f"Excluded {before - len(df_ref)} crops from calibration "
+              f"({len(df_ref)} remaining):")
+        if len(excluded):
+            print(excluded[[crop_col, 'crop_name']].to_string(index=False))
  
     # Make crop column dtypes match between df_fc and df_ref so the merge works
     df_ref[crop_col] = df_ref[crop_col].astype(df_fc[crop_col].dtype)

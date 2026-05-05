@@ -31,13 +31,14 @@ CONFIG = {
 
     # ---- Calibration (calibrate_cfactor.py) ----
     'ei_path':                  '../erosivity_index/predictions/grid_EI_daily_avg_pred_20260424_nn3.parquet',
-    'c_factor_table_path':      'C_Faktoren.csv',
+    'c_factor_table_path':      'C_Faktoren.csv', # os.path.expanduser('~mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Erosionsrisiko/C_Faktoren.csv')
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
     'manual_overrides_path':    None, # only need it if any of sampled crops fail to auto-match LNF codes
     'calibration_results_path': 'calibration_results.csv',
     'ts_cols':                  ['lnf_code', 'yr', 'poly_id'],
     'crop_col':                 'lnf_code',
     'beta_bounds':              (1e-4, 0.1),
+    'exclude_calibration_lnf_codes': [601, 611],  # Kunstwiesen, Extensiv genutzte Wiesen
     # FC is on a 0–100 scale here (PV+NPV scaled by 100). Matthews et al. (2023)
     # found β ≈ 0.04 with FC on 0–1, so the equivalent here is ≈ 0.0004
 }
