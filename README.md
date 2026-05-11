@@ -321,25 +321,63 @@ The final predictions are saved as `grid_EI_daily_avg_pred_20260424_nn3.parquet`
 
 ---
 
-### 7. C-factor / Soil Loss Ratio (`cfactor/`)
-
-Converts the FC predictions to the Soil Loss Ratio (SLR), which is the core of the RUSLE C-factor.
-
-The SLR formula applied at each pixel and timestamp:
-
+### 7. C-factor (`cfactor/`)
+ 
+Calibrates one global parameter β of the soil loss ratio model
 ```
-slr = exp(fc_total × β)    β = to calibrate
-fc_total = PV + NPV × 100
+SLR(t) = exp(-β · fc_total(t)),    fc_total = (PV + NPV) × 100
 ```
-
-- `cfactor/SLR.py` — 
-- `cfactor/calibrate_SLR.py` — 
-
+so that EI-weighted annual C-factors derived from FC reproduce the per-crop tabulated C-factors used in the existing Swiss erosion risk pipeline (Prasuhn, Hutchings & Gilgen 2023, *Agroscope Science* 158). The pixel-level C-factor is
+```
+C_pixel = Σₜ exp(-β · fc_total(t)) · EI(t)  /  Σₜ EI(t)
+```
+with EI(t) the climatological daily erosivity from Section 6 (DOY-averaged, reused across years). Strategy follows Matthews et al. (2023, ISWCR).
+ 
+**Entry point**: `cfactor/main.py`. All paths and parameters live in its `CONFIG` dict.
+ 
 ```bash
-python cfactor/SLR.py
-python cfactor/calibrate_SLR.py
+python cfactor/main.py                   # full pipeline
+python cfactor/main.py --skip-sampling   # calibration only
+```
+ 
+#### Step 1 — Sample FC time series (`cfactor/sample_FC.py`)
+ 
+For the top ~20 arable crops (based on area, saved in `~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx`) and a collapsed grassland class (top 5 by area, all LNF grassland codes merged), sample `tot_samples` parcels uniformly across crops and years 2021–2024, weighting polygons by area. For each sampled parcel: extract the annual Sentinel-2 time series, predict PV/NPV/Soil with the Section 4 unmixing model, clean for cloud/snow/shadow, and gap-fill per pixel with a Gaussian Process Regressor (max gap 15 days). Output: one pixel time series per `(lnf_code, yr, poly_id)`, saved to `samples_data_gpr.parquet`. Throughout, "pixel" means the single sampled pixel retained per parcel per year.
+ 
+#### Step 2 — Calibrate β (`cfactor/calibrate_cfactor.py`)
+ 
+1. Load the gap-filled FC.
+2. Build the reference table from the `Total` column of `C_Faktoren.csv`, bridging LNF codes → crop names via `Crop_DE` in the LNF spreadsheet (exact match → normalised-form fallback → optional manual-overrides CSV). Per-crop Swiss arable area (mean over `area_years`) is pulled from the same spreadsheet for the area-weighted loss.
+3. Snap each FC pixel to the 100 m EI grid and merge EI onto each observation by `(x_snap, y_snap, doy)`.
+4. **Optimise β** with `scipy.optimize.minimize_scalar` (bounded Brent, `beta_bounds = (1e-4, 0.1)`). For each candidate β: compute `C_pixel(β)`, average to one value per crop, take `|C_predicted − C_ref|`, and reduce to a scalar — area-weighted MAE by default (so cereals dominate the fit) or unweighted (Matthews default). Crops in `exclude_calibration_lnf_codes` are dropped from the loss if `exp(-β·FC)` is inappropriate for permanent grasslands; they still appear in the per-pixel output.
+5. At β_opt, recompute `C_pixel` for every sampled pixel as the operational product.
+> Matthews et al. report β ≈ 0.04
+
+
+**Outputs**:
+- `samples_data_gpr.parquet` — gap-filled FC time series
+- `beta.json` — fitted β and weighting flag
+- `calibration_results.csv` — per-crop diagnostics at β_opt
+- `calibration_results_per_pixel.csv` — per-pixel C-factors at β_opt (operational product)
+- `calibration_scatter.png`, `beta_sensitivity.png` — diagnostic plots
+
+
+
+To analyse the calibration on the samples:
+```bash
+python analyse_calibration_sample.py
+```
+Results will be written to `calibration_analysis/`
+
+
+To apply the C-factor calcuation on a region and copare to tabulted values:
+```bash
+python apply_and_compare.py
 ```
 
+
+Compute C-factor on all data
+Analse C-factors (crop type, region, temporal efffects)
 ---
 
 ### 8. Driver Analysis (`driver_analysis/`) *(incomplete)*
