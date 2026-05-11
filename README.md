@@ -363,21 +363,21 @@ For the top ~20 arable crops (based on area, saved in `~/mnt/eo-nas1/data/landus
 
 
 
-To analyse the calibration on the samples:
+**Analyse the calibration on the samples**
 ```bash
 python analyse_calibration_sample.py
 ```
 Results will be written to `calibration_analysis/`
 
 
-To apply the C-factor calcuation on a region and copare to tabulted values:
+**Apply the C-factor calcuation on a region and compare to tabulated values**
 ```bash
 python apply_and_compare.py
 ```
 
 
-Compute C-factor on all data
-Analse C-factors (crop type, region, temporal efffects)
+**Compute C-factor on all data**
+**Analse C-factors (crop type, region, temporal efffects)**
 ---
 
 ### 8. Driver Analysis (`driver_analysis/`) *(incomplete)*
