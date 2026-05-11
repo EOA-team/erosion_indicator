@@ -90,6 +90,10 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
     for lnf_yr in lnf_files:
         yr = lnf_yr.split('lnf')[-1].split('.gpkg')[0]
         lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
+        # Some years (2021) have duplicated geometries
+        lnf["geom_wkb"] = lnf.geometry.to_wkb()
+        lnf = lnf.drop_duplicates(subset=["lnf_code", "geom_wkb"])
+        lnf = lnf.drop(columns="geom_wkb")
         # Set all grasslands to same class
         lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
@@ -270,7 +274,7 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
             continue
 
         # Extract S2 data: add a month before and after
-        ds_s2 = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-12-01', f'{int(yr)+1}-01-31')) #.sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
+        ds_s2 = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
         try:
             mask = ds_s2.rename({'lat':'y', 'lon':'x'}).rio.write_crs(32632).rio.clip([polygon], ds_s2.rio.crs, drop=True)  # Clip S2 data to the polygon
         except:
