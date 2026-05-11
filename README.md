@@ -375,9 +375,10 @@ Results will be written to `calibration_analysis/`
 python apply_and_compare.py
 ```
 
-
+To complete:
 **Compute C-factor on all data**
 **Analse C-factors (crop type, region, temporal efffects)**
+
 ---
 
 ### 8. Driver Analysis (`driver_analysis/`) *(incomplete)*
