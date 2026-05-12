@@ -319,6 +319,8 @@ The final predictions are saved as `grid_EI_daily_avg_pred_20260424_nn3.parquet`
 - `erosivity_index/check_predictions.py` — spatial and temporal patterns in predictions, plotting. Saves in `erosivity_index/results`
 - `erosivity_index/extract_model_info.py` — extract test scores from a trained model.
 
+> [!IMPORTANT]
+> The results of the upscaled product can be viewed in the plots in `results`. The overall trend follows the [BAFU product](https://map.geo.admin.ch/#/map?lang=en&center=2611932.83,1202957.3&z=2.154&topic=bafu&layers=ch.bafu.erosion-gruenland_bodenabtrag_mai,f;ch.bafu.niederschlagserosivitaet-mai;ch.bafu.geochemischer-bodenatlas_schweiz_arsen,f&bgLayer=ch.swisstopo.pixelkarte-grau&catalogNodes=bafu,768,781,1361,767,784,798,804,806,826,843,849,851,1505,15157,2801,2828,2833) which uses data from the 80's to 2000's. There is also spatial corrlation, but some extreme values are not found in the new upscaled product.
 ---
 
 ### 7. C-factor (`cfactor/`)
