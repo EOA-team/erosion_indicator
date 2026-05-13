@@ -18,10 +18,11 @@ CONFIG = {
     'lnf_dir':         '~/mnt/eo-nas1/data/landuse/raw', # will use 2021-2024 
     'top_crops': None,
     'lnf_ignore_codes': [553, 554, 555, 556, 559, 572, 594, 595, 598, 618, 625], # arable or grassland classes to ignore
-    'collapse_grassland': True,   # False = sample each grassland subtype separately
-    'tot_samples':         10000, 
+    'grassland_codes': [601,602],  # LNF codes for grassland to include in sampling (e.g. [601, 611])
+    'tot_samples':         10000,
     'samples_path':        'samples.pkl',
     'samples_s2_path':     'samples_data.pkl',
+    'fc_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/FC',  # pre-computed FC; falls back to S2+prediction if files are missing
     's2_grid_path':        '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
     's2_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
     'soil_dir':            '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',

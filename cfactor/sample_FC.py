@@ -324,6 +324,79 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
     return
 
 
+def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, save_path_FCpreds):
+    """Extract pre-computed FC (pv, npv, soil) from fc_dir.
+
+    Files must follow the same naming convention as raw S2 files (S2_left_top_year.*).
+    Returns True on success, False if any required files are missing (triggers S2+prediction fallback).
+    """
+    print(f'Extracting pre-computed FC from {fc_dir}')
+    samples = pd.read_pickle(save_path_sampledloc)
+
+    grid = gpd.read_file(s2_grid_path)
+    grid_samples = gpd.overlay(samples, grid, how='intersection')
+
+    file_lookup = {}
+    for fname in os.listdir(fc_dir):
+        key = "_".join(fname.split("_")[:4])[:-4]
+        file_lookup.setdefault(key, []).append(os.path.join(fc_dir, fname))
+
+    df_out = []
+    missing = []
+
+    for (poly_id, yr), poly_df in grid_samples.groupby(['poly_id', 'yr']):
+        polygon = poly_df.iloc[0]['polygon_geom']
+        tiles = poly_df[['left', 'top']].drop_duplicates()
+        tiles = [(row['left'], row['top']) for _, row in tiles.iterrows()]
+        matched_files = []
+        for (left, top) in tiles:
+            for y in [int(yr), int(yr) - 1]:
+                key = f"S2_{int(left)}_{int(top)}_{y}"
+                matched_files.extend(file_lookup.get(key, []))
+
+        if not matched_files:
+            missing.append((poly_id, yr))
+            continue
+
+        ds_fc = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
+        try:
+            clipped = ds_fc.rename({'lat': 'y', 'lon': 'x'}).rio.write_crs(32632).rio.clip(
+                [polygon], ds_fc.rio.crs, drop=True
+            )
+        except Exception:
+            missing.append((poly_id, yr))
+            continue
+
+        df_fc = clipped.to_dataframe().reset_index()
+        # Normalise capitalised variable names to lowercase
+        df_fc = df_fc.rename(columns={'PV': 'pv', 'NPV': 'npv', 'Soil': 'soil'})
+        fc_cols = [c for c in ['pv', 'npv', 'soil'] if c in df_fc.columns]
+        if fc_cols:
+            df_fc = df_fc.loc[(df_fc[fc_cols] != 0).any(axis=1)]
+
+        df_fc["lnf_code"] = poly_df.iloc[0]["lnf_code"]
+        df_fc["yr"] = yr
+        df_fc["poly_id"] = poly_id
+
+        sampled_x = poly_df.iloc[0]["x"]
+        sampled_y = poly_df.iloc[0]["y"]
+        snap_x, snap_y = snap_to_grid(sampled_x, sampled_y, ds_fc)
+        df_fc["is_sample_pixel"] = (df_fc["x"] == snap_x) & (df_fc["y"] == snap_y)
+        df_fc["sampled_x"] = sampled_x
+        df_fc["sampled_y"] = sampled_y
+        df_fc['x'] = df_fc['x'].apply(lambda v: v - 5)
+        df_fc['y'] = df_fc['y'].apply(lambda v: v + 5)
+
+        df_out.append(df_fc)
+
+    if missing:
+        print(f'  Pre-computed FC missing for {len(missing)} poly/yr combinations — falling back to S2 extraction and prediction')
+        return False
+
+    pd.concat(df_out, ignore_index=True).to_pickle(save_path_FCpreds)
+    return True
+
+
 def predict_FC(save_path_sampledloc_S2: str, save_path_FCpreds: str) -> None:
     """Predict fractional cover (PV, NPV, Soil) for all sampled pixels.
 
@@ -427,27 +500,28 @@ def clean_timeseries_field(field_df, cirrus_thresh=500, max_missing_frac=0.05):
     """
     field_df: all pixels in one field for a given year (or grouping)
     max_missing_frac: drop dates where more than this fraction of pixels are masked
+
+    When S2 bands are present, applies full cloud/shadow/snow masking.
+    When only pre-computed FC (pv/npv/soil) is present, drops NaN-only rows.
     """
     band_cols = [c for c in field_df.columns if c.startswith('s2_B')]
 
-    # Create masks for all pixels
-    missing_mask = (field_df[band_cols].isna()).all(axis=1) 
-    missing_mask2 = (field_df[band_cols] == 65535).all(axis=1) 
-    cloud_mask = (field_df['s2_mask'] == 1) | (field_df['s2_SCL'].isin([8, 9, 10]))
-    shadow_mask = (field_df['s2_mask'] == 2) | (field_df['s2_SCL'] == 3)
-    snow_mask = (field_df['s2_mask'] == 3) | (field_df['s2_SCL'] == 11)
-    cirrus_mask = (field_df['s2_SCL'] == 10) & (field_df['s2_B02'] > cirrus_thresh)
+    if band_cols:
+        missing_mask = (field_df[band_cols].isna()).all(axis=1)
+        missing_mask2 = (field_df[band_cols] == 65535).all(axis=1)
+        cloud_mask = (field_df['s2_mask'] == 1) | (field_df['s2_SCL'].isin([8, 9, 10]))
+        shadow_mask = (field_df['s2_mask'] == 2) | (field_df['s2_SCL'] == 3)
+        snow_mask = (field_df['s2_mask'] == 3) | (field_df['s2_SCL'] == 11)
+        cirrus_mask = (field_df['s2_SCL'] == 10) & (field_df['s2_B02'] > cirrus_thresh)
+        drop_mask = missing_mask | missing_mask2 | cloud_mask | shadow_mask | snow_mask | cirrus_mask
+    else:
+        fc_cols = [c for c in ['pv', 'npv', 'soil'] if c in field_df.columns]
+        drop_mask = field_df[fc_cols].isna().all(axis=1) if fc_cols else pd.Series(False, index=field_df.index)
 
-    # Combine masks
-    drop_mask = missing_mask | missing_mask2 | cloud_mask | shadow_mask | snow_mask | cirrus_mask
+    field_df = field_df.copy()
     field_df['masked'] = drop_mask.astype(int)
-
-    # Compute fraction of masked pixels per date
     masked_frac_per_date = field_df.groupby('time')['masked'].mean()
-
-    # Keep only dates where fraction of masked pixels <= threshold
     valid_dates = masked_frac_per_date[masked_frac_per_date <= max_missing_frac].index
-
     return field_df[field_df['time'].isin(valid_dates)].drop(columns='masked')
 
 
@@ -1168,22 +1242,29 @@ def run_sampling_pipeline(config: dict) -> None:
         )
 
     # =====================================
-    # Extract S2 and Soil data (extract whole year + a month before/after)
-    samples_s2_path = config['samples_s2_path']
-    if not os.path.exists(samples_s2_path):
-        extract_s2_data_field(
-            samples_path,
-            os.path.expanduser(config['s2_grid_path']),
-            os.path.expanduser(config['s2_dir']),
-            os.path.expanduser(config['soil_dir']),
-            samples_s2_path 
-        )
-
-    # =====================================
-    # Predict FC
+    # Extract FC: use pre-computed files if available, otherwise extract S2 + predict
     fc_preds_path = config['fc_preds_path']
+    fc_dir = os.path.expanduser(config.get('fc_dir', '~/mnt/eo-nas1/data/satellite/sentinel2/FC'))
     if not os.path.exists(fc_preds_path):
-        predict_FC(samples_s2_path, fc_preds_path)
+        used_precomputed = False
+        if os.path.isdir(fc_dir):
+            used_precomputed = extract_precomputed_fc_field(
+                samples_path,
+                os.path.expanduser(config['s2_grid_path']),
+                fc_dir,
+                fc_preds_path
+            )
+        if not used_precomputed:
+            samples_s2_path = config['samples_s2_path']
+            if not os.path.exists(samples_s2_path):
+                extract_s2_data_field(
+                    samples_path,
+                    os.path.expanduser(config['s2_grid_path']),
+                    os.path.expanduser(config['s2_dir']),
+                    os.path.expanduser(config['soil_dir']),
+                    samples_s2_path
+                )
+            predict_FC(samples_s2_path, fc_preds_path)
 
     # =====================================
     # Clean and filter timeseries
@@ -1320,6 +1401,7 @@ DEFAULT_CONFIG = {
     'tot_samples':         10000,
     'samples_path':        'samples.pkl',
     'samples_s2_path':     'samples_data.pkl',
+    'fc_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/FC',  # pre-computed FC; falls back to S2+prediction if files are missing
     's2_grid_path':        '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
     's2_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
     'soil_dir':            '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',
