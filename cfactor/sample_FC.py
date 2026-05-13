@@ -10,19 +10,26 @@ import matplotlib.pyplot as plt
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel, Matern
 from sklearn.preprocessing import StandardScaler
+import torch
 import warnings
 warnings.simplefilter("ignore")
 import sys
 sys.path.insert(0, os.path.expanduser('~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/SALI_models'))
-from src.model_utils import compute_FC, compute_FC_grassland
+from src.model_utils import load_all_models
 
 
-def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, seed=42):
+def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, collapse_grassland=True, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps) (EPSG:2056)"""
 
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
     n_years = len(lnf_files)
-    n_crops = len(lnf_codes)
+    # When collapsing, only one grassland slot is sampled — exclude the extra codes from the count
+    effective_lnf_codes = (
+        [c for c in lnf_codes if c not in grassland_codes[1:]]
+        if collapse_grassland and grassland_codes
+        else lnf_codes
+    )
+    n_crops = len(effective_lnf_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -31,15 +38,15 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, gr
     for lnf_yr in lnf_files:
         yr = lnf_yr.split('lnf')[-1].split('.gpkg')[0]
         lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
-        # Set all grasslands to same class
-        lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
+        if collapse_grassland and grassland_codes:
+            lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
-        lnf = lnf[lnf.lnf_code.isin(lnf_codes)]
+        lnf = lnf[lnf.lnf_code.isin(effective_lnf_codes)]
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
         seed += 1 # so that among differetn years it varies
-        for crop in lnf_codes:
+        for crop in effective_lnf_codes:
             crop_polys = lnf[lnf.lnf_code == crop]
 
             sampled_polys = crop_polys.sample(
@@ -73,15 +80,21 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, gr
     return
 
 
-def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, target_crs=32632, seed=42):
+def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, collapse_grassland=True, target_crs=32632, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps)"""
 
     # Consider only 2021-2025 (to match LNF code)
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
     lnf_files = [f for f in lnf_files if 2021 <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= 2024]
-    
+
     n_years = len(lnf_files)
-    n_crops = len(lnf_codes)
+    # When collapsing, only one grassland slot is sampled — exclude the extra codes from the count
+    effective_lnf_codes = (
+        [c for c in lnf_codes if c not in grassland_codes[1:]]
+        if collapse_grassland and grassland_codes
+        else lnf_codes
+    )
+    n_crops = len(effective_lnf_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -94,15 +107,15 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
         lnf["geom_wkb"] = lnf.geometry.to_wkb()
         lnf = lnf.drop_duplicates(subset=["lnf_code", "geom_wkb"])
         lnf = lnf.drop(columns="geom_wkb")
-        # Set all grasslands to same class
-        lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
+        if collapse_grassland and grassland_codes:
+            lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
-        lnf = lnf[lnf.lnf_code.isin(lnf_codes)]
+        lnf = lnf[lnf.lnf_code.isin(effective_lnf_codes)]
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
         seed += 1 # so that among different years it varies
-        for crop in lnf_codes:
+        for crop in effective_lnf_codes:
             crop_polys = lnf[lnf.lnf_code == crop].to_crs(target_crs)
             if len(crop_polys) == 0:
                 continue
@@ -327,53 +340,61 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
     return
 
 
-def predict_FC(save_path_sampledloc_S2, save_path_FCpreds):
-    print('Predict FC')
+def predict_FC(save_path_sampledloc_S2: str, save_path_FCpreds: str) -> None:
+    """Predict fractional cover (PV, NPV, Soil) for all sampled pixels.
 
+    Models are loaded once and each soil group is processed by its own model only,
+    avoiding repeated disk I/O and redundant cross-group predictions.
+    """
     bands = ['s2_B02','s2_B03','s2_B04','s2_B05','s2_B06','s2_B07','s2_B08','s2_B8A','s2_B11','s2_B12']
     df_samples = pd.read_pickle(save_path_sampledloc_S2)
 
-    # Prepare data
-    df_samples[df_samples==65535] = np.nan
+    df_samples[df_samples == 65535] = np.nan
     df_samples = df_samples.dropna()
     df_samples[bands] /= 10000
+    df_samples['soil_group'] = df_samples['soil_group'].astype(int)
 
-    # Predict using correct model
-    df_global = df_samples[df_samples.soil_group==0].copy()
-    df_soil   = df_samples[df_samples.soil_group!=0].copy()
+    soil_groups = sorted(df_samples['soil_group'].unique().tolist())
+    n_groups = len(soil_groups)
+    print(f'Predict FC — {len(df_samples):,} rows, {n_groups} soil groups — loading models...', end=' ', flush=True)
 
-    data_global = df_samples[df_samples.soil_group==0][bands].to_numpy()
-    data_soil = df_samples[df_samples.soil_group!=0][bands].to_numpy()
+    model_dir = os.path.expanduser('~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/SALI_models/FC/models/')
+    models_dict = load_all_models(model_dir, soil_groups)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('done', flush=True)
 
-    all_preds_global = []
-    all_preds_soil =  []
-    chunk_size = 10000
-    for i in range(0, len(data_global), chunk_size):
-        chunk = data_global[i:i+chunk_size]
-        preds = compute_FC_grassland(chunk)   # pv, npv, soil
-        all_preds_global.append(preds)
-    for i in range(0, len(data_soil), chunk_size):
-        chunk = data_soil[i:i+chunk_size]
-        preds = compute_FC(chunk)   # pv, npv, soil
-        all_preds_soil.append(preds)
+    def _run_ensemble(data: np.ndarray, models: dict, chunk_size: int = 50000) -> np.ndarray:
+        """Run 5-iteration ensemble for one soil group; returns (n, 3) normalised array."""
+        n = len(data)
+        acc = np.zeros((n, 3), dtype=np.float32)
+        for iteration in range(1, 6):
+            m_pv  = models[iteration]['PV']
+            m_npv = models[iteration]['NPV']
+            m_s   = models[iteration]['Soil']
+            m_pv.eval(); m_npv.eval(); m_s.eval()
+            for start in range(0, n, chunk_size):
+                X = torch.from_numpy(data[start:start + chunk_size]).float().to(device)
+                with torch.no_grad():
+                    acc[start:start + chunk_size, 0] += m_pv(X).cpu().numpy().squeeze()
+                    acc[start:start + chunk_size, 1] += m_npv(X).cpu().numpy().squeeze()
+                    acc[start:start + chunk_size, 2] += m_s(X).cpu().numpy().squeeze()
+        acc /= 5.0
+        acc = acc.clip(0, 1)
+        row_sums = acc.sum(axis=1, keepdims=True)
+        acc /= np.where(row_sums > 0, row_sums, 1.0)
+        return acc
 
-    # Combine results
-    preds_global = np.vstack(all_preds_global)
-    preds_soil = np.vstack(all_preds_soil)
+    result_parts = []
+    for idx, sg in enumerate(soil_groups):
+        subset = df_samples[df_samples['soil_group'] == sg].copy()
+        preds = _run_ensemble(subset[bands].to_numpy(), models_dict[sg])
+        subset[['pv', 'npv', 'soil']] = preds
+        result_parts.append(subset)
+        print(f'\r  [{idx + 1}/{n_groups}] soil_group={sg}: {len(subset):,} rows done  ', end='', flush=True)
 
-    # Assing predictions
-    df_global[['pv', 'npv', 'soil']] = preds_global
-
-    preds_soil = pd.DataFrame(preds_soil, columns=['soil_group', 'pv', 'npv', 'soil'])
-    df_soil = df_soil.copy()
-    df_soil['row_idx'] = np.arange(len(df_soil))   
-    preds_soil['row_idx'] = np.tile(np.arange(len(df_soil)), 5)
-    df_soil = pd.merge(df_soil, preds_soil, on=['row_idx', 'soil_group'])
-
-    df_samples = pd.concat([df_global, df_soil]).sort_index().drop(columns=['row_idx', 'soil_group'])
-    df_samples.to_pickle(save_path_FCpreds)
-
-    return
+    print(flush=True)
+    df_out = pd.concat(result_parts).sort_index().drop(columns=['soil_group'])
+    df_out.to_pickle(save_path_FCpreds)
 
 
 def clean_timeseries_df(group, cirrus_thresh=1000):
@@ -1160,7 +1181,8 @@ def run_sampling_pipeline(config: dict) -> None:
         sample_locations_with_field(
             lnf_labels_path, lnf_dir,
             config['tot_samples'], samples_path,
-            lnf_codes, grass_codes
+            lnf_codes, grass_codes,
+            collapse_grassland=config.get('collapse_grassland', True)
         )
 
     # =====================================
@@ -1321,6 +1343,7 @@ DEFAULT_CONFIG = {
         'Mixtures of beans, vetch, peas, chickpeas, and lupins with cereals or camelina, minimum 30% legumes at harvest (for grain)',
         'Spring barley', 'Annual berries (e.g., strawberries)',
     ],
+    'collapse_grassland': True,   # False = sample each grassland subtype separately
     'tot_samples':    1000,
     'samples_path':   'samples.pkl',
     'samples_s2_path': 'samples_data.pkl',

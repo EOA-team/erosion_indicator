@@ -18,6 +18,7 @@ CONFIG = {
     'lnf_dir':         '~/mnt/eo-nas1/data/landuse/raw', # will use 2021-2024 
     'top_crops': None,
     'lnf_ignore_codes': [553, 554, 555, 556, 559, 572, 594, 595, 598, 618, 625], # arable or grassland classes to ignore
+    'collapse_grassland': True,   # False = sample each grassland subtype separately
     'tot_samples':         10000, 
     'samples_path':        'samples.pkl',
     'samples_s2_path':     'samples_data.pkl',
@@ -38,7 +39,7 @@ CONFIG = {
     'ts_cols':                  ['lnf_code', 'yr', 'poly_id'],
     'crop_col':                 'lnf_code',
     'beta_bounds':              (1e-4, 0.1),
-    'exclude_calibration_lnf_codes': [601, 611, 545, 546],  # Kunstwiesen, Extensiv genutzte Wiesen
+    'exclude_calibration_lnf_codes': [], #[601, 611, 545, 546],  # Kunstwiesen, Extensiv genutzte Wiesen
     # FC is on a 0–100 scale here (PV+NPV scaled by 100). Matthews et al. (2023)
     # found β ≈ 0.04 with FC on 0–1, so the equivalent here is ≈ 0.0004
     'area_weight_loss':         True, # If True, weight the loss by Swiss arable area per crop (areas from the LNF spreadsheet)
