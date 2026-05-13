@@ -18,18 +18,12 @@ sys.path.insert(0, os.path.expanduser('~/mnt/eo-nas1/eoa-share/projects/012_EO_d
 from src.model_utils import load_all_models
 
 
-def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, collapse_grassland=True, seed=42):
+def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps) (EPSG:2056)"""
 
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
     n_years = len(lnf_files)
-    # When collapsing, only one grassland slot is sampled — exclude the extra codes from the count
-    effective_lnf_codes = (
-        [c for c in lnf_codes if c not in grassland_codes[1:]]
-        if collapse_grassland and grassland_codes
-        else lnf_codes
-    )
-    n_crops = len(effective_lnf_codes)
+    n_crops = len(lnf_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -38,15 +32,13 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, gr
     for lnf_yr in lnf_files:
         yr = lnf_yr.split('lnf')[-1].split('.gpkg')[0]
         lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
-        if collapse_grassland and grassland_codes:
-            lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
-        lnf = lnf[lnf.lnf_code.isin(effective_lnf_codes)]
+        lnf = lnf[lnf.lnf_code.isin(lnf_codes)]
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
         seed += 1 # so that among differetn years it varies
-        for crop in effective_lnf_codes:
+        for crop in lnf_codes:
             crop_polys = lnf[lnf.lnf_code == crop]
 
             sampled_polys = crop_polys.sample(
@@ -80,7 +72,7 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, gr
     return
 
 
-def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, grassland_codes, collapse_grassland=True, target_crs=32632, seed=42):
+def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, target_crs=32632, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps)"""
 
     # Consider only 2021-2025 (to match LNF code)
@@ -88,13 +80,7 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
     lnf_files = [f for f in lnf_files if 2021 <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= 2024]
 
     n_years = len(lnf_files)
-    # When collapsing, only one grassland slot is sampled — exclude the extra codes from the count
-    effective_lnf_codes = (
-        [c for c in lnf_codes if c not in grassland_codes[1:]]
-        if collapse_grassland and grassland_codes
-        else lnf_codes
-    )
-    n_crops = len(effective_lnf_codes)
+    n_crops = len(lnf_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -107,15 +93,13 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
         lnf["geom_wkb"] = lnf.geometry.to_wkb()
         lnf = lnf.drop_duplicates(subset=["lnf_code", "geom_wkb"])
         lnf = lnf.drop(columns="geom_wkb")
-        if collapse_grassland and grassland_codes:
-            lnf.loc[lnf['lnf_code'].isin(grassland_codes), 'lnf_code'] = grassland_codes[0]
         # Filter to keep only relevant polys
-        lnf = lnf[lnf.lnf_code.isin(effective_lnf_codes)]
+        lnf = lnf[lnf.lnf_code.isin(lnf_codes)]
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
         seed += 1 # so that among different years it varies
-        for crop in effective_lnf_codes:
+        for crop in lnf_codes:
             crop_polys = lnf[lnf.lnf_code == crop].to_crs(target_crs)
             if len(crop_polys) == 0:
                 continue
@@ -1149,17 +1133,16 @@ def run_sampling_pipeline(config: dict) -> None:
     df_labels = pd.read_excel(lnf_labels_path, sheet_name='label_sheet')
     if top_crops is None:
         df_arable = df_labels[df_labels['Crop_Label_lv3'].isin(['Arable Land'])]
-        df_grass = df_labels[df_labels['Crop_Label_lv3'].isin(['Grassland'])]
+        #df_grass = df_labels[df_labels['Crop_Label_lv3'].isin(['Grassland'])]
         top_crops = set()
-        top_grass = set()
+        #top_grass = set()
         for c in ['2022_Area_m23', '2023_Area_m24', '2024_Area_m25']:
             top_crops.update(df_arable.sort_values(by=c, ascending=False)[:20]['Crop_EN'].tolist())
-            top_grass.update(df_grass.sort_values(by=c, ascending=False)[:5]['Crop_EN'].tolist())
+            #top_grass.update(df_grass.sort_values(by=c, ascending=False)[:5]['Crop_EN'].tolist())
 
     arable_codes      = df_labels[df_labels['Crop_EN'].isin(top_crops)]['LNF_code'].unique().tolist()
     arable_codes      = [c for c in arable_codes if c not in exclude_codes]
-    grass_codes       = df_labels[df_labels['Crop_EN'].isin(top_grass)]['LNF_code'].unique().tolist()
-    grass_codes       = [c for c in grass_codes if c not in exclude_codes]
+    grass_codes       = [c for c in config.get('grassland_codes', []) if c not in exclude_codes]
     lnf_codes = arable_codes + grass_codes
     print(f"LNF codes (crops: {len(arable_codes)}, grass: {len(grass_codes)}): {lnf_codes}")
 
@@ -1175,14 +1158,13 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # =====================================
     # Sample main crops locations (per year, across space) and save
-    # Consider only 2021-2024. All grassland classes collapsed to single class
+    # Consider only 2021-2024.
     samples_path = config['samples_path']
     if not os.path.exists(samples_path):
         sample_locations_with_field(
             lnf_labels_path, lnf_dir,
             config['tot_samples'], samples_path,
-            lnf_codes, grass_codes,
-            collapse_grassland=config.get('collapse_grassland', True)
+            lnf_codes
         )
 
     # =====================================
@@ -1334,7 +1316,7 @@ DEFAULT_CONFIG = {
     'lnf_dir':         '~/mnt/eo-nas1/data/landuse/raw',
     'top_crops': None,  # None = auto-detect top crops from LNF area stats; or pass an explicit list of crop names
     'lnf_ignore_codes': [553, 554, 555, 556, 559, 572, 594, 595, 598, 618, 625],  # arable or grassland classes to ignore
-    'collapse_grassland': True,   # False = sample each grassland subtype separately
+    'grassland_codes': [],  # LNF codes for grassland to include in sampling (e.g. [601, 611])
     'tot_samples':         10000,
     'samples_path':        'samples.pkl',
     'samples_s2_path':     'samples_data.pkl',
