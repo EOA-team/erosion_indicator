@@ -83,6 +83,7 @@ import os
 import numpy as np
 import pandas as pd
 import re as _re
+import json
 import matplotlib.pyplot as plt
 import pyarrow.dataset as ds
 import pyarrow.compute as pc
@@ -656,7 +657,9 @@ def run_calibration(config: dict) -> None:
                                        crop_col=crop_col,
                                        beta_bounds=beta_bounds,
                                        area_weight=area_weight_loss)
- 
+    with open('beta.json', 'w') as f:
+        json.dump({'beta': beta_opt, 'area_weight_loss': area_weight_loss}, f)
+        
     # Save crop-level calibration table
     df_crop.to_csv(results_path, index=False)
     print(f"Per-crop calibration results saved to {results_path}")
@@ -678,7 +681,28 @@ def run_calibration(config: dict) -> None:
                           area_weight=area_weight_loss)
  
  
-# Expected config keys (defined and owned by main.py):
+DEFAULT_CONFIG = {
+    # ---- Calibration ----
+    'gapfilled_fc_path':         'samples_data_gpr.parquet',
+    'ei_path':                   '../erosivity_index/predictions/grid_EI_daily_avg_pred_20260424_nn3.parquet',
+    'c_factor_table_path':       'C_Faktoren.csv',
+    'lnf_classification_path':   '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
+    'manual_overrides_path':     None,  # only needed if any sampled crops fail to auto-match LNF codes
+    'calibration_results_path':  'calibration_results.csv',
+    'ts_cols':                   ['lnf_code', 'yr', 'poly_id'],
+    'crop_col':                  'lnf_code',
+    'beta_bounds':               (1e-4, 0.1),
+    'exclude_calibration_lnf_codes': [],  # e.g. [601, 611, 545, 546] for Kunstwiesen, Extensiv genutzte Wiesen
+    'area_weight_loss':          True,   # False = equal-weight crops as in Matthews et al. 2023
+    'area_years':                [2021, 2022, 2023, 2024],
+}
+
+
+if __name__ == '__main__':
+    run_calibration(DEFAULT_CONFIG)
+
+
+# Config keys used by run_calibration (defined and owned by main.py):
 #   gapfilled_fc_path        — parquet of gapfilled FC time series (from sampling step)
 #   ei_path                  — parquet of climatological daily EI on 100 m grid
 #   c_factor_table_path      — C_Faktoren.csv (semicolon-separated, latin-1)

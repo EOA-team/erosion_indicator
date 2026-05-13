@@ -28,6 +28,7 @@ CONFIG = {
     'fc_preds_path':       'samples_data_pred.pkl',
     'gapfilled_fc_path':   'samples_data_gpr.parquet',
     'max_gap_days':        15,
+    'drop_fraction_threshold': 0.7,  # drop fields where >70% of observations are masked
     'n_jobs':              1,
 
     # ---- Calibration (calibrate_cfactor.py) ----

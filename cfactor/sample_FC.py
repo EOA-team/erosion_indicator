@@ -1329,31 +1329,23 @@ def run_sampling_pipeline(config: dict) -> None:
 
 
 DEFAULT_CONFIG = {
+    # ---- Sampling / gapfilling ----
     'lnf_labels_path': '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
     'lnf_dir':         '~/mnt/eo-nas1/data/landuse/raw',
-    'top_crops': [
-        'Winter wheat (excluding Swiss Granum fodder wheat)', 'Silage and green maize',
-        'Winter rapeseed for edible oil', 'Winter barley', 'Sugar beets', 'Grain maize',
-        'Annual open-field vegetables, excluding preserved vegetables', 'Potatoes',
-        'Fodder wheat according to Swiss Granum list', 'Sunflower for edible oil', 'Spelt',
-        'Triticale', 'Spring wheat (excluding Swiss Granum fodder wheat)', 'Soybean',
-        'Peas for grain production (e.g., protein peas)', 'Oats', 'Rye',
-        'Open-field vegetables for preservation', 'Seed potatoes (contract farming)',
-        'Beans and vetches for grain production (e.g., field beans)',
-        'Mixtures of beans, vetch, peas, chickpeas, and lupins with cereals or camelina, minimum 30% legumes at harvest (for grain)',
-        'Spring barley', 'Annual berries (e.g., strawberries)',
-    ],
+    'top_crops': None,  # None = auto-detect top crops from LNF area stats; or pass an explicit list of crop names
+    'lnf_ignore_codes': [553, 554, 555, 556, 559, 572, 594, 595, 598, 618, 625],  # arable or grassland classes to ignore
     'collapse_grassland': True,   # False = sample each grassland subtype separately
-    'tot_samples':    1000,
-    'samples_path':   'samples.pkl',
-    'samples_s2_path': 'samples_data.pkl',
-    's2_grid_path':   '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
-    's2_dir':         '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
-    'soil_dir':       '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',
-    'fc_preds_path':  'samples_data_pred.pkl',
-    'gapfilled_fc_path': 'samples_data_gpr.parquet',
-    'max_gap_days':   15,
-    'n_jobs':         1,
+    'tot_samples':         10000,
+    'samples_path':        'samples.pkl',
+    'samples_s2_path':     'samples_data.pkl',
+    's2_grid_path':        '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
+    's2_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
+    'soil_dir':            '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',
+    'fc_preds_path':       'samples_data_pred.pkl',
+    'gapfilled_fc_path':   'samples_data_gpr.parquet',
+    'max_gap_days':        15,
+    'drop_fraction_threshold': 0.7,  # drop fields where >70% of observations are masked
+    'n_jobs':              1,
 }
 
 
