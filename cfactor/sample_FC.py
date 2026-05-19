@@ -72,12 +72,12 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, se
     return
 
 
-def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, target_crs=32632, seed=42):
+def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, yrs, target_crs=32632, seed=42):
     """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps)"""
 
     # Consider only 2021-2025 (to match LNF code)
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
-    lnf_files = [f for f in lnf_files if 2021 <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= 2024]
+    lnf_files = [f for f in lnf_files if yrs[0] <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= yrs[-1]]
 
     n_years = len(lnf_files)
     n_crops = len(lnf_codes)
@@ -357,8 +357,9 @@ def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, sav
         if not matched_files:
             missing.append((poly_id, yr))
             continue
-
+        matched_files = [f for f in matched_files if f.endswith('zarr')]
         ds_fc = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
+        # PROBLEM: has no SCL/cloud bands
         try:
             clipped = ds_fc.rename({'lat': 'y', 'lon': 'x'}).rio.write_crs(32632).rio.clip(
                 [polygon], ds_fc.rio.crs, drop=True
@@ -1197,26 +1198,24 @@ def run_sampling_pipeline(config: dict) -> None:
     """Run the full sampling + gapfilling pipeline. Skips steps whose output already exists."""
 
     # =====================================
-    # Identify main crops to consider: use only areas stats from 2021-2024
+    # Identify main crops to consider: 
     lnf_labels_path = os.path.expanduser(config['lnf_labels_path'])
     lnf_dir         = os.path.expanduser(config['lnf_dir'])
     exclude_codes = config['lnf_ignore_codes']
+    yrs = config['years']
 
-    # Resolve LNF codes for top arable crops + grassland
+    # Resolve LNF codes for top arable crops
     top_crops = config.get('top_crops')
     df_labels = pd.read_excel(lnf_labels_path, sheet_name='label_sheet')
     if top_crops is None:
         df_arable = df_labels[df_labels['Crop_Label_lv3'].isin(['Arable Land'])]
-        #df_grass = df_labels[df_labels['Crop_Label_lv3'].isin(['Grassland'])]
         top_crops = set()
-        #top_grass = set()
-        for c in ['2022_Area_m23', '2023_Area_m24', '2024_Area_m25']:
+        for c in [f'{yr}_Area_m{str(yr+1)[-2:]}' for yr in yrs]:
             top_crops.update(df_arable.sort_values(by=c, ascending=False)[:20]['Crop_EN'].tolist())
-            #top_grass.update(df_grass.sort_values(by=c, ascending=False)[:5]['Crop_EN'].tolist())
 
     arable_codes      = df_labels[df_labels['Crop_EN'].isin(top_crops)]['LNF_code'].unique().tolist()
     arable_codes      = [c for c in arable_codes if c not in exclude_codes]
-    grass_codes       = [c for c in config.get('grassland_codes', []) if c not in exclude_codes]
+    grass_codes       = [c for c in config.get('grassland_codes', []) if c not in exclude_codes and c not in arable_codes]
     lnf_codes = arable_codes + grass_codes
     print(f"LNF codes (crops: {len(arable_codes)}, grass: {len(grass_codes)}): {lnf_codes}")
 
@@ -1232,29 +1231,30 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # =====================================
     # Sample main crops locations (per year, across space) and save
-    # Consider only 2021-2024.
-    samples_path = config['samples_path']
-    if not os.path.exists(samples_path):
-        sample_locations_with_field(
-            lnf_labels_path, lnf_dir,
-            config['tot_samples'], samples_path,
-            lnf_codes
-        )
+    # Consider only yrs from config
+    use_precomputed = config['fc_precompute']
+    if not use_precomputed:
+        samples_path = config['samples_path']
+        if not os.path.exists(samples_path):
+            sample_locations_with_field(
+                lnf_labels_path, lnf_dir,
+                config['tot_samples'], samples_path,
+                lnf_codes, yrs
+            )
 
     # =====================================
     # Extract FC: use pre-computed files if available, otherwise extract S2 + predict
     fc_preds_path = config['fc_preds_path']
-    fc_dir = os.path.expanduser(config.get('fc_dir', '~/mnt/eo-nas1/data/satellite/sentinel2/FC'))
     if not os.path.exists(fc_preds_path):
-        used_precomputed = False
-        if os.path.isdir(fc_dir):
-            used_precomputed = extract_precomputed_fc_field(
+        if use_precomputed:
+            fc_dir = os.path.expanduser(config.get('fc_dir', '~/mnt/eo-nas1/data/satellite/sentinel2/FC'))
+            extract_precomputed_fc_field(
                 samples_path,
                 os.path.expanduser(config['s2_grid_path']),
                 fc_dir,
                 fc_preds_path
             )
-        if not used_precomputed:
+        else:
             samples_s2_path = config['samples_s2_path']
             if not os.path.exists(samples_s2_path):
                 extract_s2_data_field(
@@ -1270,13 +1270,17 @@ def run_sampling_pipeline(config: dict) -> None:
     # Clean and filter timeseries
     df_samples = pd.read_pickle(fc_preds_path)
 
+    # Remove bad dates within each field
     ts_cols = ['lnf_code', 'yr', 'poly_id']
+    cirrus_thresh = config.get('cirrus_thresh')
+    max_missing_frac = config.get('max_missing_frac')
     df_clean = (
         df_samples.groupby(ts_cols, group_keys=False)
-                  .apply(clean_timeseries_field)
+                  .apply(clean_timeseries_field, max_missing_frac=max_missing_frac, cirrus_thresh=cirrus_thresh)
                   .reset_index(drop=True)
     )
 
+    # Remove entire field at date if too much data was dropped per date
     n_before = df_samples.groupby(ts_cols).size().rename("n_total")
     n_after  = df_clean.groupby(ts_cols).size().rename("n_kept")
     df_drop_stats = pd.concat([n_before, n_after], axis=1).fillna(0)
