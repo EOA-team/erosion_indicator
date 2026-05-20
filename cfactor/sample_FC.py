@@ -146,6 +146,408 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
     return
 
 
+def _agis_shortlist(
+    nutzung_csv,
+    lnf_mapping_csv,
+    lnf_labels_path,
+    yrs,
+    top_arable_codes,
+    grassland_codes,
+    rules=('single_crop_farm', 'grassland_plus_one', 'dominant_crop'),
+    grass_min_share=0.50,
+    arable_min_share=0.02,
+    other_max_share=0.10,
+    dominant_share=0.80,
+):
+    """Build a (Flaechen_ID, Jahr, kulturcode) shortlist of "clean" arable fields
+    from AGIS Nutzungsdaten, applying the selection rules from check_agis.py.
+
+    `top_arable_codes` and `grassland_codes` are LNF codes (matching `kulturcode`
+    in tbl_kulturmapping). `rules` is a subset of:
+        - 'single_crop_farm'  : farm grows literally one crop, top-arable
+        - 'grassland_plus_one': >=grass_min_share grassland + exactly 1 top-arable
+        - 'dominant_crop'     : one top-arable crop covers >=dominant_share of farm
+
+    Returns a DataFrame with columns:
+        Flaechen_ID, betr_ID, Jahr, kulturcode, Kultur_nutzung, land_type,
+        flaeche_bewirt, selection_reason
+    """
+    rules = tuple(rules)
+    valid = {'single_crop_farm', 'grassland_plus_one', 'dominant_crop'}
+    bad = set(rules) - valid
+    if bad:
+        raise ValueError(f"Unknown AGIS selection rule(s): {bad}. Valid: {valid}")
+    if not rules:
+        raise ValueError("At least one AGIS selection rule must be provided.")
+
+    print(f"Building AGIS shortlist with rules: {rules}")
+
+    # Load AGIS field-year table and crop-name lookup
+    df_nutzung = pd.read_csv(nutzung_csv, encoding="latin1", sep=";")
+    df_mapping = (
+        pd.read_csv(lnf_mapping_csv, encoding="latin1", sep=";")
+          [['kulturcode', 'Kultur_nutzung']]
+          .drop_duplicates()
+    )
+
+    # Restrict to relevant years up-front
+    df_nutzung = df_nutzung[df_nutzung['Jahr'].isin(yrs)].copy()
+
+    # Attach kulturcode to every field row, classify by land_type
+    df_nutzung = df_nutzung.merge(df_mapping, on='Kultur_nutzung', how='left')
+    df_nutzung['land_type'] = np.select(
+        [df_nutzung['kulturcode'].isin(grassland_codes),
+         df_nutzung['kulturcode'].isin(top_arable_codes)],
+        ['grassland', 'arable_top'],
+        default='other'
+    )
+
+    # Aggregate to (farm, year, kulturcode) and compute shares
+    df_crop_area = (
+        df_nutzung.groupby(
+            ['betr_ID', 'Jahr', 'kulturcode', 'Kultur_nutzung', 'land_type'],
+            as_index=False
+        )['flaeche_bewirt'].sum()
+    )
+    df_crop_area['farm_area'] = (
+        df_crop_area.groupby(['betr_ID', 'Jahr'])['flaeche_bewirt'].transform('sum')
+    )
+    df_crop_area['share'] = df_crop_area['flaeche_bewirt'] / df_crop_area['farm_area']
+
+    # Per-(farm, year) shares by land_type, and count of top-arable crops
+    shares_by_type = (
+        df_crop_area.groupby(['betr_ID', 'Jahr', 'land_type'], as_index=False)['share']
+                    .sum()
+                    .pivot(index=['betr_ID', 'Jahr'], columns='land_type', values='share')
+                    .fillna(0.0)
+                    .reset_index()
+    )
+    for col in ['grassland', 'arable_top', 'other']:
+        if col not in shares_by_type.columns:
+            shares_by_type[col] = 0.0
+
+    n_arable_top = (
+        df_crop_area[df_crop_area['land_type'] == 'arable_top']
+            .groupby(['betr_ID', 'Jahr'])['kulturcode'].nunique()
+            .rename('n_arable_top_crops')
+            .reset_index()
+    )
+    farm_summary = shares_by_type.merge(n_arable_top, on=['betr_ID', 'Jahr'], how='left')
+    farm_summary['n_arable_top_crops'] = farm_summary['n_arable_top_crops'].fillna(0).astype(int)
+
+    out_cols = ['Flaechen_ID', 'betr_ID', 'Jahr', 'kulturcode', 'Kultur_nutzung',
+                'land_type', 'flaeche_bewirt']
+    selections = []
+
+    # --- Rule 1: single-crop farms ---
+    if 'single_crop_farm' in rules:
+        n_crops_per_farm = (
+            df_crop_area.groupby(['betr_ID', 'Jahr'])['kulturcode']
+                        .nunique()
+                        .rename('n_crops')
+                        .reset_index()
+        )
+        single = n_crops_per_farm[n_crops_per_farm['n_crops'] == 1][['betr_ID', 'Jahr']]
+        f1 = (
+            df_nutzung.merge(single, on=['betr_ID', 'Jahr'], how='inner')
+                      .query('kulturcode in @top_arable_codes')
+                      .copy()
+        )
+        f1 = f1[[c for c in out_cols if c in f1.columns]]
+        f1['selection_reason'] = 'single_crop_farm'
+        print(f"  single_crop_farm   : {len(f1):>7d} fields")
+        selections.append(f1)
+
+    # --- Rule 2: grassland-dominated + exactly one top-arable crop ---
+    if 'grassland_plus_one' in rules:
+        mask = (
+            (farm_summary['grassland'] >= grass_min_share) &
+            (farm_summary['n_arable_top_crops'] == 1) &
+            (farm_summary['arable_top'] >= arable_min_share) &
+            (farm_summary['other'] <= other_max_share)
+        )
+        qualifying = farm_summary.loc[mask, ['betr_ID', 'Jahr']]
+        f2 = (
+            df_nutzung.merge(qualifying, on=['betr_ID', 'Jahr'], how='inner')
+                      .query('kulturcode in @top_arable_codes')
+                      .copy()
+        )
+        f2 = f2[[c for c in out_cols if c in f2.columns]]
+        f2['selection_reason'] = 'grassland_plus_one'
+        print(f"  grassland_plus_one : {len(f2):>7d} fields")
+        selections.append(f2)
+
+    # --- Rule 3: a single top-arable crop dominates the farm ---
+    if 'dominant_crop' in rules:
+        dominant = (
+            df_crop_area[df_crop_area['kulturcode'].isin(top_arable_codes) &
+                         (df_crop_area['share'] >= dominant_share)]
+                [['betr_ID', 'Jahr', 'kulturcode']]
+                .rename(columns={'kulturcode': 'dominant_kulturcode'})
+        )
+        f3 = (
+            df_nutzung.merge(dominant, on=['betr_ID', 'Jahr'], how='inner')
+                      .query('kulturcode == dominant_kulturcode')
+                      .copy()
+        )
+        f3 = f3[[c for c in out_cols if c in f3.columns]]
+        f3['selection_reason'] = 'dominant_crop'
+        print(f"  dominant_crop      : {len(f3):>7d} fields")
+        selections.append(f3)
+
+    fields_all = pd.concat(selections, ignore_index=True)
+
+    # Collapse duplicates across rules: same field can match several rules → join reasons
+    key_cols   = ['Flaechen_ID', 'betr_ID', 'Jahr']
+    other_cols = [c for c in fields_all.columns if c not in key_cols + ['selection_reason']]
+    fields_all = (
+        fields_all.groupby(key_cols, as_index=False)
+                  .agg({**{c: 'first' for c in other_cols},
+                        'selection_reason': lambda x: ','.join(sorted(set(x)))})
+    )
+
+    print(f"  → unique clean fields: {len(fields_all)} "
+          f"across {fields_all['kulturcode'].nunique()} crops, "
+          f"{fields_all['Jahr'].nunique()} years")
+
+    return fields_all
+
+
+def sample_locations_with_field_agis(
+    lnf_dir,
+    nutzung_csv,
+    lnf_mapping_csv,
+    lnf_labels_path,
+    tot_samples,
+    save_path,
+    arable_codes,
+    grass_codes,
+    yrs,
+    grass_codes_for_shares=None,
+    rules=('single_crop_farm', 'grassland_plus_one', 'dominant_crop'),
+    grass_min_share=0.50,
+    arable_min_share=0.02,
+    other_max_share=0.10,
+    dominant_share=0.80,
+    target_crs=32632,
+    seed=42,
+    lnf_id_col_by_year=None,
+):
+    """AGIS-informed analogue of sample_locations_with_field.
+
+    Builds an AGIS shortlist of "clean" arable fields (using one or more
+    selection rules from check_agis.py), joins it onto yearly LNF geometries
+    via the LNF field-id column matching Flaechen_ID, and samples one point
+    per selected field — same downstream contract as sample_locations_with_field
+    (poly_id, lnf_code, point_geom, polygon_geom, x, y, yr).
+
+    Selection rules (`rules`, applied as a union, dedup by (Flaechen_ID, Jahr))
+    --------------------------------------------------------------------------
+    A *top-arable crop* means an LNF code in `arable_codes` (the top-20 arable
+    crops by area across `yrs`, minus `exclude_codes` and any codes overridden
+    to grassland via `config['grassland_codes']`).
+
+    - 'single_crop_farm'   — the farm grows exactly one crop, AND that crop is
+                             a top-arable crop. The single field of that crop
+                             is kept.
+    - 'grassland_plus_one' — top-arable fields on farms that satisfy ALL of:
+                                grassland share         >= grass_min_share   (50%)
+                                # of top-arable crops   == 1
+                                that arable crop's share>= arable_min_share  (2%)
+                                "other" land use share  <= other_max_share   (10%)
+                             Only the arable field is kept (grassland fields on
+                             the same farm are excluded).
+    - 'dominant_crop'      — fields growing crop X, where X is a top-arable
+                             crop covering >= dominant_share (80%) of farm area.
+                             Only fields of crop X are kept; companion fields
+                             (the remaining <=20%) are excluded.
+
+    The three rule outputs are then unioned and deduplicated on
+    (Flaechen_ID, Jahr); a single field can satisfy multiple rules and its
+    `selection_reason` is the comma-joined list. Land-use shares are computed
+    over `grass_codes_for_shares` (typically the wide Grassland-lv3 set ∪
+    config overrides) and `top_arable_codes`; everything else is 'other'.
+
+    On top of the union, a per-(year, crop) sampling cap is applied:
+    `tot_samples / n_years / n_crops` fields are drawn area-weighted, WITHOUT
+    replacement, and capped at the number of available clean fields. Crops
+    that don't reach the cap log a warning and use everything they have.
+
+    Grassland sampling
+    ------------------
+    AGIS "cleanness" rules target arable crops; this mirrors check_agis.py.
+    Grassland codes in `grass_codes` (typically narrow, e.g. [601]) are sampled
+    the standard random way directly from the LNF polygons — they are NOT
+    subject to the AGIS filtering above. So the strict cleanness guarantee
+    covers arable C-factor calibration but not the grassland baseline.
+
+    Parameters
+    ----------
+    grass_codes : list[int]
+        Grassland LNF codes from which to *draw FC samples* (typically narrow).
+    grass_codes_for_shares : list[int] or None
+        LNF codes that count as "grassland" when computing farm-level land
+        shares inside the AGIS rules (typically wide — every Grassland-lv3
+        code plus overrides). Falls back to `grass_codes` if None.
+    lnf_id_col_by_year : dict[int, str] or None
+        Map each year to the LNF column holding the AGIS Flaechen_ID. The
+        schema changed in 2023: <=2022 uses 'uuid', >=2023 uses
+        'identifikator_be'. Pass a dict to override per year.
+    rules, grass_min_share, arable_min_share, other_max_share, dominant_share
+        See the rule definitions above. Defaults match check_agis.py.
+    """
+    if grass_codes_for_shares is None:
+        grass_codes_for_shares = grass_codes
+
+    # Default LNF id-column lookup: schema changed in 2023.
+    default_id_col_by_year = {
+        2019: 'uuid', 2020: 'uuid', 2021: 'uuid', 2022: 'uuid',
+        2023: 'identifikator_be', 2024: 'identifikator_be', 2025: 'identifikator_be',
+    }
+    if lnf_id_col_by_year:
+        default_id_col_by_year.update(lnf_id_col_by_year)
+    lnf_id_col_by_year = default_id_col_by_year
+
+    # AGIS shortlist (arable only — grassland is sampled separately below if requested)
+    shortlist = _agis_shortlist(
+        nutzung_csv=nutzung_csv,
+        lnf_mapping_csv=lnf_mapping_csv,
+        lnf_labels_path=lnf_labels_path,
+        yrs=yrs,
+        top_arable_codes=arable_codes,
+        grassland_codes=grass_codes_for_shares,  # wide set, for share computation
+        rules=rules,
+        grass_min_share=grass_min_share,
+        arable_min_share=arable_min_share,
+        other_max_share=other_max_share,
+        dominant_share=dominant_share,
+    )
+    # Normalize id types for the eventual uuid join (LNF uuid is str-like)
+    shortlist['Flaechen_ID'] = shortlist['Flaechen_ID'].astype(str)
+
+    # Find matching LNF files for the requested years
+    lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
+    lnf_files = [f for f in lnf_files if yrs[0] <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= yrs[-1]]
+
+    n_years = len(lnf_files)
+    n_crops_total = len(arable_codes) + len(grass_codes)
+    samples_per_year = int(np.floor(tot_samples / max(n_years, 1)))
+    samples_per_crop = int(np.floor(samples_per_year / max(n_crops_total, 1)))
+    print(f"Target sampling: {tot_samples} total → {samples_per_year}/year, "
+          f"{samples_per_crop}/crop/year (area-weighted, no replacement, "
+          f"capped at availability)")
+
+    all_samples = []
+    for lnf_yr in lnf_files:
+        yr = int(lnf_yr.split('lnf')[-1].split('.gpkg')[0])
+        lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
+        # Some LNF years have duplicated geometries — de-dup as in the original
+        lnf["geom_wkb"] = lnf.geometry.to_wkb()
+        lnf = lnf.drop_duplicates(subset=["lnf_code", "geom_wkb"])
+        lnf = lnf.drop(columns="geom_wkb")
+        # Filter to relevant codes
+        lnf = lnf[lnf.lnf_code.isin(arable_codes + grass_codes)]
+        lnf["poly_id"] = lnf.index
+        if not len(lnf):
+            continue
+
+        # AGIS shortlist for this year (arable codes only)
+        clean_yr = shortlist[shortlist['Jahr'] == yr][['Flaechen_ID', 'kulturcode']]
+        # Resolve the LNF column that holds the AGIS Flaechen_ID for this year,
+        # tolerating case / whitespace variation. The schema changed in 2023.
+        expected = lnf_id_col_by_year.get(yr)
+        if expected is None:
+            raise KeyError(
+                f"[{yr}] No LNF id column configured. Extend lnf_id_col_by_year "
+                f"with {{{yr}: '<colname>'}}. Columns present: {lnf.columns.tolist()}"
+            )
+        cand = {c.strip().lower(): c for c in lnf.columns}
+        if expected.lower() not in cand:
+            raise KeyError(
+                f"[{yr}] Expected LNF id column '{expected}' not found in {lnf_yr}. "
+                f"Columns present: {lnf.columns.tolist()}. "
+                "Pass lnf_id_col_by_year={{{yr}: '<actual colname>'}} to override."
+            )
+        id_col = cand[expected.lower()]
+        if id_col != 'uuid':
+            print(f"  [{yr}] LNF id column is '{id_col}' → renaming to 'uuid' for join")
+            lnf = lnf.rename(columns={id_col: 'uuid'})
+        lnf['uuid'] = lnf['uuid'].astype(str)
+        is_grass  = lnf['lnf_code'].isin(grass_codes)
+        is_arable = lnf['lnf_code'].isin(arable_codes)
+        lnf_arable_clean = lnf[is_arable].merge(
+            clean_yr.rename(columns={'Flaechen_ID': 'uuid'}),
+            on='uuid', how='inner'
+        )
+        # Sanity check: AGIS kulturcode and LNF lnf_code should agree for the same field
+        mism = lnf_arable_clean[lnf_arable_clean['lnf_code'] != lnf_arable_clean['kulturcode']]
+        if len(mism):
+            print(f"  [{yr}] {len(mism)} arable fields with AGIS kulturcode != LNF lnf_code — keeping LNF code")
+        lnf_arable_clean = lnf_arable_clean.drop(columns='kulturcode')
+        lnf_grass = lnf[is_grass]
+        lnf_keep = pd.concat([lnf_arable_clean, lnf_grass], ignore_index=True)
+        lnf_keep = gpd.GeoDataFrame(lnf_keep, geometry='geometry', crs=lnf.crs)
+        print(f"  [{yr}] LNF universe: {len(lnf)} polys → after AGIS filter "
+              f"(+grassland): {len(lnf_keep)} polys "
+              f"({len(lnf_arable_clean)} arable + {len(lnf_grass)} grassland)")
+
+        seed += 1
+        for crop in arable_codes + grass_codes:
+            crop_polys = lnf_keep[lnf_keep.lnf_code == crop].to_crs(target_crs)
+            if len(crop_polys) == 0:
+                continue
+
+            n_target = min(samples_per_crop, len(crop_polys))
+            if n_target == 0:
+                continue
+            if n_target < samples_per_crop:
+                print(f"  [{yr}] crop {crop}: requested {samples_per_crop}, "
+                      f"only {len(crop_polys)} clean fields available — using all of them")
+
+            sampled_polys = crop_polys.sample(
+                n=n_target,
+                weights=crop_polys.area,
+                replace=False,
+                random_state=seed,
+            )
+
+            buffered = sampled_polys.copy()
+            buffered["geometry"] = buffered.geometry.buffer(-10)
+            buffered = buffered[~buffered.geometry.is_empty]
+            buffered = buffered[buffered.geometry.notnull()]
+            if not len(buffered):
+                continue
+            buffered["orig_idx"] = buffered.index
+
+            pts = buffered.sample_points(1, random_state=seed)
+            pts = pts.explode(index_parts=False)
+            pts = gpd.GeoDataFrame(pts, geometry='sampled_points', crs=target_crs)\
+                .rename(columns={'sampled_points': "point_geom"})
+            pts["orig_idx"] = pts.index
+            pts = pts.merge(
+                buffered[["orig_idx", "poly_id", "lnf_code", "geometry"]],
+                on="orig_idx", how="left",
+            )
+            pts = pts.rename(columns={"geometry": "polygon_geom"}).drop(columns="orig_idx")
+
+            pts["x"] = pts.point_geom.x
+            pts["y"] = pts.point_geom.y
+            pts["yr"] = str(yr)  # keep string-typed yr to match the rest of the pipeline
+
+            all_samples.append(pts)
+
+    if not all_samples:
+        raise RuntimeError("AGIS sampling produced no samples — check inputs and rules.")
+
+    samples = gpd.GeoDataFrame(pd.concat(all_samples, ignore_index=True),
+                               geometry="point_geom", crs=target_crs)
+    print(f"Total sampled fields: {len(samples)} "
+          f"across {samples['lnf_code'].nunique()} crops, "
+          f"{samples['yr'].nunique()} years")
+    samples.to_pickle(save_path)
+    return
+
+
 def snap_to_grid(x, y, ds):
 
     res = abs(ds.rename({'lat':'y', 'lon':'x'}).rio.resolution()[0])
@@ -1209,15 +1611,59 @@ def run_sampling_pipeline(config: dict) -> None:
     df_labels = pd.read_excel(lnf_labels_path, sheet_name='label_sheet')
     if top_crops is None:
         df_arable = df_labels[df_labels['Crop_Label_lv3'].isin(['Arable Land'])]
+        # Years used to pick top crops by area. Defaults to `yrs` for backward
+        # compat, but the LNF spreadsheet's per-year area columns follow the
+        # pattern `<yr>_Area_m<(yr+1) % 100>` only from 2021 onward (e.g.
+        # '2021_Area_m22', '2022_Area_m23', ...); 2019/2020 use a different
+        # naming ('2019_Area_m2', '2020_Area_m2') that the templated lookup
+        # can't address. Pass a separate `top_crops_area_years` (e.g.
+        # [2022, 2023, 2024]) when sampling a wider range of years.
+        area_yrs = config.get('top_crops_area_years', yrs)
+        area_cols = [f'{yr}_Area_m{str(yr+1)[-2:]}' for yr in area_yrs]
+        missing = [c for c in area_cols if c not in df_arable.columns]
+        if missing:
+            print(f"[top_crops] Missing area columns in LNF labels file: {missing} "
+                  f"— skipping. Available area columns: "
+                  f"{[c for c in df_arable.columns if 'Area_m' in c]}")
+            area_cols = [c for c in area_cols if c in df_arable.columns]
+        if not area_cols:
+            raise ValueError(
+                "Cannot auto-detect top crops: none of the requested area "
+                "columns exist in the LNF labels file. Either fix "
+                "`top_crops_area_years` or pass an explicit `top_crops` list."
+            )
+        print(f"[top_crops] Picking top-20 arable crops by area from columns: {area_cols}")
         top_crops = set()
-        for c in [f'{yr}_Area_m{str(yr+1)[-2:]}' for yr in yrs]:
+        for c in area_cols:
             top_crops.update(df_arable.sort_values(by=c, ascending=False)[:20]['Crop_EN'].tolist())
 
     arable_codes      = df_labels[df_labels['Crop_EN'].isin(top_crops)]['LNF_code'].unique().tolist()
     arable_codes      = [c for c in arable_codes if c not in exclude_codes]
-    grass_codes       = [c for c in config.get('grassland_codes', []) if c not in exclude_codes and c not in arable_codes]
+    # Grassland overrides from config take precedence over the lv3 label —
+    # mirrors GRASSLAND_OVERRIDE in check_agis.py. E.g. code 601 is labeled
+    # 'Arable Land' in lv3 but is grassland in practice; if it's listed in
+    # config['grassland_codes'] it must be stripped out of arable_codes here.
+    grass_override = [c for c in config.get('grassland_codes', []) if c not in exclude_codes]
+    arable_codes   = [c for c in arable_codes if c not in grass_override]
+    grass_codes    = grass_override
     lnf_codes = arable_codes + grass_codes
     print(f"LNF codes (crops: {len(arable_codes)}, grass: {len(grass_codes)}): {lnf_codes}")
+
+    # Wide grassland set for AGIS share computation (every Grassland-lv3 code
+    # plus any narrow overrides from config['grassland_codes']). This is what
+    # check_agis.py uses to decide whether a farm is "mostly grassland", and it
+    # is distinct from grass_codes above, which is the (typically narrow) set
+    # we actually draw FC samples from.
+    grass_codes_lv3 = (
+        df_labels[df_labels['Crop_Label_lv3'] == 'Grassland']['LNF_code']
+        .unique().tolist()
+    )
+    grass_codes_for_shares = sorted(
+        set(grass_codes_lv3) | set(config.get('grassland_codes', []))
+    )
+    grass_codes_for_shares = [c for c in grass_codes_for_shares if c not in exclude_codes]
+    # Make sure none of these accidentally also live in the arable set
+    grass_codes_for_shares = [c for c in grass_codes_for_shares if c not in arable_codes]
 
     code_name_map = dict(
         df_labels[df_labels['LNF_code'].isin(lnf_codes)]
@@ -1231,19 +1677,47 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # =====================================
     # Sample main crops locations (per year, across space) and save
-    # Consider only yrs from config
-    use_precomputed = config['fc_precompute']
-    if not use_precomputed:
-        samples_path = config['samples_path']
-        if not os.path.exists(samples_path):
+    # Sampling is independent of how FC is obtained downstream — both the
+    # precomputed-FC and S2+predict branches consume the same samples.pkl.
+    samples_path = config['samples_path']
+    if not os.path.exists(samples_path):
+        strategy = config.get('sampling_strategy', 'random')
+        if strategy == 'random':
             sample_locations_with_field(
                 lnf_labels_path, lnf_dir,
                 config['tot_samples'], samples_path,
                 lnf_codes, yrs
             )
+        elif strategy == 'agis':
+            sample_locations_with_field_agis(
+                lnf_dir=lnf_dir,
+                nutzung_csv=os.path.expanduser(config['nutzung_csv']),
+                lnf_mapping_csv=os.path.expanduser(config['lnf_mapping_csv']),
+                lnf_labels_path=lnf_labels_path,
+                tot_samples=config['tot_samples'],
+                save_path=samples_path,
+                arable_codes=arable_codes,
+                grass_codes=grass_codes,
+                grass_codes_for_shares=grass_codes_for_shares,
+                yrs=yrs,
+                rules=tuple(config.get('agis_rules',
+                                       ('single_crop_farm',
+                                        'grassland_plus_one',
+                                        'dominant_crop'))),
+                grass_min_share=config.get('agis_grass_min_share',  0.50),
+                arable_min_share=config.get('agis_arable_min_share', 0.02),
+                other_max_share=config.get('agis_other_max_share',   0.10),
+                dominant_share=config.get('agis_dominant_share',     0.80),
+                lnf_id_col_by_year=config.get('lnf_id_col_by_year'),
+            )
+        else:
+            raise ValueError(
+                f"Unknown sampling_strategy={strategy!r}. Use 'random' or 'agis'."
+            )
 
     # =====================================
     # Extract FC: use pre-computed files if available, otherwise extract S2 + predict
+    use_precomputed = config['fc_precompute']
     fc_preds_path = config['fc_preds_path']
     if not os.path.exists(fc_preds_path):
         if use_precomputed:
@@ -1414,6 +1888,19 @@ DEFAULT_CONFIG = {
     'max_gap_days':        15,
     'drop_fraction_threshold': 0.7,  # drop fields where >70% of observations are masked
     'n_jobs':              1,
+
+    # ---- Sampling strategy ----
+    # 'random' -> sample_locations_with_field (original: weighted random per crop/year)
+    # 'agis'   -> sample_locations_with_field_agis (AGIS-clean fields only, per check_agis.py)
+    'sampling_strategy': 'agis',
+    # Used only when sampling_strategy == 'agis':
+    'nutzung_csv':       '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_nutzungsdaten.csv',
+    'lnf_mapping_csv':   '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_kulturmapping.csv',
+    'agis_rules':              ('single_crop_farm', 'grassland_plus_one', 'dominant_crop'),
+    'agis_grass_min_share':    0.50,
+    'agis_arable_min_share':   0.02,
+    'agis_other_max_share':    0.10,
+    'agis_dominant_share':     0.80,
 }
 
 

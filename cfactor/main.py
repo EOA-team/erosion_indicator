@@ -34,7 +34,27 @@ CONFIG = {
     'gapfilled_fc_path':   'samples_data_gpr.parquet',
     'max_gap_days':        15,
     'n_jobs':              1,
-    'years': [2022, 2023, 2024], # LNF years to use for sampling (should match years used for area weights in calibration)
+    'years': [2019, 2020, 2021, 2022, 2023, 2024], # LNF years to use for sampling AGIS fields
+    # Years used to pick the "top arable crops by area" from the LNF spreadsheet.
+    # The spreadsheet's per-year area columns are only well-defined for 2021+
+    # ('2021_Area_m22', '2022_Area_m23', ...); 2019/2020 use the generic
+    # '*_Area_m2' columns and can't be addressed by the templated name. So the
+    # crop *selection* is driven by these years only, even when we *sample*
+    # fields from a wider range of years.
+    'top_crops_area_years': [2022, 2023, 2024],
+
+    # ---- Sampling strategy ----
+    # 'random' -> sample_locations_with_field (weighted random across LNF polygons)
+    # 'agis'   -> sample_locations_with_field_agis (AGIS-clean fields via check_agis.py rules)
+    'sampling_strategy': 'agis',
+    # Used only when sampling_strategy == 'agis':
+    'nutzung_csv':       '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_nutzungsdaten.csv',
+    'lnf_mapping_csv':   '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_kulturmapping.csv',
+    'agis_rules':              ('single_crop_farm', 'grassland_plus_one', 'dominant_crop'),
+    'agis_grass_min_share':    0.50,
+    'agis_arable_min_share':   0.02,
+    'agis_other_max_share':    0.10,
+    'agis_dominant_share':     0.80,
 
     # ---- Calibration (calibrate_cfactor.py) ----
     'ei_path':                  '../erosivity_index/predictions/grid_EI_daily_avg_pred_20260424_nn3.parquet',
