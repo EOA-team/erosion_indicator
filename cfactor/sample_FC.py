@@ -726,22 +726,34 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
     return
 
 
-def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, save_path_FCpreds):
-    """Extract pre-computed FC (pv, npv, soil) from fc_dir.
+def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, s2_dir,
+                                 soil_dir, save_path_FCpreds):
+    """Extract pre-computed FC (pv, npv, soil) per field from fc_dir, and attach
+    the matching S2 cloud-mask bands (s2_SCL, s2_mask, s2_B02, ...) from s2_dir
+    and soil_group from soil_dir so downstream cleaning works.
 
-    Files must follow the same naming convention as raw S2 files (S2_left_top_year.*).
-    Returns True on success, False if any required files are missing (triggers S2+prediction fallback).
+    Files follow the same naming convention as raw S2 files: S2_{left}_{top}_{year}*.zarr
+    Returns True on full success, False if any required FC file is missing (triggers
+    S2+prediction fallback).
     """
-    print(f'Extracting pre-computed FC from {fc_dir}')
+    print(f'Extracting pre-computed FC from {fc_dir} + S2 cleaning bands from {s2_dir}')
     samples = pd.read_pickle(save_path_sampledloc)
 
     grid = gpd.read_file(s2_grid_path)
     grid_samples = gpd.overlay(samples, grid, how='intersection')
 
-    file_lookup = {}
-    for fname in os.listdir(fc_dir):
-        key = "_".join(fname.split("_")[:4])[:-4]
-        file_lookup.setdefault(key, []).append(os.path.join(fc_dir, fname))
+    # Build a {S2_left_top_year: [files]} lookup for both FC and S2 dirs
+    def _build_lookup(directory):
+        lookup = {}
+        if not os.path.isdir(directory):
+            return lookup
+        for fname in os.listdir(directory):
+            key = "_".join(fname.split("_")[:4])[:-4]  # S2_left_top_year
+            lookup.setdefault(key, []).append(os.path.join(directory, fname))
+        return lookup
+
+    fc_lookup = _build_lookup(fc_dir)
+    s2_lookup = _build_lookup(s2_dir)
 
     df_out = []
     missing = []
@@ -750,37 +762,89 @@ def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, sav
         polygon = poly_df.iloc[0]['polygon_geom']
         tiles = poly_df[['left', 'top']].drop_duplicates()
         tiles = [(row['left'], row['top']) for _, row in tiles.iterrows()]
-        matched_files = []
-        for (left, top) in tiles:
-            for y in [int(yr), int(yr) - 1]:
-                key = f"S2_{int(left)}_{int(top)}_{y}"
-                matched_files.extend(file_lookup.get(key, []))
+        years = [int(yr), int(yr) - 1]
 
-        if not matched_files:
+        fc_files, s2_files = [], []
+        for (left, top) in tiles:
+            for y in years:
+                key = f"S2_{int(left)}_{int(top)}_{y}"
+                fc_files.extend(fc_lookup.get(key, []))
+                s2_files.extend(s2_lookup.get(key, []))
+
+        fc_files = [f for f in fc_files if f.endswith('zarr')]
+        s2_files = [f for f in s2_files if f.endswith('zarr')]
+
+        # No FC -> trigger fallback for the whole pipeline
+        if not fc_files:
             missing.append((poly_id, yr))
             continue
-        matched_files = [f for f in matched_files if f.endswith('zarr')]
-        ds_fc = xr.open_mfdataset(matched_files).sel(time=slice(f'{int(yr)-1}-06-01', f'{yr}-07-30'))
-        # PROBLEM: has no SCL/cloud bands
+
+        time_slice = slice(f'{int(yr)-1}-06-01', f'{yr}-07-30')
+
+        # ---- Load and clip FC ----
+        ds_fc = xr.open_mfdataset(fc_files).sel(time=time_slice)
         try:
-            clipped = ds_fc.rename({'lat': 'y', 'lon': 'x'}).rio.write_crs(32632).rio.clip(
+            clipped_fc = ds_fc.rename({'lat': 'y', 'lon': 'x'}).rio.write_crs(32632).rio.clip(
                 [polygon], ds_fc.rio.crs, drop=True
             )
         except Exception:
             missing.append((poly_id, yr))
             continue
 
-        df_fc = clipped.to_dataframe().reset_index()
-        # Normalise capitalised variable names to lowercase
+        df_fc = clipped_fc.to_dataframe().reset_index()
         df_fc = df_fc.rename(columns={'PV': 'pv', 'NPV': 'npv', 'Soil': 'soil'})
         fc_cols = [c for c in ['pv', 'npv', 'soil'] if c in df_fc.columns]
         if fc_cols:
             df_fc = df_fc.loc[(df_fc[fc_cols] != 0).any(axis=1)]
 
+        # ---- Load and clip matching S2 (for SCL/mask/B02) and merge on (x, y, time) ----
+        if s2_files:
+            ds_s2 = xr.open_mfdataset(s2_files).sel(time=time_slice)
+            try:
+                clipped_s2 = ds_s2.rename({'lat': 'y', 'lon': 'x'}).rio.write_crs(32632).rio.clip(
+                    [polygon], ds_s2.rio.crs, drop=True
+                )
+            except Exception:
+                clipped_s2 = None
+        else:
+            clipped_s2 = None
+
+        if clipped_s2 is not None:
+            df_s2 = clipped_s2.to_dataframe().reset_index()
+            # Keep only the cloud-mask-relevant columns plus the merge keys.
+            # clean_timeseries_field uses: s2_SCL, s2_mask, s2_B02, plus any s2_B* for missingness.
+            keep_s2_cols = ['x', 'y', 'time'] + [c for c in df_s2.columns if c.startswith('s2_')]
+            df_s2 = df_s2[keep_s2_cols]
+            df_fc = df_fc.merge(df_s2, on=['x', 'y', 'time'], how='left')
+        else:
+            print(f'  Warning: no matching S2 file for poly_id={poly_id}, yr={yr} — '
+                  f'cloud masking will be limited for this field')
+
         df_fc["lnf_code"] = poly_df.iloc[0]["lnf_code"]
         df_fc["yr"] = yr
         df_fc["poly_id"] = poly_id
 
+        # ---- Soil group (same logic as extract_s2_data_field) ----
+        soil_files = [os.path.join(soil_dir, f'SRC_{int(left)}_{int(top)}.zarr')
+                      for left, top in tiles]
+        soil_files = [f for f in soil_files if os.path.exists(f)]
+        if not soil_files:
+            soil_group = 0
+        else:
+            ds_soil = xr.open_mfdataset(soil_files).astype("float32")
+            try:
+                ds_soil_clipped = ds_soil.rio.write_crs(32632).rio.clip(
+                    [polygon], ds_soil.rio.crs, drop=True
+                )
+                soil_values = ds_soil_clipped["soil_group"].values.flatten()
+                soil_values = soil_values[(soil_values != -10000) & (~np.isnan(soil_values))]
+                soil_group = (Counter(soil_values).most_common(1)[0][0]
+                              if len(soil_values) else 0)
+            except Exception:
+                soil_group = 0
+        df_fc['soil_group'] = soil_group
+
+        # ---- is_sample_pixel + sampled coords (snap on FC grid) ----
         sampled_x = poly_df.iloc[0]["x"]
         sampled_y = poly_df.iloc[0]["y"]
         snap_x, snap_y = snap_to_grid(sampled_x, sampled_y, ds_fc)
@@ -793,7 +857,8 @@ def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, sav
         df_out.append(df_fc)
 
     if missing:
-        print(f'  Pre-computed FC missing for {len(missing)} poly/yr combinations — falling back to S2 extraction and prediction')
+        print(f'  Pre-computed FC missing for {len(missing)} poly/yr combinations — '
+              f'falling back to S2 extraction and prediction')
         return False
 
     pd.concat(df_out, ignore_index=True).to_pickle(save_path_FCpreds)
@@ -1720,15 +1785,20 @@ def run_sampling_pipeline(config: dict) -> None:
     use_precomputed = config['fc_precompute']
     fc_preds_path = config['fc_preds_path']
     if not os.path.exists(fc_preds_path):
+        ok = False
         if use_precomputed:
             fc_dir = os.path.expanduser(config.get('fc_dir', '~/mnt/eo-nas1/data/satellite/sentinel2/FC'))
-            extract_precomputed_fc_field(
+            ok = extract_precomputed_fc_field(
                 samples_path,
                 os.path.expanduser(config['s2_grid_path']),
                 fc_dir,
+                os.path.expanduser(config['s2_dir']),
+                os.path.expanduser(config['soil_dir']),
                 fc_preds_path
             )
-        else:
+        if not ok:
+            # Either fc_precompute=False, or precomputed FC was missing for some
+            # fields — extract S2 + soil and predict FC on the fly.
             samples_s2_path = config['samples_s2_path']
             if not os.path.exists(samples_s2_path):
                 extract_s2_data_field(
