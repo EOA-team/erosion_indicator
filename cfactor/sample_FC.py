@@ -1812,6 +1812,7 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # =====================================
     # Clean and filter timeseries
+    print('Loading existing FC, cleaning...')
     df_samples = pd.read_pickle(fc_preds_path)
 
     # Remove bad dates within each field
@@ -1844,32 +1845,6 @@ def run_sampling_pipeline(config: dict) -> None:
     group_cols = ['poly_id', 'x', 'y', 'time', 'yr', 'sampled_x', 'sampled_y', 'lnf_code', 'is_sample_pixel']
     df_clean_filtered   = df_clean_filtered.groupby(group_cols, as_index=False).mean(numeric_only=True)
     df_samples_filtered = df_samples_filtered.groupby(group_cols, as_index=False).mean(numeric_only=True)
-
-    # ====================
-    # Plot cleaned timeseries (before gapfilling)
-    plot_ts_cols = ['lnf_code', 'poly_id', 'x', 'y', 'yr', 'sampled_x', 'sampled_y']
-    for yr, df_year in df_clean_filtered.groupby('yr'):
-        unique_ts   = df_year[plot_ts_cols].drop_duplicates()
-        selected_ts = unique_ts.sample(n=min(5, len(unique_ts)), random_state=42)
-        df_subset   = df_year.merge(selected_ts, on=plot_ts_cols, how='inner')
-
-        unique_codes = df_subset['lnf_code'].unique()
-        cmap         = plt.get_cmap('tab20')
-        color_dict   = {code: cmap(i % 10) for i, code in enumerate(unique_codes)}
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        for keys, group in df_subset.groupby(plot_ts_cols):
-            ax.plot(group.sort_values('time')['time'], group.sort_values('time')['pv'],
-                    alpha=0.3, color=color_dict[keys[0]])
-
-        ax.set_xlabel("Time")
-        ax.set_ylabel("PV")
-        ax.set_title(f"Cleaned pixel time series — Year {yr}")
-        handles = [plt.Line2D([0], [0], color=color_dict[c], lw=2) for c in unique_codes]
-        ax.legend(handles, unique_codes, title="lnf_code")
-        plt.tight_layout()
-        plt.savefig(f'plots/cleaned_timeseries_{yr}.png')
-        plt.close()
 
     # =====================================
     # GPR gapfilling
