@@ -1383,6 +1383,160 @@ def _gapfill_one_field_alr(keys, group_clean, ts_cols, value_cols, pixel_cols, a
     )
 
 
+def _gapfill_one_field_alr_regular(keys, group_clean, ts_cols, value_cols, pixel_cols, alpha,
+                                   grid_step_days=10, max_train_points=1000):
+    """Return GPR predictions on a regular grid anchored at July 1 of yr-1.
+
+    Same GP machinery as ``_gapfill_one_field_alr`` (per-field, ALR-transformed
+    composition, Matern kernel on time + seasonality + spatial features), but
+    the prediction grid is a fixed ``grid_step_days``-day cadence covering the
+    agricultural year [yr-1-07-01, yr-06-30]. Cleaned observations are not
+    retained in the output unless they happen to fall exactly on the grid
+    (they don't, by construction). Training still uses all clean field pixels.
+
+    Requires 'yr' to be one of the ts_cols so the grid can be anchored.
+    """
+    if len(group_clean) < 3:
+        return None
+
+    target_clean = group_clean[group_clean["is_sample_pixel"]].copy()
+    if len(target_clean) == 0:
+        return None
+
+    # --- Resolve year from keys (ts_cols defines key order) ---
+    ts_dict = dict(zip(ts_cols, keys if isinstance(keys, tuple) else (keys,)))
+    if "yr" not in ts_dict:
+        raise ValueError("_gapfill_one_field_alr_regular requires 'yr' in ts_cols")
+    yr = int(ts_dict["yr"])
+
+    # --- Build the regular grid: yr-1-07-01 → yr-06-30, step = grid_step_days ---
+    grid_start = pd.Timestamp(f"{yr - 1}-07-01")
+    grid_end   = pd.Timestamp(f"{yr}-06-30")
+    grid_dates = pd.date_range(grid_start, grid_end, freq=f"{grid_step_days}D")
+
+    if len(grid_dates) == 0:
+        return None
+
+    # --- Feature engineering (train on all field pixels) ---
+    dates_train = pd.to_datetime(group_clean["time"])
+    # Anchor t at the grid_start so train and predict share the same time origin.
+    t0 = grid_start
+    t_train = (dates_train - t0).dt.days.values.reshape(-1, 1).astype(float)
+    t_pred  = (grid_dates  - t0).days.values.reshape(-1, 1).astype(float)
+
+    sin_train = np.sin(2 * np.pi * (t_train % 365) / 365)
+    cos_train = np.cos(2 * np.pi * (t_train % 365) / 365)
+    sin_pred  = np.sin(2 * np.pi * (t_pred  % 365) / 365)
+    cos_pred  = np.cos(2 * np.pi * (t_pred  % 365) / 365)
+
+    t_train_norm = t_train / 365.0
+    t_pred_norm  = t_pred  / 365.0
+
+    p_scaler    = StandardScaler()
+    pixel_train = p_scaler.fit_transform(group_clean[pixel_cols].values)
+    # Grid predictions all sit at the single target pixel
+    target_pixel = target_clean[pixel_cols].values[:1]
+    pixel_pred   = p_scaler.transform(np.repeat(target_pixel, len(grid_dates), axis=0))
+
+    n_pixel_dims = pixel_train.shape[1]
+    n_features   = 3 + n_pixel_dims   # t, sin, cos, spatial
+
+    X_train_full = np.hstack([t_train_norm, sin_train, cos_train, pixel_train]).astype(np.float32)
+    X_pred       = np.hstack([t_pred_norm,  sin_pred,  cos_pred,  pixel_pred ]).astype(np.float32)
+
+    fc_train_full  = group_clean[value_cols].values.astype(np.float32)
+    alr_train_full = alr_transform(fc_train_full)
+
+    # --- Stratified subsample: always keep target pixel, fill budget from others ---
+    target_mask = group_clean["is_sample_pixel"].values.astype(bool)
+
+    if len(group_clean) > max_train_points:
+        n_target  = target_mask.sum()
+        budget    = max(0, max_train_points - n_target)
+        other_idx = np.where(~target_mask)[0]
+
+        if budget > 0 and len(other_idx) > 0:
+            other_times = t_train_norm[other_idx, 0]
+            n_bins      = min(10, budget)
+            bin_edges   = np.linspace(other_times.min(), other_times.max(), n_bins + 1)
+            bin_ids     = np.digitize(other_times, bin_edges) - 1
+            per_bin     = max(1, budget // n_bins)
+            rng         = np.random.default_rng(42)
+            chosen_other = []
+            for b in range(n_bins):
+                in_bin = other_idx[bin_ids == b]
+                if len(in_bin) > 0:
+                    chosen_other.append(rng.choice(in_bin, size=min(per_bin, len(in_bin)), replace=False))
+            chosen_other = np.concatenate(chosen_other) if chosen_other else np.array([], dtype=int)
+            keep = np.concatenate([np.where(target_mask)[0], chosen_other])
+        else:
+            keep = np.where(target_mask)[0]
+
+        X_train   = X_train_full[keep]
+        alr_train = alr_train_full[keep]
+    else:
+        X_train   = X_train_full
+        alr_train = alr_train_full
+
+    estimated_alpha = float(np.var(alr_train, axis=0).mean()) * 0.05
+    estimated_alpha = float(np.clip(estimated_alpha, 1e-4, 0.5))
+
+    ls_init   = [1.0] * n_features
+    ls_bounds = (
+        [(0.1,  5.0)]  * 1           +   # t
+        [(0.5, 10.0)]  * 2           +   # sin, cos
+        [(0.05, 10.0)] * n_pixel_dims    # spatial
+    )
+    base_kernel = ConstantKernel(1.0, (0.1, 5.0)) * Matern(
+        length_scale=ls_init,
+        length_scale_bounds=ls_bounds,
+        nu=1.5
+    ) + WhiteKernel(noise_level=estimated_alpha, noise_level_bounds=(1e-5, 0.5))
+
+    alr_preds = np.zeros((len(X_pred), 2))
+    alr_unc   = np.zeros((len(X_pred), 2))
+    for j in range(2):
+        y_train = alr_train[:, j]
+        if j == 0:
+            gp = GaussianProcessRegressor(
+                kernel=base_kernel, alpha=estimated_alpha,
+                normalize_y=True, n_restarts_optimizer=5
+            )
+            gp.fit(X_train, y_train)
+            fitted_kernel = gp.kernel_
+        else:
+            gp = GaussianProcessRegressor(
+                kernel=fitted_kernel, alpha=estimated_alpha,
+                normalize_y=True, n_restarts_optimizer=2
+            )
+            gp.fit(X_train, y_train)
+
+        mean, std = gp.predict(X_pred, return_std=True)
+        alr_preds[:, j] = mean
+        alr_unc[:, j]   = std
+
+    fc_pred = alr_inverse(alr_preds)
+
+    # Quality flag on grid points (based on ALR uncertainty)
+    total_unc = np.linalg.norm(alr_unc, axis=1)
+    p80 = np.percentile(total_unc, 80)
+    p95 = np.percentile(total_unc, 95)
+    qflag = np.zeros(len(total_unc), dtype=int)
+    qflag[total_unc > p80] = 1
+    qflag[total_unc > p95] = 2
+
+    # Build grid result dataframe
+    pixel_dict = dict(zip(pixel_cols, target_clean[pixel_cols].iloc[0]))
+    grid_result = pd.DataFrame({"time": grid_dates.values.astype("datetime64[ns]"),
+                                **ts_dict, **pixel_dict})
+    for i, col in enumerate(value_cols):
+        grid_result[col] = fc_pred[:, i]
+    grid_result["is_gapfilled"]    = True
+    grid_result["fc_quality_flag"] = qflag
+
+    return grid_result.sort_values("time").reset_index(drop=True)
+
+
 def _gapfill_one_field_alr_median(keys, group_raw, group_clean, ts_cols, value_cols, pixel_cols, alpha, max_train_points=1000):
     """Process a single field — designed to be called in parallel."""
     if len(group_clean) < 3:
@@ -1595,18 +1749,39 @@ def _gapfill_one_field(keys, group_raw, group_clean, ts_cols, value_cols, pixel_
     return res
 
 
-def gapfill_dataframe_gpr_per_field_parallel(df_clean, ts_cols, value_cols, pixel_cols, alpha=1e-2, max_gap_days=15, n_jobs=1):
+def gapfill_dataframe_gpr_per_field_parallel(df_clean, ts_cols, value_cols, pixel_cols,
+                                             alpha=1e-2, max_gap_days=15,
+                                             method='irregular', grid_step_days=10,
+                                             n_jobs=1):
+    """Per-field GPR gapfilling, dispatching on `method`.
 
+    method='irregular': keep cleaned obs, fill only gaps > max_gap_days
+                        (_gapfill_one_field_alr).
+    method='regular':   replace timeseries with a regular grid_step_days-day grid
+                        anchored at July 1 of yr-1 (_gapfill_one_field_alr_regular).
+    """
     tasks = [(keys, group) for keys, group in df_clean.groupby(ts_cols)]
-    print(f"To process: {len(tasks)} fields using {n_jobs} workers")
+    print(f"To process: {len(tasks)} fields using {n_jobs} workers (method='{method}')")
 
-    results = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_gapfill_one_field_alr)(
-            keys, group_clean,
-            ts_cols, value_cols, pixel_cols, alpha, max_gap_days
+    if method == 'irregular':
+        results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(_gapfill_one_field_alr)(
+                keys, group_clean,
+                ts_cols, value_cols, pixel_cols, alpha, max_gap_days
+            )
+            for keys, group_clean in tasks
         )
-        for keys, group_clean in tasks
-    )
+    elif method == 'regular':
+        results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(_gapfill_one_field_alr_regular)(
+                keys, group_clean,
+                ts_cols, value_cols, pixel_cols, alpha,
+                grid_step_days=grid_step_days
+            )
+            for keys, group_clean in tasks
+        )
+    else:
+        raise ValueError(f"Unknown gapfill method '{method}'. Use 'irregular' or 'regular'.")
 
     results = [r for r in results if r is not None]
     return pd.concat(results, ignore_index=True)
@@ -1853,15 +2028,23 @@ def run_sampling_pipeline(config: dict) -> None:
         value_cols = ["pv", "npv", "soil"]
         pixel_cols = ["x", "y"]
 
+        gapfill_method  = config.get('gapfill_method', 'irregular')
+        grid_step_days  = config.get('grid_step_days', 10)
+
         df_gpr = gapfill_dataframe_gpr_per_field_parallel(
             df_clean_filtered,
             ts_cols, value_cols, pixel_cols,
             alpha=1e-4,
             max_gap_days=config.get('max_gap_days', 15),
+            method=gapfill_method,
+            grid_step_days=grid_step_days,
             n_jobs=config.get('n_jobs', 1)
         )
 
         df_gpr['time'] = pd.to_datetime(df_gpr['time'])
+        # Restrict to the agricultural year [yr-1-07-01, yr-06-30].
+        # For method='regular' this is a no-op (grid built inside the window);
+        # for method='irregular' it drops out-of-window cleaned obs.
         start_dates = pd.to_datetime((df_gpr['yr'].astype(int) - 1).astype(str) + '-07-01')
         end_dates   = pd.to_datetime(df_gpr['yr'].astype(str) + '-06-30')
         df_gpr = df_gpr[(df_gpr['time'] >= start_dates) & (df_gpr['time'] <= end_dates)]
@@ -1910,7 +2093,7 @@ def run_sampling_pipeline(config: dict) -> None:
                 legend_entries[label] = handle
     fig.legend(list(legend_entries.values()), list(legend_entries.keys()), loc='upper right')
     plt.tight_layout()
-    plt.savefig("plots/gpr_all_timeseries_subplots.png")
+    plt.savefig("plots/gpr_all_timeseries_subplots_regular.png")
     plt.close()
 
 

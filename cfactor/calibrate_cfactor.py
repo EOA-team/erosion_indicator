@@ -599,6 +599,7 @@ def run_calibration(config: dict) -> None:
     manual_overrides_path   = config.get('manual_overrides_path')
     if manual_overrides_path:
         manual_overrides_path = os.path.expanduser(manual_overrides_path)
+    results_dir             = config['results_folder']
     results_path            = config['calibration_results_path']
     ts_cols                 = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
     crop_col                = config.get('crop_col', 'lnf_code')
@@ -606,7 +607,10 @@ def run_calibration(config: dict) -> None:
     exclude_lnf_codes       = config.get('exclude_calibration_lnf_codes', []) or []
     area_weight_loss        = config.get('area_weight_loss', True)
     area_years              = config.get('area_years', []) or None
- 
+
+    os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, results_path)
+    
     # Load gapfilled FC timeseries
     print("Loading gapfilled FC timeseries...")
     df_fc = pd.read_parquet(fc_path)
@@ -657,7 +661,7 @@ def run_calibration(config: dict) -> None:
                                        crop_col=crop_col,
                                        beta_bounds=beta_bounds,
                                        area_weight=area_weight_loss)
-    with open('beta.json', 'w') as f:
+    with open(os.path.join(results_dir, 'beta.json'), 'w') as f:
         json.dump({'beta': beta_opt, 'area_weight_loss': area_weight_loss}, f)
         
     # Save crop-level calibration table
@@ -673,11 +677,11 @@ def run_calibration(config: dict) -> None:
     print(f"Per-pixel C-factors at β_opt saved to {pixel_c_path}")
  
     # Diagnostic plots
-    plot_calibration_per_crop(df_crop, beta_opt, 'calibration_scatter.png',
+    plot_calibration_per_crop(df_crop, beta_opt, os.path.join(results_dir, 'calibration_scatter.png'),
                               area_weight=area_weight_loss)
     beta_range = np.linspace(beta_bounds[0], beta_bounds[1], 60)
     plot_beta_sensitivity(df, df_ref, ts_cols, beta_range, beta_opt,
-                          'beta_sensitivity.png', crop_col=crop_col,
+                          os.path.join(results_dir, 'beta_sensitivity.png'), crop_col=crop_col,
                           area_weight=area_weight_loss)
  
  

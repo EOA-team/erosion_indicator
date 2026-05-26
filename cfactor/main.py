@@ -33,6 +33,12 @@ CONFIG = {
     'drop_fraction_threshold': 0.7,  # drop fields where >drop_fraction_threshold [0-1] of observations are masked
     'gapfilled_fc_path':   'samples_data_gpr.parquet',
     'max_gap_days':        15,
+    # Gapfilling method:
+    #   'irregular' -> keep cleaned obs, GP-fill only gaps > max_gap_days
+    #   'regular'   -> drop cleaned obs, GP-predict on a regular grid_step_days
+    #                  cadence anchored at July 1 of yr-1 (agricultural year)
+    'gapfill_method':      'regular',
+    'grid_step_days':      10,
     'n_jobs':              1,
     'years': [2019, 2020, 2021, 2022, 2023, 2024], # LNF years to use for sampling AGIS fields
     # Years used to pick the "top arable crops by area" from the LNF spreadsheet.
@@ -61,6 +67,7 @@ CONFIG = {
     'c_factor_table_path':      'C_Faktoren.csv', # os.path.expanduser('~mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Erosionsrisiko/C_Faktoren.csv')
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
     'manual_overrides_path':    None, # only need it if any of sampled crops fail to auto-match LNF codes
+    'results_folder':           'calibration_analysis_default',
     'calibration_results_path': 'calibration_results.csv',
     'ts_cols':                  ['lnf_code', 'yr', 'poly_id'],
     'crop_col':                 'lnf_code',
@@ -81,25 +88,32 @@ def main() -> None:
         '--skip-sampling', action='store_true',
         help='Skip sampling + gapfilling (requires samples_data_gpr.parquet to exist)'
     )
+    parser.add_argument(
+        '--output-dir', default='.',
+        help='Directory where all calibration outputs are written (created if needed). '
+             'Defaults to the current working directory.'
+    )
     args = parser.parse_args()
+
+    config = {**CONFIG, 'output_dir': args.output_dir}
 
     if not args.skip_sampling:
         print("=" * 60)
         print("STEP 1: Sampling + gapfilling")
         print("=" * 60)
-        run_sampling_pipeline(CONFIG)
+        run_sampling_pipeline(config)
     else:
-        if not os.path.exists(CONFIG['gapfilled_fc_path']):
+        if not os.path.exists(config['gapfilled_fc_path']):
             raise FileNotFoundError(
-                f"--skip-sampling set but {CONFIG['gapfilled_fc_path']} not found. "
+                f"--skip-sampling set but {config['gapfilled_fc_path']} not found. "
                 "Run without --skip-sampling first."
             )
-        print(f"Skipping sampling — using existing {CONFIG['gapfilled_fc_path']}")
+        print(f"Skipping sampling — using existing {config['gapfilled_fc_path']}")
 
     print("=" * 60)
     print("STEP 2: C-factor calibration")
     print("=" * 60)
-    #run_calibration(CONFIG)
+    run_calibration(config)
 
     print("Done.")
 
