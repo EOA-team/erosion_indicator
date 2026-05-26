@@ -31,7 +31,7 @@ CONFIG = {
     'cirrus_thresh': 500,  # Max value of blue band when SCL=10 (cirrus cloud masking)
     'max_missing_frac': 0.05,  # Max amount of missing data per date in a field timeseries
     'drop_fraction_threshold': 0.7,  # drop fields where >drop_fraction_threshold [0-1] of observations are masked
-    'gapfilled_fc_path':   'samples_data_gpr.parquet',
+    'gapfilled_fc_path':   'samples_data_gpr_regular.parquet',
     'max_gap_days':        15,
     # Gapfilling method:
     #   'irregular' -> keep cleaned obs, GP-fill only gaps > max_gap_days
@@ -67,7 +67,7 @@ CONFIG = {
     'c_factor_table_path':      'C_Faktoren.csv', # os.path.expanduser('~mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Erosionsrisiko/C_Faktoren.csv')
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
     'manual_overrides_path':    None, # only need it if any of sampled crops fail to auto-match LNF codes
-    'results_folder':           'calibration_analysis_default',
+    'results_folder':           'calibration_analysis_regular2',
     'calibration_results_path': 'calibration_results.csv',
     'ts_cols':                  ['lnf_code', 'yr', 'poly_id'],
     'crop_col':                 'lnf_code',
@@ -80,6 +80,32 @@ CONFIG = {
     # the years used in the FC sampling step so weights describe the same
     # crop landscape as the calibration data.
     'area_years':               [2022, 2023, 2024],
+
+    # ---- Stratified calibration (optional) ----
+    # When `stratified_calibration` is True, calibration matches predicted
+    # C-factors against the stratified C_ref table (`Tal_Pflug, Tal_Mulch,
+    # Tal_Direkt, Berg_Pflug, Berg_Mulch, Berg_Direkt` columns of
+    # C_Faktoren.csv) instead of the single `Total` column. Each sampled
+    # pixel is assigned one stratum based on field altitude (Tal/Berg from
+    # tbl_nutzungsdaten.swissALTI3D) and farm-year soil preparation
+    # (Pflug/Mulch/Direkt from tbl_ressourceneffizienzbeitrag.reb_sb).
+    #
+    # Requires `sampling_strategy == 'agis'` so `uuid` (Flaechen_ID) and
+    # `betr_ID` are present in the gapfilled parquet.
+    'stratified_calibration':    False,
+    'grenze_tal_berg':           600,           # m, swissALTI3D cutoff matching erosion_config.yaml
+    'standardansaatverfahren':   'Pflug',       # tillage class when reb_sb is NA
+    # REB table is keyed by (betr_ID, Jahr) — does not contain Flaechen_ID,
+    # so within a farm-year with mixed reb_sb the tillage of any one pixel
+    # is unknown. Assignment policy:
+    #   'stochastic' — draw per-pixel from empirical reb_sb frequencies of
+    #                  the farm-year (zero bias in expectation, default)
+    #   'first_row'  — first row's reb_sb (matches the R-side `slice(1)`
+    #                  in 05-Dataprep.R; deterministic but arbitrary)
+    #   'mode'       — most frequent reb_sb in the farm-year
+    'ressourceneffizienz_csv':   '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_ressourceneffizienzbeitrag.csv',
+    'tillage_assignment':        'stochastic',
+    'tillage_random_seed':       42,
 }
 
 def main() -> None:
@@ -88,32 +114,25 @@ def main() -> None:
         '--skip-sampling', action='store_true',
         help='Skip sampling + gapfilling (requires samples_data_gpr.parquet to exist)'
     )
-    parser.add_argument(
-        '--output-dir', default='.',
-        help='Directory where all calibration outputs are written (created if needed). '
-             'Defaults to the current working directory.'
-    )
     args = parser.parse_args()
-
-    config = {**CONFIG, 'output_dir': args.output_dir}
 
     if not args.skip_sampling:
         print("=" * 60)
         print("STEP 1: Sampling + gapfilling")
         print("=" * 60)
-        run_sampling_pipeline(config)
+        run_sampling_pipeline(CONFIG)
     else:
-        if not os.path.exists(config['gapfilled_fc_path']):
+        if not os.path.exists(CONFIG['gapfilled_fc_path']):
             raise FileNotFoundError(
-                f"--skip-sampling set but {config['gapfilled_fc_path']} not found. "
+                f"--skip-sampling set but {CONFIG['gapfilled_fc_path']} not found. "
                 "Run without --skip-sampling first."
             )
-        print(f"Skipping sampling — using existing {config['gapfilled_fc_path']}")
+        print(f"Skipping sampling — using existing {CONFIG['gapfilled_fc_path']}")
 
     print("=" * 60)
     print("STEP 2: C-factor calibration")
     print("=" * 60)
-    run_calibration(config)
+    run_calibration(CONFIG)
 
     print("Done.")
 

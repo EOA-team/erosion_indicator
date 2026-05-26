@@ -451,8 +451,11 @@ def sample_locations_with_field_agis(
         if not len(lnf):
             continue
 
-        # AGIS shortlist for this year (arable codes only)
-        clean_yr = shortlist[shortlist['Jahr'] == yr][['Flaechen_ID', 'kulturcode']]
+        # AGIS shortlist for this year (arable codes only).
+        # `betr_ID` is carried through alongside `Flaechen_ID` so downstream
+        # stratification (calibrate_cfactor.py) can join tillage info from
+        # tbl_ressourceneffizienzbeitrag, which is keyed by (betr_ID, Jahr).
+        clean_yr = shortlist[shortlist['Jahr'] == yr][['Flaechen_ID', 'betr_ID', 'kulturcode']]
         # Resolve the LNF column that holds the AGIS Flaechen_ID for this year,
         # tolerating case / whitespace variation. The schema changed in 2023.
         expected = lnf_id_col_by_year.get(yr)
@@ -519,13 +522,26 @@ def sample_locations_with_field_agis(
                 continue
             buffered["orig_idx"] = buffered.index
 
+            # Columns to propagate from polys to sampled points. `uuid` and
+            # `betr_ID` are present only for arable polys (AGIS-shortlisted);
+            # grassland polys are sampled without an AGIS join, so they get
+            # NaN for these fields — that's fine: stratified calibration
+            # skips pixels without these IDs.
+            keep_cols = ["orig_idx", "poly_id", "lnf_code", "geometry"]
+            for opt in ("uuid", "betr_ID"):
+                if opt in buffered.columns:
+                    keep_cols.append(opt)
+                else:
+                    buffered[opt] = np.nan
+                    keep_cols.append(opt)
+
             pts = buffered.sample_points(1, random_state=seed)
             pts = pts.explode(index_parts=False)
             pts = gpd.GeoDataFrame(pts, geometry='sampled_points', crs=target_crs)\
                 .rename(columns={'sampled_points': "point_geom"})
             pts["orig_idx"] = pts.index
             pts = pts.merge(
-                buffered[["orig_idx", "poly_id", "lnf_code", "geometry"]],
+                buffered[keep_cols],
                 on="orig_idx", how="left",
             )
             pts = pts.rename(columns={"geometry": "polygon_geom"}).drop(columns="orig_idx")
@@ -685,6 +701,10 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
         df_s2_sampled["lnf_code"] = poly_df.iloc[0]["lnf_code"]
         df_s2_sampled["yr"] = yr
         df_s2_sampled["poly_id"] = poly_df.iloc[0]["poly_id"]
+        # Propagate AGIS identifiers (NaN for grass polys / random-sampling
+        # mode where they don't exist) so calibrate_cfactor can stratify.
+        for opt in ("uuid", "betr_ID"):
+            df_s2_sampled[opt] = poly_df.iloc[0][opt] if opt in poly_df.columns else np.nan
 
         # Extract soil data for the polygon
         soil_files = [os.path.join(soil_dir, f'SRC_{int(left)}_{int(top)}.zarr') for left, right in tiles]
@@ -823,6 +843,8 @@ def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, s2_
         df_fc["lnf_code"] = poly_df.iloc[0]["lnf_code"]
         df_fc["yr"] = yr
         df_fc["poly_id"] = poly_id
+        for opt in ("uuid", "betr_ID"):
+            df_fc[opt] = poly_df.iloc[0][opt] if opt in poly_df.columns else np.nan
 
         # ---- Soil group (same logic as extract_s2_data_field) ----
         soil_files = [os.path.join(soil_dir, f'SRC_{int(left)}_{int(top)}.zarr')
@@ -875,7 +897,11 @@ def predict_FC(save_path_sampledloc_S2: str, save_path_FCpreds: str) -> None:
     df_samples = pd.read_pickle(save_path_sampledloc_S2)
 
     df_samples[df_samples == 65535] = np.nan
-    df_samples = df_samples.dropna()
+    # Drop rows missing any predictor band — but not rows missing only the
+    # AGIS identifier columns (`uuid`, `betr_ID`), which are NaN by design
+    # for grassland polys and random-sampling mode.
+    pred_cols = bands + ['soil_group']
+    df_samples = df_samples.dropna(subset=pred_cols)
     df_samples[bands] /= 10000
     df_samples['soil_group'] = df_samples['soil_group'].astype(int)
 
@@ -2018,8 +2044,20 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # De-duplicate overlapping satellite pixels
     group_cols = ['poly_id', 'x', 'y', 'time', 'yr', 'sampled_x', 'sampled_y', 'lnf_code', 'is_sample_pixel']
+    # Stash AGIS identifiers (`uuid`, `betr_ID`) before the groupby — they're
+    # non-numeric strings, so `numeric_only=True` drops them. They're constant
+    # per (poly_id, yr), so we can join them back after aggregation.
+    id_cols = [c for c in ('uuid', 'betr_ID') if c in df_clean_filtered.columns]
+    if id_cols:
+        ids_clean   = (df_clean_filtered[['poly_id', 'yr'] + id_cols]
+                       .drop_duplicates(subset=['poly_id', 'yr']))
+        ids_samples = (df_samples_filtered[['poly_id', 'yr'] + id_cols]
+                       .drop_duplicates(subset=['poly_id', 'yr']))
     df_clean_filtered   = df_clean_filtered.groupby(group_cols, as_index=False).mean(numeric_only=True)
     df_samples_filtered = df_samples_filtered.groupby(group_cols, as_index=False).mean(numeric_only=True)
+    if id_cols:
+        df_clean_filtered   = df_clean_filtered.merge(ids_clean,   on=['poly_id', 'yr'], how='left')
+        df_samples_filtered = df_samples_filtered.merge(ids_samples, on=['poly_id', 'yr'], how='left')
 
     # =====================================
     # GPR gapfilling
@@ -2049,6 +2087,15 @@ def run_sampling_pipeline(config: dict) -> None:
         end_dates   = pd.to_datetime(df_gpr['yr'].astype(str) + '-06-30')
         df_gpr = df_gpr[(df_gpr['time'] >= start_dates) & (df_gpr['time'] <= end_dates)]
         df_gpr['fc_total'] = (df_gpr['pv'] + df_gpr['npv']) * 100
+
+        # Re-attach AGIS identifiers — the GPR functions build their output
+        # from `ts_cols + pixel_cols + time + value_cols` and don't carry
+        # extra columns. `uuid` and `betr_ID` are constant per (poly_id, yr).
+        if id_cols:
+            ids_lookup = (df_clean_filtered[['poly_id', 'yr'] + id_cols]
+                          .drop_duplicates(subset=['poly_id', 'yr']))
+            df_gpr = df_gpr.merge(ids_lookup, on=['poly_id', 'yr'], how='left')
+
         df_gpr.to_parquet(gapfilled_path, index=False)
 
     # =====================================
