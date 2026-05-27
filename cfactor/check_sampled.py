@@ -57,7 +57,7 @@ DROP_FRACTION_THRESHOLD = 0.7
 MAX_GAP_DAYS = 15
 
 # Input files
-SAMPLES_PATH = 'samples.pkl'
+SAMPLES_PATH = 'samples_grouped.pkl'
 FC_RAW_PATH = 'samples_data_pred.pkl'
 GAPFILLED_PATH = 'samples_data_gpr.parquet'
 LNF_LABELS_PATH = os.path.expanduser(
@@ -67,7 +67,7 @@ LNF_LABELS_PATH = os.path.expanduser(
 # Cross-validation
 N_CV_FIELDS = 100
 
-OUT_DIR = 'sample_analysis'
+OUT_DIR = 'sample_analysis_grouped'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -184,83 +184,158 @@ def gap_lengths(df, ts_cols=TS_COLS):
 
 
 # =============================================================================
-# Load FC data
-# =============================================================================
-df_samples = pd.read_pickle(FC_RAW_PATH)
-df_samples['time'] = pd.to_datetime(df_samples['time'])
-print(f'Loaded {len(df_samples):,} raw rows, '
-      f'{df_samples.groupby(TS_COLS).ngroups:,} field-years.')
-
-
-# =============================================================================
 # PART A — Sampling overview (optional, runs if samples.pkl is present)
 # =============================================================================
 if os.path.exists(SAMPLES_PATH):
     print('\n=== A. Sampling overview ===')
     df_loc = pd.read_pickle(SAMPLES_PATH)
+ 
+    # Crop grouping (sample_FC.py) pools crops with identical C-factors: a sample
+    # carries `lnf_code` = main (calibration) code and `orig_lnf_code` = the true
+    # crop it was drawn from. Older pickles predate grouping and only have
+    # `lnf_code`; fall back to it so this script stays backward-compatible.
+    has_grouping = 'orig_lnf_code' in df_loc.columns
+    if not has_grouping:
+        df_loc['orig_lnf_code'] = df_loc['lnf_code']
+    # Which (true) codes were pooled into a different main code?
+    pooled_mask = df_loc['orig_lnf_code'] != df_loc['lnf_code']
+    n_pooled = int(pooled_mask.sum())
+    if has_grouping and n_pooled:
+        pooled_pairs = (df_loc.loc[pooled_mask, ['orig_lnf_code', 'lnf_code']]
+                        .drop_duplicates().sort_values('lnf_code'))
+        print(f'Crop grouping active: {n_pooled} sample(s) pooled from '
+              f'{pooled_pairs["orig_lnf_code"].nunique()} analogy code(s):')
+        for _, r in pooled_pairs.iterrows():
+            print(f'  {int(r["orig_lnf_code"])} -> {int(r["lnf_code"])}')
+    elif has_grouping:
+        print('Crop grouping active: no analogy samples present.')
+ 
     gdf = (gpd.GeoDataFrame(df_loc, geometry=df_loc['point_geom'], crs=32632)
            .drop(columns=['point_geom', 'polygon_geom']))
     gdf_web = gdf.to_crs(epsg=3857)
-
+ 
+    # Color the map by the main (calibration) `lnf_code`. Points that were
+    # pooled in from an analogy crop (orig_lnf_code != lnf_code) are overlaid
+    # with a hollow black-edged marker so they stay identifiable while keeping
+    # the main-crop color scheme.
+    from matplotlib.lines import Line2D
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+ 
     fig, ax = plt.subplots(figsize=(14, 10))
-    gdf_web.plot(
-        ax=ax, column='lnf_code', categorical=True, legend=True,
-        alpha=0.7, markersize=4, cmap='tab20',
-        legend_kwds={'title': 'lnf_code',
-                     'bbox_to_anchor': (1.05, 1), 'loc': 'upper left'},
-    )
+    # Draw crops WITHOUT geopandas' own legend — we build a single combined
+    # legend at the end so it survives the basemap redraw and isn't clipped.
+    main_codes = sorted(gdf_web['lnf_code'].unique())
+    cmap = cm.get_cmap('tab20', len(main_codes))
+    code_to_color = {c: cmap(i) for i, c in enumerate(main_codes)}
+    for code in main_codes:
+        sub = gdf_web[gdf_web['lnf_code'] == code]
+        sub.plot(ax=ax, color=code_to_color[code], alpha=0.7, markersize=4)
+ 
+    legend_handles = [
+        Line2D([0], [0], marker='o', linestyle='none',
+               markerfacecolor=code_to_color[c], markeredgecolor='none',
+               markersize=6, label=str(c))
+        for c in main_codes
+    ]
+ 
+    if has_grouping and n_pooled:
+        gdf_pooled = gdf_web[gdf_web['orig_lnf_code'] != gdf_web['lnf_code']]
+        gdf_pooled.plot(
+            ax=ax, facecolor='none', edgecolor='black', linewidth=0.6,
+            marker='o', markersize=22,
+        )
+        legend_handles.append(
+            Line2D([0], [0], marker='o', linestyle='none',
+                   markerfacecolor='none', markeredgecolor='black',
+                   markersize=8, label=f'pooled analogy ({n_pooled})')
+        )
+ 
     ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron, zoom='auto')
-    ax.set_title('Sampled pixel locations (based on LNF 2021-2024)')
+    pooled_note = f' — {n_pooled} pooled into main crops' if (has_grouping and n_pooled) else ''
+    ax.set_title('Sampled pixel locations (based on LNF 2021-2024)' + pooled_note)
     ax.set_axis_off()
+    # Single legend, built LAST so the basemap redraw can't drop it. Anchored
+    # inside the figure (not far outside the axes) so bbox_inches='tight' keeps it.
+    ax.legend(handles=legend_handles, title='main lnf_code',
+              loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8,
+              framealpha=0.9, borderaxespad=0.0)
     plt.tight_layout()
     plt.savefig(f'{OUT_DIR}/diag_samples_map.png',
                 dpi=150, bbox_inches='tight')
     plt.close()
     print(f'Saved: {OUT_DIR}/diag_samples_map.png')
-
-    counts = (df_loc.groupby(['lnf_code', 'yr']).size()
-              .unstack('yr', fill_value=0)
-              .sort_index(axis=1))
-
+ 
+    # Per-crop counts. Bars are grouped by the main (calibration) `lnf_code`;
+    # each bar's stack is split by `orig_lnf_code` so the contribution of pooled
+    # analogy crops is visible. Per-year counts are reported in the printout.
     if os.path.exists(LNF_LABELS_PATH):
         labels = pd.read_excel(LNF_LABELS_PATH,
                                sheet_name='label_sheet')[['LNF_code', 'Crop_EN']]
         name_map = dict(labels.drop_duplicates('LNF_code').values)
-        counts.index = [f"{c} — {name_map.get(c, '?')}" for c in counts.index]
     else:
+        name_map = {}
         print(f'(LNF labels not found at {LNF_LABELS_PATH}; using codes only)')
-
-    counts = counts.loc[counts.sum(axis=1).sort_values(ascending=False).index]
-    print(f'Total samples: {len(df_loc)}  |  crops: {counts.shape[0]}  |  '
-          f'years: {list(counts.columns)}')
-
-    fig, ax = plt.subplots(figsize=(max(8, 0.45 * len(counts)), 6))
-    counts.plot(kind='bar', stacked=True, ax=ax, colormap='viridis',
-                width=0.8, edgecolor='white')
-    totals = counts.sum(axis=1)
+ 
+    # composition matrix: rows = main lnf_code, cols = true orig_lnf_code
+    comp = (df_loc.groupby(['lnf_code', 'orig_lnf_code']).size()
+            .unstack('orig_lnf_code', fill_value=0))
+    # order main crops (rows) by total samples, descending
+    comp = comp.loc[comp.sum(axis=1).sort_values(ascending=False).index]
+ 
+    # x labels: "main — name" plus the folded-in analogy codes (if any)
+    def _row_label(main_code):
+        base = f"{main_code} — {name_map.get(main_code, '?')}"
+        analogies = [c for c in comp.columns
+                     if c != main_code and comp.loc[main_code, c] > 0]
+        if analogies:
+            base += f"\n(+{', '.join(str(int(a)) for a in sorted(analogies))})"
+        return base
+ 
+    # per-year totals (kept for the printout, like the original)
+    counts_by_year = (df_loc.groupby(['lnf_code', 'yr']).size()
+                      .unstack('yr', fill_value=0).sort_index(axis=1)
+                      .reindex(comp.index))
+    print(f'Total samples: {len(df_loc)}  |  main crops: {comp.shape[0]}  |  '
+          f'years: {list(counts_by_year.columns)}')
+    print('Per-(main crop, year) counts:')
+    print(counts_by_year.to_string())
+ 
+    fig, ax = plt.subplots(figsize=(max(8, 0.55 * len(comp)), 6))
+    comp.plot(kind='bar', stacked=True, ax=ax, colormap='tab20',
+              width=0.8, edgecolor='white')
+    totals = comp.sum(axis=1)
     for i, t in enumerate(totals):
         ax.text(i, t, f' {int(t)}', ha='center', va='bottom', fontsize=8)
-    ax.set_xlabel('LNF code — crop')
+    ax.set_xticklabels([_row_label(c) for c in comp.index],
+                       rotation=45, ha='right')
+    ax.set_xlabel('Main LNF code — crop  (+ pooled analogy codes)')
     ax.set_ylabel('Number of sampled fields')
-    ax.set_title(f'Sampled fields per crop, by year (n={len(df_loc)})')
-    ax.legend(title='Year', bbox_to_anchor=(1.02, 1), loc='upper left')
+    ax.set_title(f'Sampled fields per crop, split by true crop (n={len(df_loc)})')
+    ax.legend(title='true lnf_code', bbox_to_anchor=(1.02, 1),
+              loc='upper left', fontsize=7)
     ax.margins(y=0.08)
-    plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     plt.savefig(f'{OUT_DIR}/diag_samples_per_crop.png',
                 dpi=150, bbox_inches='tight')
     plt.close()
     print(f'Saved: {OUT_DIR}/diag_samples_per_crop.png')
-
+ 
     del df_loc, gdf, gdf_web
 else:
     print(f'(Skipping sampling overview: {SAMPLES_PATH} not found)')
+ 
 
 
 # =============================================================================
 # PART B — Cleaning diagnostics
 # =============================================================================
 print('\n=== B. Cleaning diagnostics ===')
+
+df_samples = pd.read_pickle(FC_RAW_PATH)
+df_samples['time'] = pd.to_datetime(df_samples['time'])
+print(f'Loaded {len(df_samples):,} raw rows, '
+      f'{df_samples.groupby(TS_COLS).ngroups:,} field-years.')
 
 # -----------------------------------------------------------------------------
 # B.1 Mask-category breakdown (BEFORE the per-date filter)

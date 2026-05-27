@@ -16,6 +16,145 @@ warnings.simplefilter("ignore")
 import sys
 sys.path.insert(0, os.path.expanduser('~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/SALI_models'))
 from src.model_utils import load_all_models
+from collections import defaultdict
+
+
+# C-factor value columns that define a crop's "stratified C-factor vector".
+# Two crops with identical vectors are treated as the same crop for sampling.
+CFACTOR_VALUE_COLS = ['Tal_Pflug', 'Tal_Mulch', 'Tal_Direkt',
+                      'Berg_Pflug', 'Berg_Mulch', 'Berg_Direkt']
+CFACTOR_REF_COL = 'Total'
+
+
+def build_crop_groups(
+    main_codes,
+    c_factor_table_path,
+    lnf_classification_path,
+    lnf_mapping_csv,
+    c_factor_provenance_path,
+    value_cols=CFACTOR_VALUE_COLS,
+    c_ref_col=CFACTOR_REF_COL,
+    restrict_analogies_to=None,
+):
+    """Group LNF crop codes that share identical tabulated C-factor value columns.
+
+    For every "main" code in `main_codes` (the top arable crops), find all other
+    LNF codes whose stratified C-factor vector (`value_cols`) is identical, and
+    treat them as the same crop ("analogies"). E.g. if code 531 is a top crop and
+    592 has the same C-factors, 592 is pooled into 531.
+
+    Parameters
+    ----------
+    main_codes : iterable[int]
+        Top arable LNF codes that anchor each group. Only groups containing at
+        least one of these are returned.
+    restrict_analogies_to : set[int] or None
+        If given, analogy codes are kept only if in this set (e.g. codes that
+        actually occur in the sampled LNF years). Main codes are always kept.
+
+    Returns
+    -------
+    analogy_to_main : dict[int, int]
+        Maps each analogy code -> its chosen main code. Main codes are NOT keys.
+    main_to_analogies : dict[int, list[int]]
+        Maps each main code -> sorted list of its analogy codes (may be empty).
+    groups : list[set[int]]
+        Raw connected components (for inspection / printing).
+    lnf_to_crop : dict[int, str]
+        Maps LNF code -> crop name (German), for reporting.
+    """
+    main_codes = list(main_codes)
+
+    # --- C-factor table: crop name -> values ---
+    df_c = pd.read_csv(c_factor_table_path, sep=';', encoding='latin-1')
+    df_c = df_c.rename(columns={'Kultur Kategorien 2020': 'Kultur_nutzung'})
+    df_c = df_c.dropna(subset=['Kultur_nutzung']).copy()
+    # Fix a naming
+    df_c.loc[
+        df_c['Kultur_nutzung'] == 'Einjährige Freilandgemüse (ohne Konservengemüse)',
+        'Kultur_nutzung'
+    ] = 'Einjährige Freilandgemüse, ohne Konservengemüse'
+
+    for col in value_cols + [c_ref_col]:
+        df_c[col] = pd.to_numeric(df_c[col], errors='coerce')
+    df_mapping = (
+        pd.read_csv(lnf_mapping_csv, encoding="latin1", sep=";")
+          [['kulturcode', 'Kultur_nutzung']]
+          .drop_duplicates()
+    )
+    df_c = df_c.merge(df_mapping, on='Kultur_nutzung', how='left')
+    df_c = df_c.rename(columns={'Kultur_nutzung': 'crop_name', 'kulturcode': 'lnf_code'})
+
+    # --- LNF bridge: crop name -> lnf_code ---
+    df_lnf = pd.read_excel(lnf_classification_path, sheet_name='label_sheet')
+    df_lnf = df_lnf[['LNF_code', 'Crop_DE']].rename(
+        columns={'LNF_code': 'lnf_code', 'Crop_DE': 'crop_name'}).dropna()
+    df = df_lnf.merge(df_c[['lnf_code', c_ref_col] + value_cols],
+                      on='lnf_code', how='inner').dropna(subset=value_cols)
+
+    # --- C factor provenance: drop codes that are fully estimated ---
+    df_prov = pd.read_excel(os.path.expanduser(c_factor_provenance_path),
+                            sheet_name='provenance', header=4)
+    estim_codes = df_prov[df_prov['n_estimate'] == 6].BFS_code.tolist()
+    df = df[~df['lnf_code'].isin(estim_codes)]
+    main_codes = [c for c in main_codes if c not in estim_codes]
+
+    # --- step 1: group lnf_codes sharing an identical value_cols vector ---
+    grouped = df.groupby(value_cols)['lnf_code'].apply(list)
+
+    # --- step 2: build an undirected graph linking codes in the same group ---
+    graph = defaultdict(set)
+    for codes in grouped:
+        for i in range(len(codes)):
+            for j in range(i + 1, len(codes)):
+                a, b = codes[i], codes[j]
+                graph[a].add(b)
+                graph[b].add(a)
+
+    # --- step 3: connected components ---
+    visited = set()
+    groups = []
+    all_nodes = set(main_codes) | set(graph.keys())
+    for node in all_nodes:
+        if node not in visited:
+            stack = [node]
+            component = set()
+            while stack:
+                cur = stack.pop()
+                if cur not in visited:
+                    visited.add(cur)
+                    component.add(cur)
+                    stack.extend(graph[cur] - visited)
+            groups.append(component)
+
+    # keep only groups that contain at least one main code
+    main_set = set(main_codes)
+    groups = [g for g in groups if g & main_set]
+
+    lnf_to_crop = dict(zip(df['lnf_code'], df['crop_name']))
+
+    # --- build the analogy -> main maps ---
+    analogy_to_main = {}
+    main_to_analogies = {}
+    for g in groups:
+        g = set(g)
+        main_candidates = g & main_set
+        if not main_candidates:
+            continue
+        # if several top crops collide in one group, pick the lowest as main
+        main_code = sorted(main_candidates)[0]
+
+        analogy_codes = g - {main_code}
+        # never fold one main crop into another — keep extra main codes separate
+        analogy_codes = {c for c in analogy_codes if c not in main_set}
+        if restrict_analogies_to is not None:
+            analogy_codes = {c for c in analogy_codes if c in restrict_analogies_to}
+
+        main_to_analogies[main_code] = sorted(analogy_codes)
+        for c in analogy_codes:
+            analogy_to_main[c] = main_code
+
+    return analogy_to_main, main_to_analogies, groups, lnf_to_crop
 
 
 def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, seed=42):
@@ -72,15 +211,25 @@ def sample_locations(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, se
     return
 
 
-def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, yrs, target_crs=32632, seed=42):
-    """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps)"""
+def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, lnf_codes, yrs, target_crs=32632, seed=42, analogy_to_main=None):
+    """Sample locations with a certain crop type, uniformly across crop types and available years (yearly crop maps)
+
+    `analogy_to_main` ({analogy_code: main_code}) pools crops with identical
+    tabulated C-factors: analogy polygons are relabelled to their main code and
+    enter the main crop's single area-weighted draw. The sample's true crop is
+    preserved in `orig_lnf_code`; `lnf_code` carries the (possibly relabelled)
+    main code used as the calibration grouping key.
+    """
+    analogy_to_main = dict(analogy_to_main or {})
 
     # Consider only 2021-2025 (to match LNF code)
     lnf_files = sorted([f for f in os.listdir(lnf_dir) if f.endswith('.gpkg')])
     lnf_files = [f for f in lnf_files if yrs[0] <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= yrs[-1]]
 
     n_years = len(lnf_files)
-    n_crops = len(lnf_codes)
+    # Analogy codes are pooled into their main crop, so they share a budget.
+    sample_codes = [c for c in lnf_codes if c not in analogy_to_main]
+    n_crops = len(sample_codes)
     samples_per_year = int(np.floor(tot_samples/n_years))
     samples_per_crop = int(np.floor(samples_per_year/n_crops))
 
@@ -98,8 +247,19 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
         lnf["poly_id"] = lnf.index
         if not len(lnf):
             continue
+
+        # Pool analogy crops into their main crop. Keep the true code in
+        # `orig_lnf_code`; relabel `lnf_code` to the main code so analogy polys
+        # join the main crop's draw and downstream sees one calibration code.
+        lnf["orig_lnf_code"] = lnf["lnf_code"]
+        if analogy_to_main:
+            n_relabel = lnf["lnf_code"].isin(analogy_to_main).sum()
+            if n_relabel:
+                lnf["lnf_code"] = lnf["lnf_code"].replace(analogy_to_main)
+                print(f"  [{yr}] relabelled {n_relabel} analogy poly(s) to their main crop")
+
         seed += 1 # so that among different years it varies
-        for crop in lnf_codes:
+        for crop in sample_codes:
             crop_polys = lnf[lnf.lnf_code == crop].to_crs(target_crs)
             if len(crop_polys) == 0:
                 continue
@@ -125,7 +285,7 @@ def sample_locations_with_field(crop_labels, lnf_dir, tot_samples, save_path, ln
             # Attach attributes safely using index
             pts["orig_idx"] = pts.index
             pts = pts.merge(
-                buffered[["orig_idx", "poly_id", "lnf_code", "geometry"]],
+                buffered[["orig_idx", "poly_id", "lnf_code", "orig_lnf_code", "geometry"]],
                 on="orig_idx",
                 how="left"
             )
@@ -158,6 +318,7 @@ def _agis_shortlist(
     arable_min_share=0.02,
     other_max_share=0.10,
     dominant_share=0.80,
+    analogy_to_main=None,
 ):
     """Build a (Flaechen_ID, Jahr, kulturcode) shortlist of "clean" arable fields
     from AGIS Nutzungsdaten, applying the selection rules from check_agis.py.
@@ -168,10 +329,16 @@ def _agis_shortlist(
         - 'grassland_plus_one': >=grass_min_share grassland + exactly 1 top-arable
         - 'dominant_crop'     : one top-arable crop covers >=dominant_share of farm
 
+    `analogy_to_main` ({analogy_code: main_code}) folds crops with identical
+    tabulated C-factors into a single crop *before* the farm-level rules run, so
+    e.g. a farm growing main crop 531 plus its analogy 592 is treated as a
+    single-crop farm. Returned `kulturcode` values are already the main codes.
+
     Returns a DataFrame with columns:
         Flaechen_ID, betr_ID, Jahr, kulturcode, Kultur_nutzung, land_type,
         flaeche_bewirt, selection_reason
     """
+    analogy_to_main = dict(analogy_to_main or {})
     rules = tuple(rules)
     valid = {'single_crop_farm', 'grassland_plus_one', 'dominant_crop'}
     bad = set(rules) - valid
@@ -195,6 +362,10 @@ def _agis_shortlist(
 
     # Attach kulturcode to every field row, classify by land_type
     df_nutzung = df_nutzung.merge(df_mapping, on='Kultur_nutzung', how='left')
+    # Fold analogy crops into their main crop so the farm-level rules below
+    # (crop counts, dominant share) treat C-factor-identical crops as one.
+    if analogy_to_main:
+        df_nutzung['kulturcode'] = df_nutzung['kulturcode'].replace(analogy_to_main)
     df_nutzung['land_type'] = np.select(
         [df_nutzung['kulturcode'].isin(grassland_codes),
          df_nutzung['kulturcode'].isin(top_arable_codes)],
@@ -202,13 +373,21 @@ def _agis_shortlist(
         default='other'
     )
 
-    # Aggregate to (farm, year, kulturcode) and compute shares
+    # Aggregate to (farm, year, kulturcode) and compute shares.
+    # `Kultur_nutzung` is collapsed to one representative name per kulturcode so
+    # that analogy crops folded into the same `kulturcode` above contribute to a
+    # single row — otherwise their areas would split across rows and the
+    # dominant-crop share test would under-count the pooled crop.
+    name_per_code = (
+        df_nutzung.groupby('kulturcode')['Kultur_nutzung'].first()
+    )
     df_crop_area = (
         df_nutzung.groupby(
-            ['betr_ID', 'Jahr', 'kulturcode', 'Kultur_nutzung', 'land_type'],
+            ['betr_ID', 'Jahr', 'kulturcode', 'land_type'],
             as_index=False
         )['flaeche_bewirt'].sum()
     )
+    df_crop_area['Kultur_nutzung'] = df_crop_area['kulturcode'].map(name_per_code)
     df_crop_area['farm_area'] = (
         df_crop_area.groupby(['betr_ID', 'Jahr'])['flaeche_bewirt'].transform('sum')
     )
@@ -332,6 +511,7 @@ def sample_locations_with_field_agis(
     target_crs=32632,
     seed=42,
     lnf_id_col_by_year=None,
+    analogy_to_main=None,
 ):
     """AGIS-informed analogue of sample_locations_with_field.
 
@@ -399,6 +579,8 @@ def sample_locations_with_field_agis(
     if grass_codes_for_shares is None:
         grass_codes_for_shares = grass_codes
 
+    analogy_to_main = dict(analogy_to_main or {})
+
     # Default LNF id-column lookup: schema changed in 2023.
     default_id_col_by_year = {
         2019: 'uuid', 2020: 'uuid', 2021: 'uuid', 2022: 'uuid',
@@ -421,6 +603,7 @@ def sample_locations_with_field_agis(
         arable_min_share=arable_min_share,
         other_max_share=other_max_share,
         dominant_share=dominant_share,
+        analogy_to_main=analogy_to_main,
     )
     # Normalize id types for the eventual uuid join (LNF uuid is str-like)
     shortlist['Flaechen_ID'] = shortlist['Flaechen_ID'].astype(str)
@@ -430,7 +613,10 @@ def sample_locations_with_field_agis(
     lnf_files = [f for f in lnf_files if yrs[0] <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= yrs[-1]]
 
     n_years = len(lnf_files)
-    n_crops_total = len(arable_codes) + len(grass_codes)
+    # Analogy codes are pooled into their main crop, so they don't get their own
+    # budget — count only the distinct sampled crops (main arable + grassland).
+    n_main_arable = len([c for c in arable_codes if c not in analogy_to_main])
+    n_crops_total = n_main_arable + len(grass_codes)
     samples_per_year = int(np.floor(tot_samples / max(n_years, 1)))
     samples_per_crop = int(np.floor(samples_per_year / max(n_crops_total, 1)))
     print(f"Target sampling: {tot_samples} total → {samples_per_year}/year, "
@@ -482,20 +668,45 @@ def sample_locations_with_field_agis(
             clean_yr.rename(columns={'Flaechen_ID': 'uuid'}),
             on='uuid', how='inner'
         )
-        # Sanity check: AGIS kulturcode and LNF lnf_code should agree for the same field
-        mism = lnf_arable_clean[lnf_arable_clean['lnf_code'] != lnf_arable_clean['kulturcode']]
+        # Sanity check: AGIS kulturcode and LNF lnf_code should agree for the
+        # same field. `kulturcode` from the shortlist is already analogy-folded
+        # to the main code, so compare against the analogy-folded LNF code too,
+        # otherwise pooled analogy fields would all look like mismatches.
+        lnf_code_main = lnf_arable_clean['lnf_code'].replace(analogy_to_main) if analogy_to_main \
+            else lnf_arable_clean['lnf_code']
+        mism = lnf_arable_clean[lnf_code_main != lnf_arable_clean['kulturcode']]
         if len(mism):
             print(f"  [{yr}] {len(mism)} arable fields with AGIS kulturcode != LNF lnf_code — keeping LNF code")
         lnf_arable_clean = lnf_arable_clean.drop(columns='kulturcode')
         lnf_grass = lnf[is_grass]
         lnf_keep = pd.concat([lnf_arable_clean, lnf_grass], ignore_index=True)
         lnf_keep = gpd.GeoDataFrame(lnf_keep, geometry='geometry', crs=lnf.crs)
+
+        # Keep the true crop code before any relabelling.
+        lnf_keep["orig_lnf_code"] = lnf_keep["lnf_code"]
+
+        # Pool analogy crops into their main crop: relabel analogy LNF codes to
+        # the main code so their (AGIS-clean) polygons enter the main crop's
+        # single area-weighted draw below. This keeps the per-crop sample budget
+        # honest (one draw per main code) while widening its field universe.
+        if analogy_to_main:
+            n_relabel = lnf_keep['lnf_code'].isin(analogy_to_main).sum()
+            if n_relabel:
+                lnf_keep['lnf_code'] = lnf_keep['lnf_code'].replace(analogy_to_main)
+                print(f"  [{yr}] relabelled {n_relabel} analogy poly(s) to their main crop")
+
         print(f"  [{yr}] LNF universe: {len(lnf)} polys → after AGIS filter "
               f"(+grassland): {len(lnf_keep)} polys "
               f"({len(lnf_arable_clean)} arable + {len(lnf_grass)} grassland)")
 
+        # Codes we actually iterate over to draw samples: main arable crops
+        # (analogies already folded in above) + grassland. Drop analogy codes
+        # from the iteration so they aren't double-counted.
+        sample_codes = [c for c in (arable_codes + grass_codes)
+                        if c not in analogy_to_main]
+
         seed += 1
-        for crop in arable_codes + grass_codes:
+        for crop in sample_codes:
             crop_polys = lnf_keep[lnf_keep.lnf_code == crop].to_crs(target_crs)
             if len(crop_polys) == 0:
                 continue
@@ -527,7 +738,7 @@ def sample_locations_with_field_agis(
             # grassland polys are sampled without an AGIS join, so they get
             # NaN for these fields — that's fine: stratified calibration
             # skips pixels without these IDs.
-            keep_cols = ["orig_idx", "poly_id", "lnf_code", "geometry"]
+            keep_cols = ["orig_idx", "poly_id", "lnf_code", "orig_lnf_code", "geometry"]
             for opt in ("uuid", "betr_ID"):
                 if opt in buffered.columns:
                     keep_cols.append(opt)
@@ -1912,18 +2123,53 @@ def run_sampling_pipeline(config: dict) -> None:
     grass_override = [c for c in config.get('grassland_codes', []) if c not in exclude_codes]
     arable_codes   = [c for c in arable_codes if c not in grass_override]
     grass_codes    = grass_override
-    lnf_codes = arable_codes + grass_codes
-    print(f"LNF codes (crops: {len(arable_codes)}, grass: {len(grass_codes)}): {lnf_codes}")
 
     # Wide grassland set for AGIS share computation (every Grassland-lv3 code
-    # plus any narrow overrides from config['grassland_codes']). This is what
-    # check_agis.py uses to decide whether a farm is "mostly grassland", and it
-    # is distinct from grass_codes above, which is the (typically narrow) set
-    # we actually draw FC samples from.
+    # plus any narrow overrides from config['grassland_codes']). Computed here
+    # (earlier than before) so the C-factor crop-grouping step can exclude
+    # grassland codes from the arable pooling below.
     grass_codes_lv3 = (
         df_labels[df_labels['Crop_Label_lv3'] == 'Grassland']['LNF_code']
         .unique().tolist()
     )
+
+    # =====================================
+    # Crop grouping by identical tabulated C-factors.
+    # Crops whose stratified C-factor vector is identical to a top (main) crop
+    # are treated as the *same* crop for sampling: their fields are pooled into
+    # the main crop's sample budget and relabelled to the main code downstream.
+    # `analogy_to_main` maps {analogy_code: main_code}; main codes are not keys.
+    analogy_to_main = {}
+    main_to_analogies = {}
+    if config.get('group_crops_by_cfactor', True):
+        analogy_to_main, main_to_analogies, _groups, _lnf_to_crop = build_crop_groups(
+            main_codes=arable_codes,
+            c_factor_table_path=os.path.expanduser(
+                config.get('c_factor_table_path', 'C_Faktoren.csv')),
+            lnf_classification_path=lnf_labels_path,
+            lnf_mapping_csv=os.path.expanduser(config['lnf_mapping_csv']),
+            c_factor_provenance_path=os.path.expanduser(
+                config.get('c_factor_provenance_path', 'c_factor_provenance.xlsx')),
+        )
+        # Don't fold a code into a main crop if it's explicitly excluded or is a
+        # grassland code (grassland is sampled separately, not via C-factor pool).
+        drop = set(exclude_codes) | set(grass_override) | set(grass_codes_lv3)
+        analogy_to_main = {a: m for a, m in analogy_to_main.items() if a not in drop}
+        # Analogy codes become extra sampleable arable codes (relabelled later).
+        analogy_codes = [c for c in analogy_to_main if c not in arable_codes]
+        arable_codes = arable_codes + analogy_codes
+        if analogy_to_main:
+            print(f"[group_crops] Pooling {len(analogy_to_main)} analogy code(s) "
+                  f"into {len(main_to_analogies)} main crop(s) by identical C-factors:")
+            for m in sorted(main_to_analogies):
+                ana = [c for c in main_to_analogies[m] if c in analogy_to_main]
+                if ana:
+                    print(f"  main {m} <- analogies {ana}")
+
+    lnf_codes = arable_codes + grass_codes
+    print(f"LNF codes (crops: {len(arable_codes)}, grass: {len(grass_codes)}): {lnf_codes}")
+
+    # AGIS share computation uses the wide Grassland-lv3 set ∪ narrow overrides.
     grass_codes_for_shares = sorted(
         set(grass_codes_lv3) | set(config.get('grassland_codes', []))
     )
@@ -1952,7 +2198,8 @@ def run_sampling_pipeline(config: dict) -> None:
             sample_locations_with_field(
                 lnf_labels_path, lnf_dir,
                 config['tot_samples'], samples_path,
-                lnf_codes, yrs
+                lnf_codes, yrs,
+                analogy_to_main=analogy_to_main,
             )
         elif strategy == 'agis':
             sample_locations_with_field_agis(
@@ -1975,6 +2222,7 @@ def run_sampling_pipeline(config: dict) -> None:
                 other_max_share=config.get('agis_other_max_share',   0.10),
                 dominant_share=config.get('agis_dominant_share',     0.80),
                 lnf_id_col_by_year=config.get('lnf_id_col_by_year'),
+                analogy_to_main=analogy_to_main,
             )
         else:
             raise ValueError(
