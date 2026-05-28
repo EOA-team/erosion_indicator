@@ -85,7 +85,7 @@ Notes
   trivially or arbitrarily and do not provide informative residuals — see
   the per-crop diagnostic plot to identify them.
 
-Entry point: `run_calibration(config)` — see DEFAULT_CONFIG at the bottom
+Entry point: `run_calibration(config)` — see the CONFIG dict in main.py
 for the expected keys.
 """
 
@@ -1463,73 +1463,4 @@ def run_calibration(config: dict) -> None:
                           area_weight=area_weight_loss)
  
  
-DEFAULT_CONFIG = {
-    # ---- Calibration ----
-    'gapfilled_fc_path':         'samples_data_gpr.parquet',
-    'ei_path':                   '../erosivity_index/predictions/grid_EI_daily_avg_pred_20260424_nn3.parquet',
-    'c_factor_table_path':       'C_Faktoren.csv',
-    'lnf_classification_path':   '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
-    'manual_overrides_path':     None,  # only needed if any sampled crops fail to auto-match LNF codes
-    'calibration_results_path':  'calibration_results.csv',
-    'ts_cols':                   ['lnf_code', 'yr', 'poly_id'],
-    'crop_col':                  'lnf_code',
-    'beta_bounds':               (1e-4, 0.1),
-    'exclude_calibration_lnf_codes': [],  # e.g. [601, 611, 545, 546] for Kunstwiesen, Extensiv genutzte Wiesen
-    'area_weight_loss':          True,   # False = equal-weight crops as in Matthews et al. 2023
-    'area_years':                [2021, 2022, 2023, 2024],
-    # ---- Stratified calibration (optional) ----
-    'stratified_calibration':    False,
-    'sampling_strategy':         'agis',  # required for stratified mode
-    'nutzung_csv':               '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_nutzungsdaten.csv',
-    'ressourceneffizienz_csv':   '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_ressourceneffizienzbeitrag.csv',
-    'grenze_tal_berg':           600,
-    'standardansaatverfahren':   'Pflug',
-    'tillage_assignment':        'stochastic',
-    'tillage_random_seed':       42,
-}
-
-
-if __name__ == '__main__':
-    run_calibration(DEFAULT_CONFIG)
-
-
-# Config keys used by run_calibration (defined and owned by main.py):
-#   gapfilled_fc_path        — parquet of gapfilled FC time series (from sampling step)
-#   ei_path                  — parquet of climatological daily EI on 100 m grid
-#   c_factor_table_path      — C_Faktoren.csv (semicolon-separated, latin-1)
-#   lnf_classification_path  — LNF_code_classification_*.xlsx
-#   manual_overrides_path    — optional CSV (lnf_code, crop_name) for residual mismatches; None if unused
-#   calibration_results_path — output CSV path; per-pixel results saved alongside with `_per_pixel` suffix
-#   ts_cols                  — group-by columns for one C per group; default ['lnf_code', 'yr', 'poly_id'].
-#                              poly_id is the parcel identifier; since the upstream sampling
-#                              step retains exactly one pixel per parcel per year, each group
-#                              corresponds to one sampled-pixel time series.
-#   crop_col                 — crop identifier column; default 'lnf_code'
-#   beta_bounds              — (min, max) for the 1-D β search; default (1e-4, 0.1)
-#   exclude_calibration_lnf_codes — optional list of LNF codes to drop from the loss
-#                              function (kept in per-pixel output); default []
-#   area_weight_loss         — if True, weight the loss by Swiss arable area per crop
-#                              so cereals dominate; if False, equal-weight crops as in
-#                              Matthews et al. 2023; default True
-#   area_years               — list of years averaged into the area weights (e.g.
-#                              [2021, 2022, 2023, 2024] to match the FC sampling
-#                              window); None or [] disables area weighting
-# Stratified-mode keys (only used when stratified_calibration=True):
-#   stratified_calibration   — master flag; default False
-#   sampling_strategy        — must be 'agis' for stratified mode (FC parquet must
-#                              carry `uuid` and `betr_ID`)
-#   nutzung_csv              — tbl_nutzungsdaten.csv (semicolon, latin-1); used for
-#                              field altitude via the `swissALTI3D` column joined
-#                              by (Flaechen_ID, Jahr)
-#   ressourceneffizienz_csv  — tbl_ressourceneffizienzbeitrag.csv (semicolon, utf-8);
-#                              used for tillage (reb_sb) joined by (betr_ID, Jahr)
-#   grenze_tal_berg          — altitude cutoff in metres for Tal/Berg; default 600
-#   standardansaatverfahren  — default tillage class when no REB entry exists for a
-#                              farm-year; default 'Pflug'
-#   tillage_assignment       — 'stochastic' | 'first_row' | 'mode'; how to resolve
-#                              farm-years with multiple distinct reb_sb values
-#                              (no field id in the REB table forces a choice).
-#                              Default 'stochastic' draws per pixel from empirical
-#                              row-count frequencies — zero bias in expectation
-#                              across many pixels; per-pixel noise.
-#   tillage_random_seed      — seeds the RNG for `'stochastic'`; default 42
+    print("Done.")

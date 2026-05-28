@@ -66,7 +66,7 @@ def build_crop_groups(
     main_codes = list(main_codes)
 
     # --- C-factor table: crop name -> values ---
-    df_c = pd.read_csv(c_factor_table_path, sep=';', encoding='latin-1')
+    df_c = pd.read_csv(os.path.expanduser(c_factor_table_path), sep=';', encoding='latin-1')
     df_c = df_c.rename(columns={'Kultur Kategorien 2020': 'Kultur_nutzung'})
     df_c = df_c.dropna(subset=['Kultur_nutzung']).copy()
     # Fix a naming
@@ -2390,42 +2390,3 @@ def run_sampling_pipeline(config: dict) -> None:
     plt.tight_layout()
     plt.savefig("plots/gpr_all_timeseries_subplots_regular.png")
     plt.close()
-
-
-DEFAULT_CONFIG = {
-    # ---- Sampling / gapfilling ----
-    'lnf_labels_path': '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
-    'lnf_dir':         '~/mnt/eo-nas1/data/landuse/raw',
-    'top_crops': None,  # None = auto-detect top crops from LNF area stats; or pass an explicit list of crop names
-    'lnf_ignore_codes': [553, 554, 555, 556, 559, 572, 594, 595, 598, 618, 625],  # arable or grassland classes to ignore
-    'grassland_codes': [],  # LNF codes for grassland to include in sampling (e.g. [601, 611])
-    'tot_samples':         10000,
-    'samples_path':        'samples.pkl',
-    'samples_s2_path':     'samples_data.pkl',
-    'fc_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/FC',  # pre-computed FC; falls back to S2+prediction if files are missing
-    's2_grid_path':        '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
-    's2_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
-    'soil_dir':            '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',
-    'fc_preds_path':       'samples_data_pred.pkl',
-    'gapfilled_fc_path':   'samples_data_gpr.parquet',
-    'max_gap_days':        15,
-    'drop_fraction_threshold': 0.7,  # drop fields where >70% of observations are masked
-    'n_jobs':              1,
-
-    # ---- Sampling strategy ----
-    # 'random' -> sample_locations_with_field (original: weighted random per crop/year)
-    # 'agis'   -> sample_locations_with_field_agis (AGIS-clean fields only, per check_agis.py)
-    'sampling_strategy': 'agis',
-    # Used only when sampling_strategy == 'agis':
-    'nutzung_csv':       '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_nutzungsdaten.csv',
-    'lnf_mapping_csv':   '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_kulturmapping.csv',
-    'agis_rules':              ('single_crop_farm', 'grassland_plus_one', 'dominant_crop'),
-    'agis_grass_min_share':    0.50,
-    'agis_arable_min_share':   0.02,
-    'agis_other_max_share':    0.10,
-    'agis_dominant_share':     0.80,
-}
-
-
-if __name__ == '__main__':
-    run_sampling_pipeline(DEFAULT_CONFIG)
