@@ -77,8 +77,9 @@ Notes
   stratum based on field altitude (Tal/Berg via ``swissALTI3D`` in
   ``tbl_nutzungsdaten``) and farm-year soil preparation (Pflug/Mulch/Direkt
   via ``reb_sb`` in ``tbl_ressourceneffizienzbeitrag``). Outputs are
-  written with a ``_stratified`` suffix so the two modes don't clobber
-  each other. See ``run_calibration_stratified`` for details.
+  Both the unstratified and stratified paths honour ``calibration_mode``
+  (``'single'`` or ``'two_beta'``); in two-β mode the SLR exponent becomes
+  ``β_pv·PV·100 + β_npv·NPV·100`` and the saved beta JSON records both betas.
 
 - Crops whose tabulated C-factor is the table-wide default (0.1 or 0.004
   fallback values used where no measurement exists) will fit either
@@ -333,11 +334,44 @@ def load_reference_cfactors(c_factor_table_path: str,
 # C-factor computation (vectorised)
 # ---------------------------------------------------------------------------
  
-def compute_cfactors_per_pixel(df: pd.DataFrame, beta: float, ts_cols: list[str],
-                               fc_col: str = 'fc_total', ei_col: str = 'ei') -> pd.DataFrame:
+def _slr_exponent(df: pd.DataFrame, beta,
+                  fc_col: str = 'fc_total',
+                  pv_col: str = 'pv', npv_col: str = 'npv') -> np.ndarray:
+    """Return the SLR exponent ``β·FC`` for either calibration mode.
+
+    ``beta`` selects the mode:
+      * scalar (float/int)        -> single-β model, exponent = β · fc_total
+      * length-2 sequence (a, b)  -> two-β model, exponent = β_pv·(pv·100)
+                                     + β_npv·(npv·100)
+
+    In two-β mode ``pv`` and ``npv`` (stored on the 0–1 scale in the gapfilled
+    parquet) are each scaled by 100 so the βs are directly comparable to the
+    single-β value (which multiplies ``fc_total = (pv+npv)·100``). When
+    β_pv == β_npv the two-β model reproduces the single-β model exactly.
+    """
+    if np.isscalar(beta):
+        return float(beta) * df[fc_col].values
+    beta_pv, beta_npv = beta
+    return (float(beta_pv) * (df[pv_col].values * 100.0)
+            + float(beta_npv) * (df[npv_col].values * 100.0))
+
+
+def _fc_input_cols(beta, fc_col: str = 'fc_total',
+                   pv_col: str = 'pv', npv_col: str = 'npv') -> list[str]:
+    """Columns required from ``df`` to evaluate the SLR for a given ``beta``."""
+    return [fc_col] if np.isscalar(beta) else [pv_col, npv_col]
+
+
+def compute_cfactors_per_pixel(df: pd.DataFrame, beta, ts_cols: list[str],
+                               fc_col: str = 'fc_total', ei_col: str = 'ei',
+                               pv_col: str = 'pv', npv_col: str = 'npv') -> pd.DataFrame:
     """Compute the EI-weighted SLR per (crop, year, pixel) group, vectorised.
 
-    C(group) = sum(exp(-beta * fc_total) * EI) / sum(EI)
+    C(group) = sum(exp(-(β·FC)) * EI) / sum(EI)
+
+    ``beta`` is either a scalar (single-β: exponent β·fc_total) or a
+    ``(β_pv, β_npv)`` pair (two-β: exponent β_pv·pv·100 + β_npv·npv·100); see
+    ``_slr_exponent``.
 
     Each ``ts_cols`` group identifies one *sampled-pixel time series* (the
     upstream sampling step retains exactly one pixel per parcel per year, so
@@ -349,8 +383,9 @@ def compute_cfactors_per_pixel(df: pd.DataFrame, beta: float, ts_cols: list[str]
     iterating through groups in Python — substantially faster when the optimiser
     re-evaluates this for every β candidate.
     """
-    valid = df[ts_cols + [fc_col, ei_col]].dropna(subset=[fc_col, ei_col])
-    slr = np.exp(-beta * valid[fc_col].values)
+    fc_cols = _fc_input_cols(beta, fc_col, pv_col, npv_col)
+    valid = df[ts_cols + fc_cols + [ei_col]].dropna(subset=fc_cols + [ei_col])
+    slr = np.exp(-_slr_exponent(valid, beta, fc_col, pv_col, npv_col))
     weighted = slr * valid[ei_col].values
 
     grouped = (
@@ -380,9 +415,23 @@ def calibrate_beta(df: pd.DataFrame, df_ref: pd.DataFrame, ts_cols: list[str],
                    fc_col: str = 'fc_total', ei_col: str = 'ei',
                    beta_bounds: tuple[float, float] = (1e-4, 0.1),
                    area_weight: bool = True,
-                   ) -> tuple[float, pd.DataFrame]:
+                   mode: str = 'single',
+                   pv_col: str = 'pv', npv_col: str = 'npv',
+                   beta_bounds_pv: tuple[float, float] | None = None,
+                   beta_bounds_npv: tuple[float, float] | None = None,
+                   ):
     """Find β minimising the (area-weighted) mean absolute difference of
     crop-level C-factors.
+
+    ``mode`` selects the SLR parameterisation:
+      * ``'single'``  — one global β, exponent β·fc_total (Matthews et al.).
+        1-D bounded search over ``beta_bounds``. Returns ``beta_opt`` as a
+        ``float``.
+      * ``'two_beta'`` — separate β for PV and NPV, exponent
+        β_pv·(pv·100) + β_npv·(npv·100). 2-D L-BFGS-B search; PV bounds default
+        to ``beta_bounds_pv`` (falling back to ``beta_bounds``) and NPV to
+        ``beta_bounds_npv`` (falling back to ``beta_bounds``). Returns
+        ``beta_opt`` as a ``(β_pv, β_npv)`` tuple.
 
     Following Matthews et al. (2023) but with optional area weighting:
       1) compute C per (crop, year, pixel) for the candidate β,
@@ -399,7 +448,8 @@ def calibrate_beta(df: pd.DataFrame, df_ref: pd.DataFrame, ts_cols: list[str],
 
     Returns
     -------
-    beta_opt : float
+    beta_opt : float | tuple[float, float]
+        Single β (mode='single') or (β_pv, β_npv) (mode='two_beta').
     df_crop  : DataFrame with one row per crop containing C_ref, C_predicted,
                residual, abs_residual, and (if used) area_ha and weight.
     """
@@ -426,8 +476,9 @@ def calibrate_beta(df: pd.DataFrame, df_ref: pd.DataFrame, ts_cols: list[str],
                   else "area_ha missing from df_ref")
         print(f"Equal-weighted MAE active ({reason}; Matthews et al. 2023 default)")
 
-    def objective(beta: float) -> float:
-        df_pred = compute_cfactors_per_pixel(df, beta, ts_cols, fc_col, ei_col)
+    def objective(beta) -> float:
+        df_pred = compute_cfactors_per_pixel(df, beta, ts_cols, fc_col, ei_col,
+                                             pv_col, npv_col)
         df_crop_pred = aggregate_to_crop(df_pred, crop_col)
         merged = df_ref.merge(df_crop_pred, on=crop_col, how='inner')
         if len(merged) == 0:
@@ -442,14 +493,31 @@ def calibrate_beta(df: pd.DataFrame, df_ref: pd.DataFrame, ts_cols: list[str],
             return float((abs_res * w).sum())
         return float(abs_res.mean())
 
-    result = minimize_scalar(objective, bounds=beta_bounds, method='bounded')
-    beta_opt = float(result.x)
-    mae_opt = float(result.fun)
     label = "area-weighted MAE" if use_area else "MAE"
-    print(f"Optimal β: {beta_opt:.5f}   {label} across crops: {mae_opt:.4f}")
+    if mode == 'single':
+        result = minimize_scalar(objective, bounds=beta_bounds, method='bounded')
+        beta_opt = float(result.x)
+        mae_opt = float(result.fun)
+        print(f"Optimal β: {beta_opt:.5f}   {label} across crops: {mae_opt:.4f}")
+    elif mode == 'two_beta':
+        from scipy.optimize import minimize
+        b_pv  = beta_bounds_pv  or beta_bounds
+        b_npv = beta_bounds_npv or beta_bounds
+        # Start at the midpoint of each component's bounds.
+        x0 = [0.5 * (b_pv[0] + b_pv[1]), 0.5 * (b_npv[0] + b_npv[1])]
+        result = minimize(lambda x: objective((x[0], x[1])), x0=x0,
+                          bounds=[b_pv, b_npv], method='L-BFGS-B')
+        beta_opt = (float(result.x[0]), float(result.x[1]))
+        mae_opt = float(result.fun)
+        print(f"Optimal β_pv: {beta_opt[0]:.5f}, β_npv: {beta_opt[1]:.5f}   "
+              f"{label} across crops: {mae_opt:.4f}")
+    else:
+        raise ValueError(f"Unknown calibration mode {mode!r} "
+                         "(expected 'single' or 'two_beta')")
 
     # Build the diagnostic crop-level table at β_opt
-    df_pred = compute_cfactors_per_pixel(df, beta_opt, ts_cols, fc_col, ei_col)
+    df_pred = compute_cfactors_per_pixel(df, beta_opt, ts_cols, fc_col, ei_col,
+                                         pv_col, npv_col)
     df_crop_pred = aggregate_to_crop(df_pred, crop_col)
     df_crop = df_ref.merge(df_crop_pred, on=crop_col, how='left')
     df_crop['residual'] = df_crop['C_predicted'] - df_crop['C_ref']
@@ -510,8 +578,12 @@ def plot_calibration_per_crop(df_crop: pd.DataFrame, beta_opt: float,
     ax.set_ylim(c_range)
     ax.set_xlabel('Reference C-factor (Total per crop)')
     ax.set_ylabel('Predicted C-factor (mean of sampled pixels)')
+    if np.isscalar(beta_opt):
+        beta_str = f'β = {beta_opt:.5f}'
+    else:
+        beta_str = f'β_pv = {beta_opt[0]:.5f}, β_npv = {beta_opt[1]:.5f}'
     title = (f'C-factor calibration per crop  '
-             f'(β = {beta_opt:.5f}, MAE = {mae_unw:.4f}, bias = {bias:+.4f}')
+             f'({beta_str}, MAE = {mae_unw:.4f}, bias = {bias:+.4f}')
     if use_area:
         title += f', area-w. MAE = {mae_aw:.4f})'
         ax.set_xlabel('Reference C-factor (Total per crop)  '
@@ -547,11 +619,19 @@ def plot_beta_sensitivity(df: pd.DataFrame, df_ref: pd.DataFrame, ts_cols: list[
         else:
             use_area = False
 
+    # In two-β mode the loss surface is 2-D; show a 1-D slice by sweeping
+    # β_npv while holding β_pv fixed at its optimum. In single mode beta is
+    # the swept scalar directly.
+    two_beta = not np.isscalar(beta_opt)
+    beta_pv_fixed = beta_opt[0] if two_beta else None
+    sweep_opt = beta_opt[1] if two_beta else beta_opt
+
     per_crop_records = []
     overall_mae = []
 
     for beta in beta_range:
-        df_pred = compute_cfactors_per_pixel(df, float(beta), ts_cols)
+        beta_eval = (beta_pv_fixed, float(beta)) if two_beta else float(beta)
+        df_pred = compute_cfactors_per_pixel(df, beta_eval, ts_cols)
         df_crop_pred = aggregate_to_crop(df_pred, crop_col)
         merged = df_ref.merge(df_crop_pred, on=crop_col, how='left')
         merged['abs_diff'] = (merged['C_predicted'] - merged['C_ref']).abs()
@@ -581,8 +661,9 @@ def plot_beta_sensitivity(df: pd.DataFrame, df_ref: pd.DataFrame, ts_cols: list[
                     if use_area else 'All crops (mean)')
     ax.plot(beta_range, overall_mae, color='black', lw=2.5,
             label=global_label, linestyle='--')
-    ax.axvline(beta_opt, color='red', linestyle=':', label=f'β_opt = {beta_opt:.5f}')
-    ax.set_xlabel('β')
+    ax.axvline(sweep_opt, color='red', linestyle=':',
+               label=f'β_opt = {sweep_opt:.5f}')
+    ax.set_xlabel('β_npv (β_pv fixed at optimum)' if two_beta else 'β')
     ax.set_ylabel('Mean absolute C-factor difference')
     title = 'β sensitivity per crop (Matthews et al. Fig. 2 style)'
     if use_area:
@@ -1009,17 +1090,20 @@ def load_reference_cfactors_stratified(c_factor_table_path: str,
     return out[out_cols].reset_index(drop=True)
  
  
-def compute_cfactors_stratified(df: pd.DataFrame, beta: float, ts_cols: list[str],
-                                fc_col: str = 'fc_total', ei_col: str = 'ei') -> pd.DataFrame:
+def compute_cfactors_stratified(df: pd.DataFrame, beta, ts_cols: list[str],
+                                fc_col: str = 'fc_total', ei_col: str = 'ei',
+                                pv_col: str = 'pv', npv_col: str = 'npv') -> pd.DataFrame:
     """Per-pixel-time-series C-factor with `region` and `tillage` carried along.
  
-    Mirrors `compute_cfactors_per_pixel` but adds the stratum identifiers
+    Mirrors `compute_cfactors_per_pixel` (incl. its single-β / two-β ``beta``
+    contract — see ``_slr_exponent``) but adds the stratum identifiers
     (constant within a ts_cols group) so the downstream aggregation can
     group by (crop, region, tillage).
     """
     extra = [c for c in ('region', 'tillage') if c in df.columns]
-    valid = df[ts_cols + extra + [fc_col, ei_col]].dropna(subset=[fc_col, ei_col])
-    slr = np.exp(-beta * valid[fc_col].values)
+    fc_cols = _fc_input_cols(beta, fc_col, pv_col, npv_col)
+    valid = df[ts_cols + extra + fc_cols + [ei_col]].dropna(subset=fc_cols + [ei_col])
+    slr = np.exp(-_slr_exponent(valid, beta, fc_col, pv_col, npv_col))
     weighted = slr * valid[ei_col].values
     grouped = (valid.assign(_num=weighted, _den=valid[ei_col].values)
                     .groupby(ts_cols + extra, as_index=False)[['_num', '_den']]
@@ -1073,24 +1157,34 @@ def calibrate_beta_stratified(df: pd.DataFrame, df_ref: pd.DataFrame,
                               fc_col: str = 'fc_total', ei_col: str = 'ei',
                               beta_bounds: tuple[float, float] = (1e-4, 0.1),
                               area_weight: bool = True,
-                              ) -> tuple[float, pd.DataFrame]:
+                              mode: str = 'single',
+                              pv_col: str = 'pv', npv_col: str = 'npv',
+                              beta_bounds_pv: tuple[float, float] | None = None,
+                              beta_bounds_npv: tuple[float, float] | None = None,
+                              ):
     """Find β minimising MAE over (crop, region, tillage) strata.
  
     Loss form (Form 1): one residual per non-empty stratum, weighted by
     (crop area × pixel count in stratum / total pixel count in crop)
     normalised across all populated strata. Set `area_weight=False` for
     equal-weighted stratum MAE.
+
+    ``mode`` selects the SLR parameterisation (same contract as
+    ``calibrate_beta``): ``'single'`` → scalar β (1-D bounded search),
+    ``'two_beta'`` → ``(β_pv, β_npv)`` (2-D L-BFGS-B). The returned
+    ``beta_opt`` is a float or a 2-tuple accordingly.
     """
     join_cols = [crop_col, 'region', 'tillage']
     use_area = area_weight and 'area_ha' in df_ref.columns
  
     def _build_loss_inputs(beta):
-        df_pred   = compute_cfactors_stratified(df, beta, ts_cols, fc_col, ei_col)
+        df_pred   = compute_cfactors_stratified(df, beta, ts_cols, fc_col, ei_col,
+                                                pv_col, npv_col)
         df_strata = aggregate_to_stratum(df_pred, crop_col)
         merged    = df_ref.merge(df_strata, on=join_cols, how='inner')
         return merged
  
-    def objective(beta: float) -> float:
+    def objective(beta) -> float:
         merged = _build_loss_inputs(beta)
         if len(merged) == 0:
             return 1e6
@@ -1101,11 +1195,26 @@ def calibrate_beta_stratified(df: pd.DataFrame, df_ref: pd.DataFrame,
             return float((abs_res * w).sum())
         return float(abs_res.mean())
  
-    result = minimize_scalar(objective, bounds=beta_bounds, method='bounded')
-    beta_opt = float(result.x)
-    mae_opt = float(result.fun)
     label = "area-weighted stratum MAE" if use_area else "equal-weighted stratum MAE"
-    print(f"[stratified] Optimal β: {beta_opt:.5f}   {label}: {mae_opt:.4f}")
+    if mode == 'single':
+        result = minimize_scalar(objective, bounds=beta_bounds, method='bounded')
+        beta_opt = float(result.x)
+        mae_opt = float(result.fun)
+        print(f"[stratified] Optimal β: {beta_opt:.5f}   {label}: {mae_opt:.4f}")
+    elif mode == 'two_beta':
+        from scipy.optimize import minimize
+        b_pv  = beta_bounds_pv  or beta_bounds
+        b_npv = beta_bounds_npv or beta_bounds
+        x0 = [0.5 * (b_pv[0] + b_pv[1]), 0.5 * (b_npv[0] + b_npv[1])]
+        result = minimize(lambda x: objective((x[0], x[1])), x0=x0,
+                          bounds=[b_pv, b_npv], method='L-BFGS-B')
+        beta_opt = (float(result.x[0]), float(result.x[1]))
+        mae_opt = float(result.fun)
+        print(f"[stratified] Optimal β_pv: {beta_opt[0]:.5f}, β_npv: {beta_opt[1]:.5f}   "
+              f"{label}: {mae_opt:.4f}")
+    else:
+        raise ValueError(f"Unknown calibration mode {mode!r} "
+                         "(expected 'single' or 'two_beta')")
  
     # Diagnostic stratum-level table at β_opt
     merged = _build_loss_inputs(beta_opt)
@@ -1160,8 +1269,12 @@ def plot_calibration_stratified(df_strata: pd.DataFrame, beta_opt: float,
     ax.set_ylim(c_range)
     ax.set_xlabel('Reference C-factor (stratified)')
     ax.set_ylabel('Predicted C-factor (mean of sampled pixels)')
+    if np.isscalar(beta_opt):
+        beta_str = f'β = {beta_opt:.5f}'
+    else:
+        beta_str = f'β_pv = {beta_opt[0]:.5f}, β_npv = {beta_opt[1]:.5f}'
     title = (f'Stratified C-factor calibration  '
-             f'(β = {beta_opt:.5f}, MAE = {mae_unw:.4f}, bias = {bias:+.4f}')
+             f'({beta_str}, MAE = {mae_unw:.4f}, bias = {bias:+.4f}')
     title += f', area-w. MAE = {mae_aw:.4f})' if use_area else ')'
     ax.set_title(title)
     ax.legend(loc='upper left', fontsize=8, ncol=2)
@@ -1181,11 +1294,17 @@ def plot_beta_sensitivity_stratified(df: pd.DataFrame, df_ref: pd.DataFrame,
     join_cols = [crop_col, 'region', 'tillage']
     use_area = area_weight and 'area_ha' in df_ref.columns
  
+    # In two-β mode show a 1-D slice: sweep β_npv with β_pv fixed at optimum.
+    two_beta = not np.isscalar(beta_opt)
+    beta_pv_fixed = beta_opt[0] if two_beta else None
+    sweep_opt = beta_opt[1] if two_beta else beta_opt
+
     per_stratum_records = []
     overall_mae = []
  
     for beta in beta_range:
-        df_pred   = compute_cfactors_stratified(df, float(beta), ts_cols)
+        beta_eval = (beta_pv_fixed, float(beta)) if two_beta else float(beta)
+        df_pred   = compute_cfactors_stratified(df, beta_eval, ts_cols)
         df_strata = aggregate_to_stratum(df_pred, crop_col)
         merged    = df_ref.merge(df_strata, on=join_cols, how='inner')
         if len(merged) == 0:
@@ -1218,9 +1337,9 @@ def plot_beta_sensitivity_stratified(df: pd.DataFrame, df_ref: pd.DataFrame,
              else 'All strata (mean)')
     ax.plot(beta_range, overall_mae, color='black', lw=2.5, linestyle='--',
             label=label)
-    ax.axvline(beta_opt, color='red', linestyle=':',
-               label=f'β_opt = {beta_opt:.5f}')
-    ax.set_xlabel('β')
+    ax.axvline(sweep_opt, color='red', linestyle=':',
+               label=f'β_opt = {sweep_opt:.5f}')
+    ax.set_xlabel('β_npv (β_pv fixed at optimum)' if two_beta else 'β')
     ax.set_ylabel('Mean absolute C-factor difference (stratified)')
     ax.set_title('Stratified β sensitivity')
     ax.legend(loc='upper right', fontsize=8)
@@ -1259,6 +1378,9 @@ def run_calibration_stratified(config: dict) -> None:
     ts_cols                 = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
     crop_col                = config.get('crop_col', 'lnf_code')
     beta_bounds             = config.get('beta_bounds', (1e-4, 0.1))
+    calibration_mode        = config.get('calibration_mode', 'single')
+    beta_bounds_pv          = config.get('beta_bounds_pv')
+    beta_bounds_npv         = config.get('beta_bounds_npv')
     exclude_lnf_codes       = config.get('exclude_calibration_lnf_codes', []) or []
     area_weight_loss        = config.get('area_weight_loss', True)
     area_years              = config.get('area_years', []) or None
@@ -1320,19 +1442,28 @@ def run_calibration_stratified(config: dict) -> None:
     df = join_ei_to_fc(df_fc, df_ei, x_off, y_off)
  
     # Calibrate
-    print("[stratified] Calibrating β (stratum-level MAE objective)...")
+    print(f"[stratified] Calibrating β (stratum-level MAE objective, "
+          f"mode='{calibration_mode}')...")
     beta_opt, df_strata = calibrate_beta_stratified(df, df_ref, ts_cols,
                                                     crop_col=crop_col,
                                                     beta_bounds=beta_bounds,
-                                                    area_weight=area_weight_loss)
+                                                    area_weight=area_weight_loss,
+                                                    mode=calibration_mode,
+                                                    beta_bounds_pv=beta_bounds_pv,
+                                                    beta_bounds_npv=beta_bounds_npv)
     with open(beta_json_path, 'w') as f:
-        json.dump({'beta': beta_opt,
-                   'area_weight_loss': area_weight_loss,
-                   'mode': 'stratified',
-                   'cutoff_m': cutoff_m,
-                   'tillage_assignment': tillage_method,
-                   'tillage_random_seed': seed,
-                   'default_tillage': default_tillage}, f, indent=2)
+        record = {'mode': 'stratified',
+                  'calibration_mode': calibration_mode,
+                  'area_weight_loss': area_weight_loss,
+                  'cutoff_m': cutoff_m,
+                  'tillage_assignment': tillage_method,
+                  'tillage_random_seed': seed,
+                  'default_tillage': default_tillage}
+        if calibration_mode == 'two_beta':
+            record['beta_pv'], record['beta_npv'] = beta_opt[0], beta_opt[1]
+        else:
+            record['beta'] = beta_opt
+        json.dump(record, f, indent=2)
  
     df_strata.to_csv(results_path_strat, index=False)
     print(f"[stratified] Per-stratum results → {results_path_strat}")
@@ -1382,6 +1513,9 @@ def run_calibration(config: dict) -> None:
     ts_cols                 = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
     crop_col                = config.get('crop_col', 'lnf_code')
     beta_bounds             = config.get('beta_bounds', (1e-4, 0.1))
+    calibration_mode        = config.get('calibration_mode', 'single')
+    beta_bounds_pv          = config.get('beta_bounds_pv')
+    beta_bounds_npv         = config.get('beta_bounds_npv')
     exclude_lnf_codes       = config.get('exclude_calibration_lnf_codes', []) or []
     area_weight_loss        = config.get('area_weight_loss', True)
     area_years              = config.get('area_years', []) or None
@@ -1432,15 +1566,24 @@ def run_calibration(config: dict) -> None:
     # Join EI to FC timeseries
     print("Joining EI to FC timeseries...")
     df = join_ei_to_fc(df_fc, df_ei, x_off, y_off)
- 
+    print(df)
     # Calibrate beta (Matthews et al. strategy: crop-level mean absolute error)
-    print("Calibrating β (crop-level MAE objective)...")
+    print(f"Calibrating β (crop-level MAE objective, mode='{calibration_mode}')...")
     beta_opt, df_crop = calibrate_beta(df, df_ref, ts_cols,
                                        crop_col=crop_col,
                                        beta_bounds=beta_bounds,
-                                       area_weight=area_weight_loss)
+                                       area_weight=area_weight_loss,
+                                       mode=calibration_mode,
+                                       beta_bounds_pv=beta_bounds_pv,
+                                       beta_bounds_npv=beta_bounds_npv)
     with open(os.path.join(results_dir,'beta.json'), 'w') as f:
-        json.dump({'beta': beta_opt, 'area_weight_loss': area_weight_loss}, f)
+        if calibration_mode == 'two_beta':
+            beta_record = {'mode': 'two_beta',
+                           'beta_pv': beta_opt[0], 'beta_npv': beta_opt[1]}
+        else:
+            beta_record = {'mode': 'single', 'beta': beta_opt}
+        beta_record['area_weight_loss'] = area_weight_loss
+        json.dump(beta_record, f, indent=2)
         
     # Save crop-level calibration table
     df_crop.to_csv(results_path, index=False)
