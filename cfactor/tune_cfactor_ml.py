@@ -47,7 +47,7 @@ a **group-mean MAE** per fold — predictions averaged to the group, compared to
 the group's C_ref — which is the scientifically meaningful number and directly
 comparable to the calibration's per-crop MAE.
 
-Outputs (to ``config['results_folder']`` = calibration_analysis_{model}/)
+Outputs (to ``config['tune_results_folder']``, default ``calibration_analysis_tune/``)
 -----------------------------------------------------------------------
 - ``tune_cv_results.csv``         full grid-search table (mean/std CV per config)
 - ``tune_baselines.csv``          baseline + selected-model CV scores
@@ -77,13 +77,14 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.neural_network import MLPRegressor
 from sklearn.linear_model import Ridge
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import GroupKFold, cross_validate
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error
+
+from weighted_mlp import WeightedMLPRegressor
 
 from calibrate_cfactor import (
     get_ei_grid_offset,
@@ -228,7 +229,10 @@ def assemble_training_table(config: dict) -> tuple[pd.DataFrame, list[str], bool
     print(f"[tune] {n_feat_rows} pixel feature rows from {feats[crop_col].nunique()} crops.")
 
     feats_attrs = dict(feats.attrs)
-    feats = feats.merge(df_ref[join_cols + ['C_ref']], on=join_cols, how='inner')
+    ref_merge_cols = join_cols + ['C_ref']
+    if 'area_ha' in df_ref.columns:
+        ref_merge_cols.append('area_ha')
+    feats = feats.merge(df_ref[ref_merge_cols], on=join_cols, how='inner')
     feats.attrs.update(feats_attrs)
     n_drop = n_feat_rows - len(feats)
     if n_drop:
@@ -287,13 +291,71 @@ def _group_mean_mae(estimator, X, y, groups) -> float:
     return mean_absolute_error(agg['y'], agg['yhat'])
 
 
-def _cv_scores(estimator, X, y, groups, cv) -> dict:
+def compute_sample_weights(feats: pd.DataFrame, join_cols: list[str],
+                           crop_col: str = 'lnf_code') -> np.ndarray:
+    """Per-pixel sample weights from stratum area (mirrors β calibration).
+
+    See ``train_cfactor_ml.compute_sample_weights`` for full docstring.
+    """
+    has_area = 'area_ha' in feats.columns and feats['area_ha'].notna().any()
+    if has_area:
+        crop_area = (feats[[crop_col, 'area_ha']]
+                     .drop_duplicates(subset=[crop_col])
+                     .set_index(crop_col)['area_ha']
+                     .fillna(0.0).clip(lower=0.0))
+        n_per_crop = feats.groupby(crop_col)[crop_col].transform('count')
+        w = feats[crop_col].map(crop_area).fillna(0.0).values / np.maximum(n_per_crop.values, 1)
+        total = w.sum()
+        w = w / total if total > 0 else np.ones(len(feats)) / len(feats)
+        print(f"[tune] Sample weights: area-weighted, "
+              f"{(w > 0).sum()}/{len(w)} pixels with non-zero weight.")
+    else:
+        group_key = feats[join_cols].astype(str).agg('|'.join, axis=1)
+        n_per_group = group_key.groupby(group_key).transform('count')
+        n_groups = group_key.nunique()
+        w = (1.0 / n_groups) / n_per_group.values
+        w = w / w.sum()
+        print(f"[tune] Sample weights: equal-group (no area_ha), {n_groups} groups.")
+    return w
+
+
+def _weighted_fit(estimator, X: np.ndarray, y: np.ndarray,
+                  sample_weights: np.ndarray | None,
+                  idx: np.ndarray | None = None,
+                  seed: int = 42) -> None:
+    """Fit any estimator with optional sample weighting.
+
+    All estimators in the tuning pipeline (WeightedMLPRegressor, Ridge,
+    DummyRegressor, HistGBR) accept ``sample_weight`` natively.
+    For Pipelines the weight is routed via ``{last_step}__sample_weight``.
+    """
+    X_fit = X[idx] if idx is not None else X
+    y_fit = y[idx] if idx is not None else y
+
+    if sample_weights is None:
+        estimator.fit(X_fit, y_fit)
+        return
+
+    w = sample_weights[idx] if idx is not None else sample_weights
+    total = w.sum()
+    if total > 0:
+        w = w / total
+
+    if isinstance(estimator, Pipeline):
+        step_name = estimator.steps[-1][0]
+        estimator.fit(X_fit, y_fit, **{f'{step_name}__sample_weight': w})
+    else:
+        estimator.fit(X_fit, y_fit, sample_weight=w)
+
+
+def _cv_scores(estimator, X, y, groups, cv,
+               sample_weights=None, seed=42) -> dict:
     """Pixel-level and group-mean MAE across folds (manual loop, so we can
     compute the group-mean metric the built-in scorers can't express)."""
     pix, grp = [], []
     for tr, te in cv.split(X, y, groups):
         est = estimator
-        est.fit(X[tr], y[tr])
+        _weighted_fit(est, X, y, sample_weights, idx=tr, seed=seed)
         pix.append(mean_absolute_error(y[te], est.predict(X[te])))
         grp.append(_group_mean_mae(est, X[te], y[te], groups[te]))
     return {
@@ -307,7 +369,7 @@ def _make_mlp(hidden, alpha, seed) -> Pipeline:
               'hidden_layer_sizes': hidden, 'alpha': alpha,
               'random_state': seed}
     return Pipeline([('scaler', StandardScaler()),
-                     ('mlp', MLPRegressor(**params))])
+                     ('mlp', WeightedMLPRegressor(**params))])
 
 
 # ---------------------------------------------------------------------------
@@ -343,8 +405,7 @@ def plot_model_comparison(baseline_df, out):
 # ---------------------------------------------------------------------------
 def run_tuning(config: dict) -> None:
     tp = {**DEFAULT_TUNE_PARAMS, **config.get('tune_params', {})}
-    results_dir = config.get('results_folder', 'calibration_analysis_{model}')
-    results_dir = results_dir.replace('{model}', 'tune')
+    results_dir = config.get('tune_results_folder', 'calibration_analysis_tune')
     plot_dir = os.path.join(results_dir, 'plots')
     os.makedirs(plot_dir, exist_ok=True)
     seed = int(tp['random_state'])
@@ -365,6 +426,15 @@ def run_tuning(config: dict) -> None:
           f"({tp['cv_group']}), {n_splits}-fold GroupKFold.")
     print(f"[tune] Effective independent labels ≈ {n_groups}; sizing against that.")
 
+    # ---- Sample weights (optional, mirrors β calibration) ----------------
+    area_weight = bool(config.get('area_weight_loss', False))
+    crop_col = config.get('crop_col', 'lnf_code')
+    if area_weight:
+        sw = compute_sample_weights(feats, join_cols, crop_col)
+    else:
+        sw = None
+        print("[tune] Sample weights: disabled (area_weight_loss=False).")
+
     # ---- Baselines -----------------------------------------------------
     rows = []
     if tp['baselines']:
@@ -376,7 +446,7 @@ def run_tuning(config: dict) -> None:
                                                         max_iter=300),
         }
         for name, est in models.items():
-            s = _cv_scores(est, X, y, groups, cv)
+            s = _cv_scores(est, X, y, groups, cv, sample_weights=sw)
             s['model'] = name
             rows.append(s)
             print(f"[tune] {name:12s} group-MAE={s['group_mae_mean']:.4f}"
@@ -389,7 +459,7 @@ def run_tuning(config: dict) -> None:
     for hidden in grid['mlp__hidden_layer_sizes']:
         for alpha in grid['mlp__alpha']:
             est = _make_mlp(hidden, alpha, seed)
-            s = _cv_scores(est, X, y, groups, cv)
+            s = _cv_scores(est, X, y, groups, cv, sample_weights=sw)
             rec = {'hidden_layer_sizes': str(hidden), 'alpha': alpha, **s}
             grid_rows.append(rec)
             key = s['group_mae_mean']
@@ -413,9 +483,10 @@ def run_tuning(config: dict) -> None:
     for alpha in tp['alpha_curve']:
         est = _make_mlp(best['hidden'], alpha, seed)
         # train MAE: fit on all, predict on all (optimistic by design)
-        est.fit(X, y)
+        _weighted_fit(est, X, y, sw, seed=seed)
         train_mae.append(mean_absolute_error(y, est.predict(X)))
-        s = _cv_scores(_make_mlp(best['hidden'], alpha, seed), X, y, groups, cv)
+        s = _cv_scores(_make_mlp(best['hidden'], alpha, seed), X, y, groups, cv,
+                        sample_weights=sw, seed=seed)
         cv_mae.append(s['pixel_mae_mean']); cv_std.append(s['pixel_mae_std'])
     plot_validation_curve(tp['alpha_curve'], train_mae, cv_mae, cv_std,
                           best['hidden'],
@@ -425,7 +496,7 @@ def run_tuning(config: dict) -> None:
     try:
         first_tr, first_te = next(cv.split(X, y, groups))
         gbr = HistGradientBoostingRegressor(random_state=seed, max_iter=300)
-        gbr.fit(X[first_tr], y[first_tr])
+        _weighted_fit(gbr, X, y, sw, idx=first_tr, seed=seed)
         pi = permutation_importance(gbr, X[first_te], y[first_te],
                                     n_repeats=10, random_state=seed)
         imp = (pd.DataFrame({'feature': feature_columns,
@@ -462,6 +533,7 @@ def run_tuning(config: dict) -> None:
     json.dump({
         'cv_group': tp['cv_group'], 'n_groups': int(n_groups),
         'n_splits': n_splits,
+        'area_weight_loss': sw is not None,
         'selected_nn_params': {k: (list(v) if isinstance(v, tuple) else v)
                                for k, v in best_params.items()},
         'selected_group_mae': best['group_mae_mean'],

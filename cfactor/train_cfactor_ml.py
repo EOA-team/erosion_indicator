@@ -62,13 +62,14 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from sklearn.neural_network import MLPRegressor
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import joblib
+
+from weighted_mlp import WeightedMLPRegressor
 
 # Reuse the calibration module's data plumbing so inputs are identical.
 from calibrate_cfactor import (
@@ -232,7 +233,10 @@ def assemble_training_table(config: dict) -> tuple[pd.DataFrame, list[str], bool
     print(f"[ml] {n_feat_rows} pixel feature rows from {feats[crop_col].nunique()} crops.")
 
     feats_attrs = dict(feats.attrs)
-    feats = feats.merge(df_ref[join_cols + ['C_ref']], on=join_cols, how='inner')
+    ref_merge_cols = join_cols + ['C_ref']
+    if 'area_ha' in df_ref.columns:
+        ref_merge_cols.append('area_ha')
+    feats = feats.merge(df_ref[ref_merge_cols], on=join_cols, how='inner')
     feats.attrs.update(feats_attrs)
     n_drop = n_feat_rows - len(feats)
     if n_drop:
@@ -248,6 +252,58 @@ def assemble_training_table(config: dict) -> tuple[pd.DataFrame, list[str], bool
         raise RuntimeError("Too few training rows — check reference matching / inputs.")
 
     return feats, join_cols, stratified
+
+
+# ---------------------------------------------------------------------------
+# Sample weights (mirrors β calibration's _compute_stratum_weights logic)
+# ---------------------------------------------------------------------------
+def compute_sample_weights(feats: pd.DataFrame, join_cols: list[str],
+                           crop_col: str = 'lnf_code') -> np.ndarray:
+    """Compute per-pixel sample weights from stratum area.
+
+    Each crop contributes proportional to its ``area_ha`` (Swiss arable area);
+    within a crop, its weight is split across populated strata in proportion
+    to their pixel counts. Every pixel in a stratum gets the same weight.
+
+    This mirrors ``_compute_stratum_weights`` in ``calibrate_cfactor.py`` so
+    the ML model optimises the same objective as the β calibration.
+
+    Falls back to inverse-group-count weighting (equal weight per group) when
+    ``area_ha`` is missing.
+    """
+    has_area = 'area_ha' in feats.columns and feats['area_ha'].notna().any()
+
+    if has_area:
+        # Crop-level area (one value per crop — strata share it)
+        crop_area = (feats[[crop_col, 'area_ha']]
+                     .drop_duplicates(subset=[crop_col])
+                     .set_index(crop_col)['area_ha']
+                     .fillna(0.0).clip(lower=0.0))
+
+        # Pixel count per stratum and per crop
+        n_per_stratum = feats.groupby(join_cols)[crop_col].transform('count')
+        n_per_crop = feats.groupby(crop_col)[crop_col].transform('count')
+
+        # Weight = crop_area × (n_pixels_in_stratum / n_pixels_in_crop) / n_pixels_in_stratum
+        #        = crop_area / n_pixels_in_crop   (each pixel in the crop gets equal share)
+        w = feats[crop_col].map(crop_area).fillna(0.0).values / np.maximum(n_per_crop.values, 1)
+        total = w.sum()
+        if total > 0:
+            w = w / total
+        else:
+            w = np.ones(len(feats)) / len(feats)
+        print(f"[ml] Sample weights: area-weighted, "
+              f"{(w > 0).sum()}/{len(w)} pixels with non-zero weight.")
+    else:
+        # Fallback: equal weight per group → inversely proportional to group pixel count
+        group_key = feats[join_cols].astype(str).agg('|'.join, axis=1)
+        n_per_group = group_key.groupby(group_key).transform('count')
+        n_groups = group_key.nunique()
+        w = (1.0 / n_groups) / n_per_group.values
+        w = w / w.sum()
+        print(f"[ml] Sample weights: equal-group (no area_ha), {n_groups} groups.")
+
+    return w
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +351,7 @@ CONFIG: dict = {
 
     # ---- Output ----
     # If the path contains '{model}', it is filled with model_kind.
-    'results_folder':        'calibration_analysis_{model}_loyo',
+    'results_folder':        'calibration_analysis_{model}',
 
     # ---- Train/test split ----
     # split_strategy:
@@ -304,7 +360,7 @@ CONFIG: dict = {
     #   'loyo'   — Leave-One-Year-Out. Loops over all years: for each, trains on
     #              the remaining years, predicts the held-out year. Reports per-year
     #              and aggregate metrics. The saved model is fitted on ALL data.
-    'split_strategy':        'loyo',
+    'split_strategy':        'parcel',
     'test_fraction':         0.3,        # only used when split_strategy='parcel'
     'random_seed':           42,
 
@@ -321,6 +377,7 @@ CONFIG: dict = {
     'crop_col':               'lnf_code',
     'exclude_calibration_lnf_codes': [601, 602],
     'area_years':             None,
+    'area_weight_loss':       True,       # weight training loss by Swiss arable area per stratum (mirrors β calibration)
 
     # Stratified-only knobs
     'nutzung_csv':            '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Core_Snapshot/Agrarbericht_2025/tbl_nutzungsdaten.csv',
@@ -375,7 +432,7 @@ def build_estimator(model_kind: str, model_params: dict, seed: int,
             params['alpha'] = alpha
         params.setdefault('random_state', seed)
         pipe = Pipeline([('scaler', StandardScaler()),
-                         ('mlp', MLPRegressor(**params))])
+                         ('mlp', WeightedMLPRegressor(**params))])
         return pipe, params, alpha_src
 
     if model_kind == 'ridge':
@@ -482,23 +539,58 @@ def run_ml_training(config: dict) -> None:
     extra = ['region', 'tillage'] if stratified else []
     ts_cols = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
 
+    # ---- Sample weights (optional, mirrors β calibration) ----------------
+    area_weight = bool(config.get('area_weight_loss', False))
+    if area_weight:
+        sample_weights = compute_sample_weights(feats, join_cols, crop_col)
+    else:
+        sample_weights = None
+        print("[ml] Sample weights: disabled (area_weight_loss=False).")
+
     # ==================================================================
     if strategy == 'loyo':
         _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                   stratified, model_kind, pipe, effective_params, alpha_src,
-                  n_steps, seed, json_path, model_params, results_dir, config)
+                  n_steps, seed, json_path, model_params, results_dir, config,
+                  sample_weights=sample_weights)
     else:
         _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                     stratified, model_kind, pipe, effective_params, alpha_src,
-                    n_steps, seed, results_dir, config)
+                    n_steps, seed, results_dir, config,
+                    sample_weights=sample_weights)
 
 
 # ---------------------------------------------------------------------------
 # Parcel-grouped holdout (original behaviour)
 # ---------------------------------------------------------------------------
+def _weighted_fit(pipe: Pipeline, X: np.ndarray, y: np.ndarray,
+                  model_kind: str, sample_weights: np.ndarray | None,
+                  idx: np.ndarray | None = None,
+                  seed: int = 42) -> None:
+    """Fit a pipeline with optional sample weighting.
+
+    Both ``WeightedMLPRegressor`` and ``Ridge`` accept ``sample_weight``
+    natively, so the weight is applied directly in the loss function —
+    no resampling required.
+    """
+    X_fit = X[idx] if idx is not None else X
+    y_fit = y[idx] if idx is not None else y
+
+    if sample_weights is None:
+        pipe.fit(X_fit, y_fit)
+        return
+
+    w = sample_weights[idx] if idx is not None else sample_weights
+    total = w.sum()
+    if total > 0:
+        w = w / total
+    pipe.fit(X_fit, y_fit, **{f'{model_kind}__sample_weight': w})
+
+
 def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                 stratified, model_kind, pipe, effective_params, alpha_src,
-                n_steps, seed, results_dir, config):
+                n_steps, seed, results_dir, config, *,
+                sample_weights=None):
     test_fraction = float(config.get('test_fraction', 0.2))
     groups = feats['poly_id'].astype(str).values if 'poly_id' in feats.columns \
         else np.arange(len(feats))
@@ -510,7 +602,7 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
     print(f"[ml] Parcel-grouped split: {len(train_idx)} train, {len(test_idx)} test")
 
     print(f"[ml] Training on {len(train_idx)} rows ...")
-    pipe.fit(X[train_idx], y[train_idx])
+    _weighted_fit(pipe, X, y, model_kind, sample_weights, train_idx, seed)
     feats['C_pred'] = pipe.predict(X)
 
     metrics = {
@@ -520,6 +612,7 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
         'effective_params': {k: (list(v) if isinstance(v, tuple) else v)
                              for k, v in effective_params.items()},
         'stratified': stratified,
+        'area_weight_loss': sample_weights is not None,
         'pixel_level': {
             'train': _metrics(y[train_idx],
                               feats.loc[feats['split'] == 'train', 'C_pred'].values),
@@ -548,7 +641,8 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
 # ---------------------------------------------------------------------------
 def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
               stratified, model_kind, pipe_template, effective_params, alpha_src,
-              n_steps, seed, json_path, model_params, results_dir, config):
+              n_steps, seed, json_path, model_params, results_dir, config, *,
+              sample_weights=None):
     years = sorted(feats['yr'].unique())
     print(f"[ml] LOYO evaluation over {len(years)} years: {years}")
 
@@ -567,7 +661,7 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
         # Fresh estimator per fold (same architecture)
         fold_pipe, _, _ = build_estimator(
             model_kind, model_params, seed, json_path)
-        fold_pipe.fit(X[train_idx], y[train_idx])
+        _weighted_fit(fold_pipe, X, y, model_kind, sample_weights, train_idx, seed)
 
         preds = fold_pipe.predict(X[test_idx])
         feats.loc[feats.index[test_idx], 'C_pred'] = preds
@@ -609,7 +703,7 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
 
     # ---- Fit final model on ALL data ----------------------------------
     print(f"[ml] Fitting final model on all {len(feats)} rows ...")
-    pipe_template.fit(X, y)
+    _weighted_fit(pipe_template, X, y, model_kind, sample_weights, seed=seed)
 
     # Final-model in-sample predictions (operational model applied to training data)
     feats['C_pred_final'] = pipe_template.predict(X)
@@ -631,6 +725,7 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
         'effective_params': {k: (list(v) if isinstance(v, tuple) else v)
                              for k, v in effective_params.items()},
         'stratified': stratified,
+        'area_weight_loss': sample_weights is not None,
         'loyo_aggregate': {
             'pixel': agg_pixel,
             'crop_level': agg_crop,
