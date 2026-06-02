@@ -1,16 +1,16 @@
-"""In-sample analysis of the ML C-factor model.
+"""Analysis of the ML C-factor model predictions.
 
 Counterpart to ``analyse_calibration_sample.py``, adapted for the outputs of
 ``train_cfactor_ml.py``. Same questions, same plots, same summary skeleton —
 but two things differ from the β-calibration case and are handled explicitly:
 
-1. **There is a held-out test set.** ``train_cfactor_ml.py`` writes a ``split``
-   column ('train'/'test') with a *grouped* split (by ``poly_id``). The β
-   calibration had no such split. So every headline metric here is reported
-   **train vs test**, and the scatter/strengths plots are drawn on the TEST
-   rows by default (override with ``cfg['analyse_split']``). Test-set
-   crop/stratum performance is the honest read on generalisation; train-set
-   numbers only tell you the model converged.
+1. **There is an evaluation split.** ``train_cfactor_ml.py`` writes a ``split``
+   column whose values depend on ``split_strategy``:
+     - *parcel*: ``'train'`` / ``'test'`` (grouped by poly_id). Plots default
+       to the TEST rows.
+     - *loyo*:   year strings (``'2019'``, ``'2020'``, …). Every row is an
+       honest out-of-fold prediction. Plots default to ALL rows (all OOF).
+   This script auto-detects the mode and adapts metrics, plots, and summary.
 
 2. **Column names.** The NN per-pixel CSV uses ``C_pred`` (not
    ``C_predicted``). It is renamed on load so all the shared plotting/metric
@@ -95,10 +95,10 @@ from analyse_calibration_sample import (
 # Config
 # ===========================================================================
 CONFIG = {
-    'results_dir':              'calibration_analysis_mlp/',
-    'per_pixel_path':           'calibration_analysis_mlp/nn_predictions_per_pixel.csv',
-    'per_crop_path':            'calibration_analysis_mlp/nn_predictions_per_crop.csv',
-    'metrics_json_path':        'calibration_analysis_mlp/nn_metrics.json',
+    'results_dir':              'calibration_analysis_mlp_loyo/',
+    'per_pixel_path':           'calibration_analysis_mlp_loyo/nn_predictions_per_pixel.csv',
+    'per_crop_path':            'calibration_analysis_mlp_loyo/nn_predictions_per_crop.csv',
+    'metrics_json_path':        'calibration_analysis_mlp_loyo/nn_metrics.json',
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/'
                                 'LNF_code_classification_20260217.xlsx',
 
@@ -115,21 +115,43 @@ CONFIG = {
 # ===========================================================================
 # Loading
 # ===========================================================================
-def load_nn_pixels(cfg: dict, stratified_override) -> tuple[pd.DataFrame, bool]:
-    """Load NN per-pixel predictions, rename C_pred→C_predicted, attach crop_de."""
+def _detect_split_mode(df: pd.DataFrame) -> str:
+    """Return 'parcel', 'loyo', or 'none' based on the split column values."""
+    if 'split' not in df.columns:
+        return 'none'
+    vals = set(df['split'].dropna().unique())
+    if vals <= {'train', 'test'}:
+        return 'parcel'
+    # Year values (int or string like '2019') → LOYO
+    if all(str(v).isdigit() and len(str(v)) == 4 for v in vals):
+        # Normalise to string so downstream groupby/filtering is consistent
+        df['split'] = df['split'].astype(str)
+        return 'loyo'
+    return 'parcel'  # fallback
+
+
+def load_nn_pixels(cfg: dict, stratified_override) -> tuple[pd.DataFrame, bool, str]:
+    """Load NN per-pixel predictions, rename C_pred→C_predicted, attach crop_de.
+
+    Returns (df, stratified, split_mode) where split_mode is 'parcel', 'loyo',
+    or 'none'.
+    """
     df = pd.read_csv(cfg['per_pixel_path'])
     if 'C_pred' in df.columns and 'C_predicted' not in df.columns:
         df = df.rename(columns={'C_pred': 'C_predicted'})
+    if 'C_pred_final' in df.columns:
+        df = df.rename(columns={'C_pred_final': 'C_predicted_final'})
     if 'split' not in df.columns:
         print("  WARNING: no 'split' column — treating all rows as a single "
-              "split. Re-run train_cfactor_nn.py to get train/test breakdown.")
+              "split. Re-run train_cfactor_ml.py to get split breakdown.")
         df['split'] = 'all'
 
-    stratified = _detect_stratified(df, stratified_override)
+    split_mode = _detect_split_mode(df)
 
+    stratified = _detect_stratified(df, stratified_override)
     bridge = load_lnf_bridge(cfg['lnf_classification_path'])
     df = df.merge(bridge[['lnf_code', 'crop_de']], on='lnf_code', how='left')
-    return df, stratified
+    return df, stratified, split_mode
 
 
 def metrics_table(per_pixel: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -150,7 +172,7 @@ def metrics_table(per_pixel: pd.DataFrame, group_cols: list[str]) -> pd.DataFram
 
 
 # ===========================================================================
-# NN-specific plot: train vs test, side by side
+# Split-aware plots
 # ===========================================================================
 def plot_train_vs_test(per_pixel: pd.DataFrame, group_cols: list[str],
                        out: str, stratified: bool) -> None:
@@ -183,9 +205,96 @@ def plot_train_vs_test(per_pixel: pd.DataFrame, group_cols: list[str],
     ax.set_xlim(0, m); ax.set_ylim(0, m)
     unit = 'stratum' if stratified else 'crop'
     ax.set_xlabel('C_ref (tabulated)')
-    ax.set_ylabel(f'C_pred (NN, {unit}-mean of pixels)')
-    ax.set_title(f'NN {unit}-mean predicted vs reference — train vs test\n'
+    ax.set_ylabel(f'C_pred ({unit}-mean of pixels)')
+    ax.set_title(f'{unit}-mean predicted vs reference — train vs test\n'
                  'test scattering off 1:1 while train hugs it = over-fit')
+    ax.legend(loc='upper left', fontsize=8)
+    plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
+    print(f"  saved {out}")
+
+
+def plot_loyo_per_year(per_pixel: pd.DataFrame, group_cols: list[str],
+                       out: str, stratified: bool) -> None:
+    """Crop/stratum-mean predicted vs reference, one colour per held-out year.
+
+    All predictions are out-of-fold; points far from 1:1 for a specific year
+    indicate that year's FC/EI distribution is poorly predicted by the
+    remaining years.
+    """
+    years = sorted(per_pixel['split'].unique())
+    if len(years) < 2:
+        return
+    fig, ax = plt.subplots(figsize=(7.5, 7.5))
+    cmap = plt.cm.tab10
+    mx = 0.0
+    for i, yr in enumerate(years):
+        t = metrics_table(per_pixel[per_pixel['split'] == yr], group_cols)
+        t = t.dropna(subset=['mean_ref', 'mean_new'])
+        if t.empty:
+            continue
+        n = t['n'].clip(lower=1).values
+        sizes = 25 + 200 * np.sqrt(n / max(n.max(), 1))
+        mae = (t['mean_new'] - t['mean_ref']).abs().mean()
+        ax.scatter(t['mean_ref'], t['mean_new'], s=sizes, alpha=0.6,
+                   c=[cmap(i % 10)], edgecolor='k', linewidth=0.3,
+                   label=f'{yr}  (MAE={mae:.4f}, n_groups={len(t)})')
+        mx = max(mx, t['mean_ref'].max(), t['mean_new'].max())
+    m = mx * 1.1 if mx > 0 else 1.0
+    ax.plot([0, m], [0, m], 'k--', lw=1, alpha=0.5, label='1:1')
+    ax.set_xlim(0, m); ax.set_ylim(0, m)
+    unit = 'stratum' if stratified else 'crop'
+    ax.set_xlabel('C_ref (tabulated)')
+    ax.set_ylabel(f'C_pred (LOYO OOF, {unit}-mean)')
+    ax.set_title(f'{unit}-mean predicted vs reference — per held-out year\n'
+                 'all predictions are out-of-fold (model never saw this year)')
+    ax.legend(loc='upper left', fontsize=7)
+    plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
+    print(f"  saved {out}")
+
+
+def plot_loyo_vs_final(per_pixel: pd.DataFrame, group_cols: list[str],
+                       out: str, stratified: bool) -> None:
+    """Compare LOYO OOF crop-means vs final-model (all-years) crop-means,
+    both plotted against C_ref on the same axes.
+
+    The gap between the two shows how much temporal leave-out penalises
+    the predictions versus the model you'd actually deploy.
+    """
+    if 'C_predicted_final' not in per_pixel.columns:
+        return
+
+    unit = 'stratum' if stratified else 'crop'
+    fig, ax = plt.subplots(figsize=(7.5, 7.5))
+    mx = 0.0
+
+    # OOF predictions (C_predicted)
+    t_oof = metrics_table(per_pixel, group_cols).dropna(subset=['mean_ref', 'mean_new'])
+    if not t_oof.empty:
+        mae_oof = (t_oof['mean_new'] - t_oof['mean_ref']).abs().mean()
+        ax.scatter(t_oof['mean_ref'], t_oof['mean_new'], alpha=0.5,
+                   c='#D7263D', edgecolor='k', linewidth=0.3, s=60,
+                   label=f'LOYO OOF  (MAE={mae_oof:.4f})')
+        mx = max(mx, t_oof['mean_ref'].max(), t_oof['mean_new'].max())
+
+    # Final model predictions — temporarily swap columns to reuse metrics_table
+    tmp = per_pixel.copy()
+    tmp['C_predicted'] = tmp['C_predicted_final']
+    t_fin = metrics_table(tmp, group_cols).dropna(subset=['mean_ref', 'mean_new'])
+    if not t_fin.empty:
+        mae_fin = (t_fin['mean_new'] - t_fin['mean_ref']).abs().mean()
+        ax.scatter(t_fin['mean_ref'], t_fin['mean_new'], alpha=0.5,
+                   c='#2E8B57', edgecolor='k', linewidth=0.3, s=60,
+                   marker='D',
+                   label=f'Final model  (MAE={mae_fin:.4f})')
+        mx = max(mx, t_fin['mean_ref'].max(), t_fin['mean_new'].max())
+
+    m = mx * 1.1 if mx > 0 else 1.0
+    ax.plot([0, m], [0, m], 'k--', lw=1, alpha=0.5, label='1:1')
+    ax.set_xlim(0, m); ax.set_ylim(0, m)
+    ax.set_xlabel('C_ref (tabulated)')
+    ax.set_ylabel(f'C_pred ({unit}-mean)')
+    ax.set_title(f'LOYO OOF vs final model (all years) — {unit}-level\n'
+                 'gap = temporal leave-out penalty')
     ax.legend(loc='upper left', fontsize=8)
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
@@ -198,12 +307,12 @@ def run(cfg: dict) -> None:
     out_dir = Path(cfg['results_dir']); out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir = out_dir / 'plots'; plot_dir.mkdir(exist_ok=True)
 
-    per_pixel, stratified = load_nn_pixels(cfg, cfg.get('stratified_mode'))
+    per_pixel, stratified, split_mode = load_nn_pixels(cfg, cfg.get('stratified_mode'))
     mode_label = 'STRATIFIED' if stratified else 'unstratified'
     group_cols = (['lnf_code', 'region', 'tillage'] if stratified
                   else ['lnf_code'])
     unit = 'stratum' if stratified else 'crop'
-    print(f"NN analysis — {mode_label} mode, "
+    print(f"ML analysis — {mode_label} mode, split_mode={split_mode}, "
           f"{len(per_pixel):,} pixel rows, splits="
           f"{sorted(per_pixel['split'].unique())}")
 
@@ -227,8 +336,15 @@ def run(cfg: dict) -> None:
     per_unit.to_csv(out_dir / fname, index=False)
     print(f"  wrote {fname}")
 
-    # Reference-C magnitude classes (computed on the analysed split only)
-    asplit = cfg.get('analyse_split', 'test')
+    # -------------------------------------------------------------------
+    # Select rows for plots
+    # -------------------------------------------------------------------
+    # Default analyse_split: 'test' for parcel (honest OOS), 'all' for LOYO
+    # (every row is OOF).
+    asplit = cfg.get('analyse_split')
+    if asplit is None:
+        asplit = 'test' if split_mode == 'parcel' else 'all'
+
     if asplit == 'all':
         plot_pixels = per_pixel.copy()
     else:
@@ -236,8 +352,10 @@ def run(cfg: dict) -> None:
         if plot_pixels.empty:
             print(f"  WARNING: split '{asplit}' empty; falling back to all rows.")
             plot_pixels = per_pixel.copy()
+            asplit = 'all'
     print(f"  plots drawn on split='{asplit}' ({len(plot_pixels):,} rows)")
 
+    # Reference-C magnitude classes
     by_mag = None
     if plot_pixels['C_ref'].notna().any():
         pp = plot_pixels.dropna(subset=['C_ref']).copy()
@@ -264,12 +382,9 @@ def run(cfg: dict) -> None:
 
     # -------------------------------------------------------------------
     # Plots — reuse the calibration plotters on the analysed split.
-    # The shared plotters expect a `per_crop`/`per_stratum` table with
-    # mean_ref/mean_new/bias/spread/n + crop_de [+region/tillage].
     # -------------------------------------------------------------------
     print("\nPlots...")
     plot_unit = metrics_table(plot_pixels, group_cols)
-    # shared plotters key boxplots/interannual on crop_de; ensure present
     if 'crop_de' not in plot_pixels.columns:
         plot_pixels['crop_de'] = plot_pixels['lnf_code'].astype(str)
 
@@ -285,10 +400,6 @@ def run(cfg: dict) -> None:
         plot_residual_vs_n_stratum(
             plot_unit, plot_dir / 'nn_residual_vs_n_per_stratum.png')
 
-        # Crop-level rollup: collapse each crop's strata back to one row and
-        # reuse the per-crop scatter, so it sits side-by-side with the
-        # per-stratum view (mirrors cal_scatter_per_crop_rollup in the
-        # calibration analyser).
         rollup = (plot_unit.dropna(subset=['mean_ref', 'mean_new'])
                            .groupby(['crop_de', 'lnf_code'], as_index=False)
                            .agg(n=('n', 'sum'),
@@ -314,27 +425,58 @@ def run(cfg: dict) -> None:
         plot_interannual(plot_pixels, plot_dir / 'nn_interannual.png')
         plot_residual_vs_n(plot_unit, plot_dir / 'nn_residual_vs_n.png')
 
-    # NN-specific: over-fit check
-    plot_train_vs_test(per_pixel, group_cols,
-                       plot_dir / 'nn_train_vs_test_scatter.png', stratified)
+    # Mode-specific diagnostic plot
+    if split_mode == 'loyo':
+        plot_loyo_per_year(per_pixel, group_cols,
+                           plot_dir / 'nn_loyo_per_year_scatter.png', stratified)
+        plot_loyo_vs_final(per_pixel, group_cols,
+                           plot_dir / 'nn_loyo_vs_final_scatter.png', stratified)
+
+        # Final model plots — same plotters, using C_predicted_final
+        if 'C_predicted_final' in plot_pixels.columns:
+            print("\n  Final model (all years) plots...")
+            pp_final = plot_pixels.copy()
+            pp_final['C_predicted'] = pp_final['C_predicted_final']
+            pu_final = metrics_table(pp_final, group_cols)
+
+            if stratified:
+                plot_scatter_per_stratum(pu_final,
+                    plot_dir / 'nn_scatter_per_stratum_final.png')
+                plot_box_per_stratum(pp_final,
+                    plot_dir / 'nn_box_per_stratum_final.png',
+                    min_n=cfg['min_n_per_crop'])
+            else:
+                plot_scatter_per_crop(pu_final,
+                    plot_dir / 'nn_scatter_per_crop_final.png')
+                plot_box_per_crop(pp_final,
+                    plot_dir / 'nn_box_per_crop_final.png',
+                    min_n=cfg['min_n_per_crop'])
+    else:
+        plot_train_vs_test(per_pixel, group_cols,
+                           plot_dir / 'nn_train_vs_test_scatter.png', stratified)
 
     # -------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------
-    def _split_headline(sp: str) -> tuple[float, float, float, float]:
-        g = per_pixel[per_pixel['split'] == sp].dropna(
-            subset=['C_ref', 'C_predicted'])
+    def _split_headline(sp_df: pd.DataFrame, label: str) -> list[str]:
+        g = sp_df.dropna(subset=['C_ref', 'C_predicted'])
         if g.empty:
-            return (np.nan,) * 4
+            return [f'--- {label} ---', '  (no data)']
         d = g['C_predicted'] - g['C_ref']
         t = metrics_table(g, group_cols).dropna(subset=['mean_ref', 'mean_new'])
         td = t['mean_new'] - t['mean_ref']
-        return (float(d.mean()), float(d.abs().mean()),
-                float(td.mean()), float(td.abs().mean()))
+        return [
+            '',
+            f'--- {label} ({len(g):,} pixels, {len(t)} {unit}s) ---',
+            f'  pixel-level bias            : {float(d.mean()):+.4f}',
+            f'  pixel-level MAE             : {float(d.abs().mean()):.4f}',
+            f'  {unit}-level bias'.ljust(31) + f': {float(td.mean()):+.4f}',
+            f'  {unit}-level MAE'.ljust(31) + f': {float(td.abs().mean()):.4f}',
+        ]
 
     lines = [
         '=' * 70,
-        f'NN in-sample analysis  ({mode_label})',
+        f'ML analysis  ({mode_label}, split_mode={split_mode})',
         '=' * 70,
         f'Per-pixel rows                : {len(per_pixel):>10,}',
         f'Crops covered                 : {per_pixel["lnf_code"].nunique():>10}',
@@ -346,26 +488,48 @@ def run(cfg: dict) -> None:
                  f'{sorted(per_pixel["yr"].dropna().unique().tolist())}'
                  if 'yr' in per_pixel.columns else '')
 
-    for sp in ('train', 'test', 'all'):
-        if sp not in per_pixel['split'].unique():
-            continue
-        pb, pm, tb, tm = _split_headline(sp)
-        lines += [
-            '',
-            f'--- {sp.upper()} split ---',
-            f'  pixel-level bias            : {pb:+.4f}',
-            f'  pixel-level MAE             : {pm:.4f}',
-            f'  {unit}-level bias'.ljust(31) + f': {tb:+.4f}',
-            f'  {unit}-level MAE'.ljust(31) + f': {tm:.4f}',
-        ]
+    if split_mode == 'loyo':
+        # Aggregate LOYO (all rows are OOF)
+        lines += _split_headline(per_pixel, 'LOYO aggregate (all rows are OOF)')
+        # Per-year breakdown
+        for yr in sorted(per_pixel['split'].unique()):
+            yr_df = per_pixel[per_pixel['split'] == yr]
+            lines += _split_headline(yr_df, f'Year {yr} (OOF)')
+        # Final model (trained on all years, in-sample)
+        if 'C_predicted_final' in per_pixel.columns:
+            tmp = per_pixel.copy()
+            tmp['C_predicted'] = tmp['C_predicted_final']
+            lines += _split_headline(tmp, 'Final model (all years, in-sample)')
+    else:
+        for sp in ('train', 'test', 'all'):
+            if sp not in per_pixel['split'].unique():
+                continue
+            sp_df = per_pixel[per_pixel['split'] == sp]
+            lines += _split_headline(sp_df, sp.upper())
 
+    # Model-reported metrics from JSON
     if model_metrics is not None:
-        cl = model_metrics.get('crop_level', {})
-        lines += ['',
-                  '--- model-reported crop-level (nn_metrics.json) ---',
-                  f"  R²  : {cl.get('r2', float('nan')):.4f}",
-                  f"  MAE : {cl.get('mae', float('nan')):.4f}",
-                  f"  RMSE: {cl.get('rmse', float('nan')):.4f}"]
+        if 'loyo_aggregate' in model_metrics:
+            cl = model_metrics['loyo_aggregate'].get('crop_level', {})
+            lines += ['',
+                      '--- model-reported LOYO aggregate crop-level (nn_metrics.json) ---',
+                      f"  R²  : {cl.get('r2', float('nan')):.4f}",
+                      f"  MAE : {cl.get('mae', float('nan')):.4f}",
+                      f"  RMSE: {cl.get('rmse', float('nan')):.4f}"]
+        if 'final_model_insample' in model_metrics:
+            fl = model_metrics['final_model_insample'].get('crop_level', {})
+            lines += ['',
+                      '--- model-reported FINAL MODEL crop-level (nn_metrics.json) ---',
+                      f"  R²  : {fl.get('r2', float('nan')):.4f}",
+                      f"  MAE : {fl.get('mae', float('nan')):.4f}",
+                      f"  RMSE: {fl.get('rmse', float('nan')):.4f}"]
+        if 'crop_level' in model_metrics and 'loyo_aggregate' not in model_metrics:
+            cl = model_metrics['crop_level']
+            lines += ['',
+                      '--- model-reported crop-level (nn_metrics.json) ---',
+                      f"  R²  : {cl.get('r2', float('nan')):.4f}",
+                      f"  MAE : {cl.get('mae', float('nan')):.4f}",
+                      f"  RMSE: {cl.get('rmse', float('nan')):.4f}"]
 
     # worst/best on the analysed split
     cols = (['crop_de', 'region', 'tillage', 'n', 'C_ref',
@@ -390,31 +554,50 @@ def run(cfg: dict) -> None:
                   by_mag[['C_ref_class', 'n', 'mean_ref', 'mean_new', 'bias', 'MAE']]
                     .to_string(index=False, float_format='%.4f')]
 
-    lines += ['', '=' * 70, 'How to read this', '=' * 70, """
+    lines += ['', '=' * 70, 'How to read this', '=' * 70]
+    if split_mode == 'loyo':
+        lines.append(f"""
+- All OOF predictions are OUT-OF-FOLD: each row was predicted by a model that
+  never saw its year. The aggregate metrics are the honest estimate of
+  operational performance on a new year.
+
+- The FINAL MODEL (all years) predictions are in-sample. They show what the
+  deployed model produces but are NOT an honest evaluation — use them to
+  inspect model behaviour, not to claim performance. The nn_loyo_vs_final
+  scatter shows both side by side: the gap is the temporal leave-out penalty.
+
+- Per-year breakdown shows which years are hardest. A year with high MAE
+  likely had unusual weather (drought, wet year) whose FC/EI distribution
+  differs from the training years. Check whether specific crops drive
+  the error (nn_per_{unit}.csv filtered by split=year).
+
+- The saved model (nn_model.joblib) IS the final all-years model. Expect
+  its true performance on a genuinely new year to lie between the LOYO
+  aggregate (pessimistic — each fold had less data) and the final model
+  in-sample (optimistic — the model saw everything).
+
+- Because every pixel of a crop was given that crop's C_ref as its label,
+  the meaningful metric is {unit}-level MAE; pixel-level MAE is inflated
+  by the broadcast labels.
+""")
+    else:
+        lines.append(f"""
 - TRAIN vs TEST is the headline for a learned model. If train MAE is much
   lower than test MAE, the model memorised the training pixels — tighten
   regularisation (config['model_params']['alpha']), shrink hidden layers
   (MLP), or get more crops. With β there was no such gap to worry about.
 
 - Because every pixel of a crop was given that crop's C_ref as its label,
-  the NN can at best recover the crop/stratum MEAN. So the meaningful
-  metric is {unit}-level MAE on the TEST split; pixel-level MAE is inflated
-  by the broadcast labels and is not a fault of the model.
+  the meaningful metric is {unit}-level MAE on the TEST split; pixel-level
+  MAE is inflated by the broadcast labels.
 
-- Within-{unit} spread of C_pred shows whether the NN learned to move
+- Within-{unit} spread of C_pred shows whether the model learned to move
   pixels around within a crop from their FC/EI features, or just predicts
-  one value per crop. Large spread + small {unit} bias = it is using the
-  satellite signal; near-zero spread = it collapsed to the crop mean
-  (which is all the labels actually told it to do).
+  one value per crop.
 
 - A test {unit} far off the 1:1 line in the train-vs-test scatter, with
-  large n, is a genuine generalisation failure for that crop/stratum —
-  check its feature distribution against neighbours.
-
-- In stratified mode, a region or tillage class with large bias AND few
-  pixels (low n in nn_by_region/tillage) is a coverage problem, not a
-  model problem: the NN never saw enough of that cell.
-""".replace('{unit}', unit)]
+  large n, is a genuine generalisation failure for that crop/stratum.
+""")
 
     (out_dir / 'nn_summary.txt').write_text('\n'.join(lines), encoding='utf-8')
     print(f"  wrote {out_dir / 'nn_summary.txt'}")

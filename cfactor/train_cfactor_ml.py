@@ -295,10 +295,17 @@ CONFIG: dict = {
 
     # ---- Output ----
     # If the path contains '{model}', it is filled with model_kind.
-    'results_folder':        'calibration_analysis_{model}',
+    'results_folder':        'calibration_analysis_{model}_loyo',
 
     # ---- Train/test split ----
-    'test_fraction':         0.2,
+    # split_strategy:
+    #   'parcel' — GroupShuffleSplit grouped by poly_id (default, original behaviour).
+    #              Fits one model, evaluates on the held-out parcels.
+    #   'loyo'   — Leave-One-Year-Out. Loops over all years: for each, trains on
+    #              the remaining years, predicts the held-out year. Reports per-year
+    #              and aggregate metrics. The saved model is fitted on ALL data.
+    'split_strategy':        'loyo',
+    'test_fraction':         0.3,        # only used when split_strategy='parcel'
     'random_seed':           42,
 
     # ====================================================================
@@ -424,6 +431,18 @@ def plot_ridge_coefficients(pipe: Pipeline, feature_columns: list[str],
 
 
 # ===========================================================================
+# Helpers
+# ===========================================================================
+def _metrics(y_true, y_hat):
+    return {
+        'r2':   float(r2_score(y_true, y_hat)) if len(y_true) > 1 else float('nan'),
+        'mae':  float(mean_absolute_error(y_true, y_hat)),
+        'rmse': float(np.sqrt(mean_squared_error(y_true, y_hat))),
+        'n':    int(len(y_true)),
+    }
+
+
+# ===========================================================================
 # Runner
 # ===========================================================================
 def run_ml_training(config: dict) -> None:
@@ -431,15 +450,19 @@ def run_ml_training(config: dict) -> None:
     if model_kind not in ('mlp', 'ridge'):
         raise ValueError(f"model_kind must be 'mlp' or 'ridge', got {model_kind!r}.")
 
+    strategy = config.get('split_strategy', 'parcel')
+    if strategy not in ('parcel', 'loyo'):
+        raise ValueError(f"Unknown split_strategy={strategy!r}; expected 'parcel' or 'loyo'.")
+
     results_dir = config.get('results_folder', 'calibration_analysis_{model}')
     results_dir = results_dir.replace('{model}', model_kind)
     os.makedirs(results_dir, exist_ok=True)
 
-    test_fraction = float(config.get('test_fraction', 0.2))
     seed          = int(config.get('random_seed', 42))
     json_path     = config.get('tune_best_config_path',
                                'calibration_analysis_nn/tune_best_config.json')
     model_params  = config.get('model_params', {})
+    crop_col      = config.get('crop_col', 'lnf_code')
 
     # ---- Data ---------------------------------------------------------
     feats, join_cols, stratified = assemble_training_table(config)
@@ -448,53 +471,63 @@ def run_ml_training(config: dict) -> None:
     print(f"[ml] model_kind={model_kind}  using {len(feature_columns)} features "
           f"({n_steps} timesteps × channels).")
 
-    # ---- Train/test split, grouped by poly_id -------------------------
-    groups = feats['poly_id'].astype(str).values if 'poly_id' in feats.columns \
-        else np.arange(len(feats))
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=seed)
-    train_idx, test_idx = next(gss.split(feats, groups=groups))
-    feats['split'] = 'train'
-    feats.loc[feats.index[test_idx], 'split'] = 'test'
-
-    X = feats[feature_columns].values
-    y = feats['C_ref'].values
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test,  y_test  = X[test_idx],  y[test_idx]
-
-    # ---- Build + fit --------------------------------------------------
+    # ---- Build estimator (shared) ------------------------------------
     pipe, effective_params, alpha_src = build_estimator(
         model_kind, model_params, seed, json_path)
     print(f"[ml] alpha={effective_params.get('alpha', 'n/a')}  "
           f"(source: {alpha_src})")
+
+    X = feats[feature_columns].values
+    y = feats['C_ref'].values
+    extra = ['region', 'tillage'] if stratified else []
+    ts_cols = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
+
+    # ==================================================================
+    if strategy == 'loyo':
+        _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
+                  stratified, model_kind, pipe, effective_params, alpha_src,
+                  n_steps, seed, json_path, model_params, results_dir, config)
+    else:
+        _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
+                    stratified, model_kind, pipe, effective_params, alpha_src,
+                    n_steps, seed, results_dir, config)
+
+
+# ---------------------------------------------------------------------------
+# Parcel-grouped holdout (original behaviour)
+# ---------------------------------------------------------------------------
+def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
+                stratified, model_kind, pipe, effective_params, alpha_src,
+                n_steps, seed, results_dir, config):
+    test_fraction = float(config.get('test_fraction', 0.2))
+    groups = feats['poly_id'].astype(str).values if 'poly_id' in feats.columns \
+        else np.arange(len(feats))
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=seed)
+    train_idx, test_idx = next(gss.split(feats, groups=groups))
+
+    feats['split'] = 'train'
+    feats.loc[feats.index[test_idx], 'split'] = 'test'
+    print(f"[ml] Parcel-grouped split: {len(train_idx)} train, {len(test_idx)} test")
+
     print(f"[ml] Training on {len(train_idx)} rows ...")
-    pipe.fit(X_train, y_train)
-
-    # ---- Predictions + metrics ----------------------------------------
+    pipe.fit(X[train_idx], y[train_idx])
     feats['C_pred'] = pipe.predict(X)
-    pred_train = feats.loc[feats['split'] == 'train', 'C_pred'].values
-    pred_test  = feats.loc[feats['split'] == 'test',  'C_pred'].values
-
-    def _metrics(y_true, y_hat):
-        return {
-            'r2':   float(r2_score(y_true, y_hat)) if len(y_true) > 1 else float('nan'),
-            'mae':  float(mean_absolute_error(y_true, y_hat)),
-            'rmse': float(np.sqrt(mean_squared_error(y_true, y_hat))),
-            'n':    int(len(y_true)),
-        }
 
     metrics = {
         'model_kind': model_kind,
+        'split_strategy': f"parcel-grouped ({1 - test_fraction:.0%}/{test_fraction:.0%})",
         'alpha_source': alpha_src,
         'effective_params': {k: (list(v) if isinstance(v, tuple) else v)
                              for k, v in effective_params.items()},
         'stratified': stratified,
         'pixel_level': {
-            'train': _metrics(y_train, pred_train),
-            'test':  _metrics(y_test,  pred_test),
+            'train': _metrics(y[train_idx],
+                              feats.loc[feats['split'] == 'train', 'C_pred'].values),
+            'test':  _metrics(y[test_idx],
+                              feats.loc[feats['split'] == 'test',  'C_pred'].values),
         },
     }
 
-    # ---- Aggregate pixel predictions to group --------------------------
     agg = (feats.groupby(join_cols, as_index=False)
                 .agg(C_pred_crop=('C_pred', 'mean'),
                      n_pixels=('C_pred', 'size'),
@@ -505,10 +538,125 @@ def run_ml_training(config: dict) -> None:
     print(f"[ml] Group level R²={metrics['crop_level']['r2']:.3f} "
           f"MAE={metrics['crop_level']['mae']:.4f}")
 
-    # ---- Save artefacts -----------------------------------------------
+    _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
+                  alpha_src, feature_columns, join_cols, ts_cols, extra,
+                  stratified, n_steps, results_dir, 'parcel')
+
+
+# ---------------------------------------------------------------------------
+# Leave-One-Year-Out evaluation + final model on all data
+# ---------------------------------------------------------------------------
+def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
+              stratified, model_kind, pipe_template, effective_params, alpha_src,
+              n_steps, seed, json_path, model_params, results_dir, config):
+    years = sorted(feats['yr'].unique())
+    print(f"[ml] LOYO evaluation over {len(years)} years: {years}")
+
+    # Out-of-fold predictions — each row gets exactly one C_pred from a model
+    # that never saw its year.
+    feats['C_pred'] = np.nan
+    feats['split'] = ''       # will hold the held-out year label
+    per_year_metrics = {}
+
+    for yr in years:
+        test_mask = feats['yr'] == yr
+        train_mask = ~test_mask
+        train_idx = np.where(train_mask)[0]
+        test_idx  = np.where(test_mask)[0]
+
+        # Fresh estimator per fold (same architecture)
+        fold_pipe, _, _ = build_estimator(
+            model_kind, model_params, seed, json_path)
+        fold_pipe.fit(X[train_idx], y[train_idx])
+
+        preds = fold_pipe.predict(X[test_idx])
+        feats.loc[feats.index[test_idx], 'C_pred'] = preds
+        feats.loc[feats.index[test_idx], 'split'] = str(yr)
+
+        # Per-year pixel metrics
+        yr_pix = _metrics(y[test_idx], preds)
+
+        # Per-year crop/stratum metrics — only for groups present in this year
+        yr_feats = feats.loc[test_mask].copy()
+        yr_agg = (yr_feats.groupby(join_cols, as_index=False)
+                          .agg(C_pred_crop=('C_pred', 'mean'),
+                               n_pixels=('C_pred', 'size'),
+                               C_ref=('C_ref', 'first')))
+        yr_crop = _metrics(yr_agg['C_ref'].values, yr_agg['C_pred_crop'].values)
+
+        per_year_metrics[int(yr)] = {
+            'n_rows': int(test_mask.sum()),
+            'n_groups': int(yr_agg.shape[0]),
+            'pixel': yr_pix,
+            'crop_level': yr_crop,
+        }
+        print(f"[ml]   {yr}: {yr_pix['n']} rows, {yr_agg.shape[0]} groups  "
+              f"pixel MAE={yr_pix['mae']:.4f}  group MAE={yr_crop['mae']:.4f}")
+
+    # ---- Aggregate LOYO metrics (all OOF predictions pooled) -----------
+    all_pred = feats['C_pred'].values
+    agg_pixel = _metrics(y, all_pred)
+
+    agg = (feats.groupby(join_cols, as_index=False)
+                .agg(C_pred_crop=('C_pred', 'mean'),
+                     n_pixels=('C_pred', 'size'),
+                     C_ref=('C_ref', 'first')))
+    agg_crop = _metrics(agg['C_ref'].values, agg['C_pred_crop'].values)
+
+    print(f"[ml] LOYO aggregate — pixel R²={agg_pixel['r2']:.3f} "
+          f"MAE={agg_pixel['mae']:.4f}  "
+          f"group R²={agg_crop['r2']:.3f} MAE={agg_crop['mae']:.4f}")
+
+    # ---- Fit final model on ALL data ----------------------------------
+    print(f"[ml] Fitting final model on all {len(feats)} rows ...")
+    pipe_template.fit(X, y)
+
+    # Final-model in-sample predictions (operational model applied to training data)
+    feats['C_pred_final'] = pipe_template.predict(X)
+    agg_final = (feats.groupby(join_cols, as_index=False)
+                      .agg(C_pred_final_crop=('C_pred_final', 'mean'),
+                           n_pixels=('C_pred_final', 'size'),
+                           C_ref=('C_ref', 'first')))
+    final_pixel = _metrics(y, feats['C_pred_final'].values)
+    final_crop  = _metrics(agg_final['C_ref'].values,
+                           agg_final['C_pred_final_crop'].values)
+    print(f"[ml] Final model (all years, in-sample) — "
+          f"pixel R²={final_pixel['r2']:.3f} MAE={final_pixel['mae']:.4f}  "
+          f"group R²={final_crop['r2']:.3f} MAE={final_crop['mae']:.4f}")
+
+    metrics = {
+        'model_kind': model_kind,
+        'split_strategy': f'loyo ({len(years)} years)',
+        'alpha_source': alpha_src,
+        'effective_params': {k: (list(v) if isinstance(v, tuple) else v)
+                             for k, v in effective_params.items()},
+        'stratified': stratified,
+        'loyo_aggregate': {
+            'pixel': agg_pixel,
+            'crop_level': agg_crop,
+        },
+        'loyo_per_year': per_year_metrics,
+        'final_model_insample': {
+            'pixel': final_pixel,
+            'crop_level': final_crop,
+        },
+    }
+
+    _save_outputs(feats, agg, metrics, pipe_template, model_kind,
+                  effective_params, alpha_src, feature_columns, join_cols,
+                  ts_cols, extra, stratified, n_steps, results_dir, 'loyo')
+
+
+# ---------------------------------------------------------------------------
+# Shared save/plot logic
+# ---------------------------------------------------------------------------
+def _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
+                  alpha_src, feature_columns, join_cols, ts_cols, extra,
+                  stratified, n_steps, results_dir, strategy):
     model_path = os.path.join(results_dir, 'nn_model.joblib')
     joblib.dump({'pipeline': pipe,
                  'model_kind': model_kind,
+                 'split_strategy': strategy,
                  'feature_columns': feature_columns,
                  'join_cols': join_cols,
                  'stratified': stratified,
@@ -518,9 +666,10 @@ def run_ml_training(config: dict) -> None:
     print(f"[ml] Model → {model_path}")
 
     feats.to_csv(os.path.join(results_dir, 'nn_training_features.csv'), index=False)
-    extra = ['region', 'tillage'] if stratified else []
-    ts_cols = config.get('ts_cols', ['lnf_code', 'yr', 'poly_id'])
-    feats[ts_cols + extra + ['C_ref', 'C_pred', 'split']].to_csv(
+    pixel_cols = ts_cols + extra + ['C_ref', 'C_pred', 'split']
+    if 'C_pred_final' in feats.columns:
+        pixel_cols.append('C_pred_final')
+    feats[pixel_cols].to_csv(
         os.path.join(results_dir, 'nn_predictions_per_pixel.csv'), index=False)
     agg.to_csv(os.path.join(results_dir, 'nn_predictions_per_crop.csv'), index=False)
 
@@ -530,7 +679,6 @@ def run_ml_training(config: dict) -> None:
     plot_crop_scatter(agg.dropna(subset=['C_ref', 'C_pred_crop']),
                       os.path.join(results_dir, 'nn_scatter.png'), stratified)
 
-    # Model-specific diagnostic
     if model_kind == 'mlp':
         plot_loss_curve(pipe.named_steps['mlp'],
                         os.path.join(results_dir, 'nn_loss_curve.png'))
