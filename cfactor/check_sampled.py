@@ -57,8 +57,8 @@ DROP_FRACTION_THRESHOLD = 0.7
 MAX_GAP_DAYS = 15
 
 # Input files
-SAMPLES_PATH = 'samples_grouped.pkl'
-FC_RAW_PATH = 'samples_data_pred_grouped.pkl'
+SAMPLES_PATH = 'samples.pkl'
+FC_RAW_PATH = 'samples_data_pred.pkl'
 GAPFILLED_PATH = 'samples_data_gpr.parquet'
 LNF_LABELS_PATH = os.path.expanduser(
     '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx'
@@ -724,7 +724,7 @@ else:
 # =============================================================================
 # PART C — Gapfilling diagnostics (optional, runs if parquet is present)
 # =============================================================================
-"""
+
 if not os.path.exists(GAPFILLED_PATH):
     print(f'\n(Skipping gapfilling diagnostics: {GAPFILLED_PATH} not found)')
     print('\nDone.')
@@ -985,4 +985,3 @@ if _gapfill_one_field_alr is not None:
         print(f'Saved: {OUT_DIR}/gpr_cv_records.csv')
 
 print('\nDone.')
-"""
