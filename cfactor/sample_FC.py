@@ -2348,6 +2348,7 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # =====================================
     # Diagnostic plot: sample of gapfilled timeseries
+    """
     df_gpr = pd.read_parquet(gapfilled_path)
     plot_cols = ['lnf_code', 'yr', 'poly_id', 'x', 'y']
 
@@ -2390,3 +2391,4 @@ def run_sampling_pipeline(config: dict) -> None:
     plt.tight_layout()
     plt.savefig("plots/gpr_all_timeseries_subplots_regular.png")
     plt.close()
+    """

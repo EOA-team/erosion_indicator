@@ -20,18 +20,18 @@ CONFIG = {
     'lnf_ignore_codes':    [553, 554, 555, 556, 559, 572, 594, 595, 598, 618, 625], # arable or grassland classes to ignore
     'grassland_codes':     [601],  # LNF codes for grassland to include in sampling (e.g. [601, 611]) -> 601 is actually labeled as arable
     'tot_samples':         10000,
-    'samples_path':        'samples_strat.pkl',
-    'samples_s2_path':     'samples_data_strat.pkl', # not generated if FC precomputed
+    'samples_path':        'samples.pkl',
+    'samples_s2_path':     'samples_data.pkl', # not generated if FC precomputed
     'fc_precompute':        False,  # whether to use precomputed FC. PROBLEM: need to attach cloud cleaning bands from S2 data
     'fc_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/FC',
     's2_grid_path':        '~/mnt/eo-nas1/eoa-share/projects/012_EO_dataInfrastructure/Project layers/gridface_s2tiles_CH.shp',
     's2_dir':              '~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH',
     'soil_dir':            '~/mnt/eo-nas1/data/satellite/sentinel2/DLR_soilsuite_preds/',
-    'fc_preds_path':       'samples_data_pred_strat.pkl',
+    'fc_preds_path':       'samples_data_pred.pkl',
     'cirrus_thresh':        500,  # Max value of blue band when SCL=10 (cirrus cloud masking)
     'max_missing_frac':     0.05,  # Max amount of missing data per date in a field timeseries
     'drop_fraction_threshold': 0.7,  # drop fields where >drop_fraction_threshold [0-1] of observations are masked
-    'gapfilled_fc_path':    'samples_data_gpr_regular_strat.parquet',
+    'gapfilled_fc_path':    'samples_data_gpr.parquet',
     'max_gap_days':         15,
     # Gapfilling method:
     #   'irregular' -> keep cleaned obs, GP-fill only gaps > max_gap_days
@@ -39,7 +39,7 @@ CONFIG = {
     #                  cadence anchored at July 1 of yr-1 (agricultural year)
     'gapfill_method':      'regular',
     'grid_step_days':      10,
-    'n_jobs':              1,
+    'n_jobs':              2,
     'years': [2019, 2020, 2021, 2022, 2023, 2024], # LNF years to use for sampling AGIS fields
     # Years used to pick the "top arable crops by area" from the LNF spreadsheet.
     # The spreadsheet's per-year area columns are only well-defined for 2021+
@@ -83,7 +83,7 @@ CONFIG = {
     'c_factor_table_path':      '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Erosionsrisiko/C_Faktoren.csv',
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
     'manual_overrides_path':    None, # only need it if any of sampled crops fail to auto-match LNF codes
-    'results_folder':           'calibration_analysis_regular2',
+    'results_folder':           'calibration_analysis_noley',
     'calibration_results_path': 'calibration_results.csv',
     'ts_cols':                  ['lnf_code', 'yr', 'poly_id'],
     'crop_col':                 'lnf_code',
@@ -97,14 +97,13 @@ CONFIG = {
     #               comparable to the single-β value (two_beta reduces to
     #               single when β_pv == β_npv). 2-D L-BFGS-B fit. β_opt is a
     #               (β_pv, β_npv) tuple; beta.json records both.
-    'calibration_mode':         'two_beta',
+    'calibration_mode':         'single',
     # Optional per-component bounds for 'two_beta' (each falls back to
     # `beta_bounds` if None). Set explicit tuples to constrain PV/NPV separately.
     'beta_bounds_pv':           None,
     'beta_bounds_npv':          None,
-    'exclude_calibration_lnf_codes': [], #[601, 611, 545, 546],  # Kunstwiesen, Extensiv genutzte Wiesen
-    # FC is on a 0–100 scale here (PV+NPV scaled by 100). Matthews et al. (2023)
-    # found β ≈ 0.04 with FC on 0–1, so the equivalent here is ≈ 0.0004
+    'exclude_calibration_lnf_codes': [601, 602], #[601, 611, 545, 546],  # Kunstwiesen, Extensiv genutzte Wiesen
+    # FC is on a 0–100 scale here (PV+NPV scaled by 100). Matthews et al. (2023) found β ≈ 0.04 with FC on 0–100
     'area_weight_loss':         True, # If True, weight the loss by Swiss arable area per crop (areas from the LNF spreadsheet)
     # Years to average for the area weights — should match (or be a subset of)
     # the years used in the FC sampling step so weights describe the same
