@@ -97,9 +97,9 @@ import matplotlib.pyplot as plt
 # Default config — edit paths to your environment.
 # ===========================================================================
 CONFIG = {
-    'results_dir':              'calibration_analysis_default',
-    'per_pixel_path':           'calibration_results_per_pixel.csv',
-    'per_crop_path':            'calibration_results.csv',
+    'results_dir':              'calibration_analysis_single_noley',
+    'per_pixel_path':           'calibration_results_stratified_per_pixel.csv',
+    'per_crop_path':            'calibration_results_stratified.csv',
     'c_factor_table_path':      'C_Faktoren.csv',
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/'
                                 'LNF_code_classification_20260217.xlsx',
@@ -199,6 +199,29 @@ def _detect_stratified(per_pixel: pd.DataFrame, override: bool | None) -> bool:
     return ('region' in per_pixel.columns) and ('tillage' in per_pixel.columns)
 
 
+def _group_excluded(g: pd.DataFrame) -> bool:
+    """True if the group was excluded from the β fit.
+
+    Reads the per-pixel ``excluded_from_fit`` flag (constant within a crop).
+    Returns False when the column is absent (old per-pixel files).
+    """
+    if 'excluded_from_fit' not in g.columns:
+        return False
+    s = g['excluded_from_fit']
+    return bool(s.any()) if len(s) else False
+
+
+# Styling for groups excluded from the β fit. The look is unified across all
+# plots so the reader can spot excluded crops/strata at a glance.
+EXCLUDED_STYLE = dict(
+    edge='#555555',     # grey edge for boxes / scatter points
+    face_alpha=0.25,    # for filled markers
+    line_alpha=0.55,    # for line plots
+    hatch='////',       # for boxplots
+    linestyle='--',     # for line plots
+)
+
+
 def _stratum_label(row, max_crop_chars: int = 18) -> str:
     """Compact label for a (crop, region, tillage) row in stratified plots."""
     crop = str(row.get('crop_de', row.get('lnf_code', '?')))[:max_crop_chars]
@@ -209,29 +232,51 @@ def _stratum_label(row, max_crop_chars: int = 18) -> str:
 # Plots — unstratified
 # ===========================================================================
 def plot_scatter_per_crop(per_crop: pd.DataFrame, out: str) -> None:
-    """Crop-mean predicted vs reference. Point size ~ √n."""
+    """Crop-mean predicted vs reference. Point size ~ √n.
+    Excluded-from-fit crops are drawn hollow + grey-edged.
+    """
     df = per_crop.dropna(subset=['mean_ref', 'mean_new']).copy()
     if df.empty:
         return
+    if 'excluded' not in df.columns:
+        df['excluded'] = False
     fig, ax = plt.subplots(figsize=(7, 7))
     n = df['n'].clip(lower=1).values
     sizes = 30 + 250 * np.sqrt(n / n.max())
-    ax.scatter(df['mean_ref'], df['mean_new'], s=sizes, alpha=0.7,
-               edgecolor='k', linewidth=0.4)
+    df['_size'] = sizes
+    # Fitted crops: filled blue
+    fit = df[~df['excluded']]
+    if len(fit):
+        ax.scatter(fit['mean_ref'], fit['mean_new'], s=fit['_size'].values,
+                   alpha=0.7, edgecolor='k', linewidth=0.4,
+                   label='fitted')
+    # Excluded crops: hollow grey-edged
+    exc = df[df['excluded']]
+    if len(exc):
+        ax.scatter(exc['mean_ref'], exc['mean_new'], s=exc['_size'].values,
+                   facecolors='none', edgecolor=EXCLUDED_STYLE['edge'],
+                   linewidth=1.0, alpha=0.9,
+                   label='excluded from fit')
     for _, r in df.iterrows():
         ax.annotate(str(r['crop_de'])[:22],
                     (r['mean_ref'], r['mean_new']),
-                    fontsize=7, alpha=0.8,
+                    fontsize=7,
+                    color=EXCLUDED_STYLE['edge'] if r['excluded'] else 'black',
+                    alpha=0.8,
                     xytext=(4, 3), textcoords='offset points')
     m = max(df['mean_ref'].max(), df['mean_new'].max()) * 1.1
     ax.plot([0, m], [0, m], 'k--', lw=1, alpha=0.5, label='1:1')
-    bias = (df['mean_new'] - df['mean_ref']).mean()
-    mae  = (df['mean_new'] - df['mean_ref']).abs().mean()
+    # Headline bias/MAE are over the *fitted* crops only.
+    fit_means = fit if len(fit) else df
+    bias = (fit_means['mean_new'] - fit_means['mean_ref']).mean()
+    mae  = (fit_means['mean_new'] - fit_means['mean_ref']).abs().mean()
     ax.set_xlabel('C_ref  (per-crop Total in C_Faktoren.csv)')
     ax.set_ylabel('C_new  (mean of sampled-pixel SLR with calibrated β)')
     ax.set_title(f'Calibration sample — crop-mean predicted vs reference\n'
-                 f'n_crops={len(df)}  bias={bias:+.4f}  MAE={mae:.4f}')
+                 f'n_fitted={len(fit_means)}  bias={bias:+.4f}  MAE={mae:.4f}'
+                 + (f'  ({len(exc)} excluded)' if len(exc) else ''))
     ax.set_xlim(0, m); ax.set_ylim(0, m)
+    ax.legend(loc='upper left', fontsize=8)
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
 
@@ -240,26 +285,39 @@ def plot_strengths_weaknesses(per_crop: pd.DataFrame, out: str,
                               min_n: int = 10) -> None:
     """bias × spread per crop. Origin = agrees with table & no within-crop
     variation. Top-left/right = high within-crop variation. Far from x=0 =
-    systematic mismatch."""
+    systematic mismatch. Excluded crops shown hollow grey-edged."""
     df = per_crop[per_crop['n'] >= min_n].dropna(subset=['bias', 'spread']).copy()
     if df.empty:
         print('  (not enough data per crop for strengths/weaknesses)')
         return
+    if 'excluded' not in df.columns:
+        df['excluded'] = False
     fig, ax = plt.subplots(figsize=(11, 7))
-    sizes = 30 + 6 * np.sqrt(df['n'].clip(upper=10000))
-    sc = ax.scatter(df['bias'], df['spread'], s=sizes,
-                    c=df['bias'].abs(), cmap='Reds',
-                    alpha=0.8, edgecolor='k', linewidth=0.5)
+    df['_size'] = 30 + 6 * np.sqrt(df['n'].clip(upper=10000))
+    fit = df[~df['excluded']]
+    exc = df[df['excluded']]
+    if len(fit):
+        sc = ax.scatter(fit['bias'], fit['spread'], s=fit['_size'].values,
+                        c=fit['bias'].abs(), cmap='Reds',
+                        alpha=0.8, edgecolor='k', linewidth=0.5,
+                        label='fitted')
+        plt.colorbar(sc, ax=ax, label='|bias|  (fitted only)')
+    if len(exc):
+        ax.scatter(exc['bias'], exc['spread'], s=exc['_size'].values,
+                   facecolors='none', edgecolor=EXCLUDED_STYLE['edge'],
+                   linewidth=1.0, alpha=0.9, label='excluded from fit')
     ax.axvline(0, color='k', lw=0.7, alpha=0.6)
     for _, r in df.iterrows():
         ax.annotate(str(r['crop_de'])[:22], (r['bias'], r['spread']),
-                    fontsize=7, alpha=0.85,
+                    fontsize=7,
+                    color=EXCLUDED_STYLE['edge'] if r['excluded'] else 'black',
+                    alpha=0.85,
                     xytext=(4, 3), textcoords='offset points')
     ax.set_xlabel('bias  (C_new − C_ref)  →  S2 systematically higher')
     ax.set_ylabel('within-crop spread of C_new (σ across pixels)')
     ax.set_title('Per-crop strengths & weaknesses on calibration sample\n'
                  'origin = agrees with table & no within-crop variation')
-    plt.colorbar(sc, ax=ax, label='|bias|')
+    ax.legend(loc='upper right', fontsize=8)
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
 
@@ -273,18 +331,46 @@ def plot_box_per_crop(per_pixel: pd.DataFrame, out: str,
         return
     order = (sub.groupby('crop_de')['C_predicted'].median()
                 .sort_values().index.tolist())
+    # Excluded mask, one value per crop in `order`.
+    if 'excluded_from_fit' in sub.columns:
+        exc_by_crop = (sub.groupby('crop_de')['excluded_from_fit']
+                          .any().to_dict())
+    else:
+        exc_by_crop = {}
+    excluded_flags = [bool(exc_by_crop.get(c, False)) for c in order]
     fig, ax = plt.subplots(figsize=(max(8, 0.45 * len(order)), 6))
     data = [sub.loc[sub['crop_de'] == c, 'C_predicted'].values for c in order]
-    ax.boxplot(data, labels=[c[:25] for c in order], showfliers=False,
-               medianprops=dict(color='steelblue', lw=1.5))
+    bp = ax.boxplot(data, labels=[c[:25] for c in order], showfliers=False,
+                    patch_artist=True,
+                    medianprops=dict(color='steelblue', lw=1.5))
+    # Style boxes: fitted = plain white fill, excluded = hatched grey edge
+    for box, is_exc in zip(bp['boxes'], excluded_flags):
+        if is_exc:
+            box.set(facecolor='white', edgecolor=EXCLUDED_STYLE['edge'],
+                    hatch=EXCLUDED_STYLE['hatch'], linewidth=1.0)
+        else:
+            box.set(facecolor='white', edgecolor='black', linewidth=1.0)
+    # Grey-out the x-tick labels for excluded crops
+    for tick, is_exc in zip(ax.get_xticklabels(), excluded_flags):
+        if is_exc:
+            tick.set_color(EXCLUDED_STYLE['edge'])
     for i, c in enumerate(order, start=1):
-        ref = sub.loc[sub['crop_de'] == c, 'C_ref'].iloc[0]
-        ax.scatter(i, ref, color='red', s=40, zorder=5,
-                   label='C_ref (Total)' if i == 1 else None)
+        ref = sub.loc[sub['crop_de'] == c, 'C_ref']
+        if len(ref) and ref.notna().any():
+            ax.scatter(i, ref.iloc[0], color='red', s=40, zorder=5,
+                       label='C_ref (Total)' if i == 1 else None)
+    # Build legend, adding a hatched-box proxy for excluded crops if any.
+    handles, labels = ax.get_legend_handles_labels()
+    if any(excluded_flags):
+        from matplotlib.patches import Patch
+        handles.append(Patch(facecolor='white',
+                             edgecolor=EXCLUDED_STYLE['edge'],
+                             hatch=EXCLUDED_STYLE['hatch'],
+                             label='excluded from fit'))
     ax.set_ylabel('C-factor')
     ax.set_title('Calibration sample — C_new distribution per crop, with C_ref')
     plt.xticks(rotation=70, ha='right', fontsize=8)
-    ax.legend(loc='upper left')
+    ax.legend(handles=handles, loc='upper left')
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
 
@@ -292,7 +378,9 @@ def plot_box_per_crop(per_pixel: pd.DataFrame, out: str,
 def plot_interannual(per_pixel: pd.DataFrame, out: str,
                      min_n: int = 30) -> None:
     """Mean C_new per (crop, year). Tells you if the satellite product is
-    interannually stable or sees real year-to-year variation."""
+    interannually stable or sees real year-to-year variation.
+    Excluded-from-fit crops are drawn dashed + faded.
+    """
     if 'yr' not in per_pixel.columns or per_pixel['yr'].nunique() < 2:
         return
     counts = per_pixel.groupby('crop_de').size()
@@ -300,10 +388,20 @@ def plot_interannual(per_pixel: pd.DataFrame, out: str,
     sub = per_pixel[per_pixel['crop_de'].isin(keep)].copy()
     if sub.empty:
         return
+    if 'excluded_from_fit' in sub.columns:
+        exc_by_crop = (sub.groupby('crop_de')['excluded_from_fit']
+                          .any().to_dict())
+    else:
+        exc_by_crop = {}
     fig, ax = plt.subplots(figsize=(10, 6))
     for crop, g in sub.groupby('crop_de'):
         yearly = g.groupby('yr')['C_predicted'].mean()
-        ax.plot(yearly.index, yearly.values, marker='o', label=crop[:25])
+        is_exc = bool(exc_by_crop.get(crop, False))
+        ax.plot(yearly.index, yearly.values,
+                marker='o',
+                linestyle=EXCLUDED_STYLE['linestyle'] if is_exc else '-',
+                alpha=EXCLUDED_STYLE['line_alpha'] if is_exc else 1.0,
+                label=crop[:25] + (' (excl.)' if is_exc else ''))
     ax.set_xlabel('Year')
     ax.set_ylabel('Mean C_new on calibration sample')
     ax.set_title('Interannual variation in S2-derived C-factor — '
@@ -315,23 +413,37 @@ def plot_interannual(per_pixel: pd.DataFrame, out: str,
 
 def plot_residual_vs_n(per_crop: pd.DataFrame, out: str) -> None:
     """|bias| vs n. Crops with high |bias| AND high n are the meaningful
-    weaknesses; high |bias| at low n is just sampling noise."""
+    weaknesses; high |bias| at low n is just sampling noise.
+    Excluded-from-fit crops drawn hollow grey.
+    """
     df = per_crop.dropna(subset=['bias', 'n']).copy()
     if df.empty:
         return
+    if 'excluded' not in df.columns:
+        df['excluded'] = False
     df['abs_bias'] = df['bias'].abs()
     fig, ax = plt.subplots(figsize=(8, 5.5))
-    ax.scatter(df['n'], df['abs_bias'], s=40, alpha=0.7, edgecolor='k', lw=0.4)
+    fit = df[~df['excluded']]; exc = df[df['excluded']]
+    if len(fit):
+        ax.scatter(fit['n'], fit['abs_bias'], s=40, alpha=0.7,
+                   edgecolor='k', lw=0.4, label='fitted')
+    if len(exc):
+        ax.scatter(exc['n'], exc['abs_bias'], s=40,
+                   facecolors='none', edgecolor=EXCLUDED_STYLE['edge'],
+                   lw=1.0, label='excluded from fit')
     for _, r in df.iterrows():
         if r['abs_bias'] > df['abs_bias'].median():
             ax.annotate(str(r['crop_de'])[:18], (r['n'], r['abs_bias']),
-                        fontsize=7, alpha=0.7,
+                        fontsize=7,
+                        color=EXCLUDED_STYLE['edge'] if r['excluded'] else 'black',
+                        alpha=0.7,
                         xytext=(4, 3), textcoords='offset points')
     ax.set_xscale('log')
     ax.set_xlabel('Sample size n (parcel-pixels)')
     ax.set_ylabel('|bias|  =  |C_new_mean − C_ref|')
     ax.set_title('Where do residuals come from? '
                  '(meaningful weaknesses are high-n + high |bias|)')
+    ax.legend(loc='upper right', fontsize=8)
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
 
@@ -365,24 +477,38 @@ def plot_scatter_per_stratum(per_stratum: pd.DataFrame, out: str) -> None:
     """One point per (crop, region, tillage) stratum.
 
     Colour by region, marker by tillage. Point size ~ √n. Each crop
-    appears up to 6 times.
+    appears up to 6 times. Excluded-from-fit strata drawn hollow grey-edged.
     """
     df = per_stratum.dropna(subset=['mean_ref', 'mean_new']).copy()
     if df.empty:
         return
+    if 'excluded' not in df.columns:
+        df['excluded'] = False
     fig, ax = plt.subplots(figsize=(8, 8))
     n = df['n'].clip(lower=1).values
     sizes = 30 + 250 * np.sqrt(n / max(n.max(), 1))
     df['_size'] = sizes
-    for (reg, til), sub in df.groupby(['region', 'tillage']):
+    # Fitted strata: coloured by region, marker by tillage
+    for (reg, til), sub in df[~df['excluded']].groupby(['region', 'tillage']):
         ax.scatter(sub['mean_ref'], sub['mean_new'],
                    s=sub['_size'].values,
                    c=REGION_COLORS.get(reg, 'grey'),
                    marker=TILLAGE_MARKERS.get(til, 'x'),
                    alpha=0.75, edgecolor='k', linewidth=0.4,
                    label=f'{reg}/{til}')
-    # Annotate only the visually-interesting ones (largest residuals or
-    # largest n) to avoid clutter.
+    # Excluded strata: hollow grey, keep tillage marker for readability
+    exc = df[df['excluded']]
+    if len(exc):
+        for til, sub in exc.groupby('tillage'):
+            ax.scatter(sub['mean_ref'], sub['mean_new'],
+                       s=sub['_size'].values,
+                       facecolors='none',
+                       edgecolor=EXCLUDED_STYLE['edge'],
+                       marker=TILLAGE_MARKERS.get(til, 'x'),
+                       linewidth=1.0, alpha=0.9,
+                       label=f'excluded ({til})')
+    # Annotate visually-interesting points (fitted side only — excluded crops
+    # already stand out by colour).
     df['_abs_resid'] = (df['mean_new'] - df['mean_ref']).abs()
     interesting = pd.concat([
         df.nlargest(8, '_abs_resid'),
@@ -391,16 +517,22 @@ def plot_scatter_per_stratum(per_stratum: pd.DataFrame, out: str) -> None:
     for _, r in interesting.iterrows():
         ax.annotate(_stratum_label(r),
                     (r['mean_ref'], r['mean_new']),
-                    fontsize=6.5, alpha=0.8,
+                    fontsize=6.5,
+                    color=EXCLUDED_STYLE['edge'] if r['excluded'] else 'black',
+                    alpha=0.8,
                     xytext=(4, 3), textcoords='offset points')
     m = max(df['mean_ref'].max(), df['mean_new'].max()) * 1.1
     ax.plot([0, m], [0, m], 'k--', lw=1, alpha=0.5, label='1:1')
-    bias = (df['mean_new'] - df['mean_ref']).mean()
-    mae  = (df['mean_new'] - df['mean_ref']).abs().mean()
+    # Headline bias/MAE over fitted strata only.
+    fit = df[~df['excluded']]
+    fit_means = fit if len(fit) else df
+    bias = (fit_means['mean_new'] - fit_means['mean_ref']).mean()
+    mae  = (fit_means['mean_new'] - fit_means['mean_ref']).abs().mean()
     ax.set_xlabel('C_ref  (stratified C_Faktoren entry)')
     ax.set_ylabel('C_new  (mean of sampled-pixel SLR with calibrated β)')
     ax.set_title(f'Calibration sample — stratum-mean predicted vs reference\n'
-                 f'n_strata={len(df)}  bias={bias:+.4f}  MAE={mae:.4f}')
+                 f'n_fitted={len(fit_means)}  bias={bias:+.4f}  MAE={mae:.4f}'
+                 + (f'  ({len(exc)} excluded)' if len(exc) else ''))
     ax.set_xlim(0, m); ax.set_ylim(0, m)
     ax.legend(loc='upper left', fontsize=8, ncol=2)
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
@@ -409,25 +541,38 @@ def plot_scatter_per_stratum(per_stratum: pd.DataFrame, out: str) -> None:
 
 def plot_strengths_weaknesses_stratum(per_stratum: pd.DataFrame, out: str,
                                        min_n: int = 10) -> None:
-    """bias × spread per stratum, coloured by region, markered by tillage."""
+    """bias × spread per stratum, coloured by region, markered by tillage.
+    Excluded-from-fit strata drawn hollow grey-edged."""
     df = per_stratum[per_stratum['n'] >= min_n].dropna(subset=['bias', 'spread']).copy()
     if df.empty:
         print('  (not enough data per stratum for strengths/weaknesses)')
         return
+    if 'excluded' not in df.columns:
+        df['excluded'] = False
     fig, ax = plt.subplots(figsize=(11, 7))
-    sizes = 30 + 6 * np.sqrt(df['n'].clip(upper=10000))
-    df['_size'] = sizes
-    for (reg, til), sub in df.groupby(['region', 'tillage']):
+    df['_size'] = 30 + 6 * np.sqrt(df['n'].clip(upper=10000))
+    for (reg, til), sub in df[~df['excluded']].groupby(['region', 'tillage']):
         ax.scatter(sub['bias'], sub['spread'], s=sub['_size'].values,
                    c=REGION_COLORS.get(reg, 'grey'),
                    marker=TILLAGE_MARKERS.get(til, 'x'),
                    alpha=0.8, edgecolor='k', linewidth=0.4,
                    label=f'{reg}/{til}')
+    exc = df[df['excluded']]
+    if len(exc):
+        for til, sub in exc.groupby('tillage'):
+            ax.scatter(sub['bias'], sub['spread'], s=sub['_size'].values,
+                       facecolors='none',
+                       edgecolor=EXCLUDED_STYLE['edge'],
+                       marker=TILLAGE_MARKERS.get(til, 'x'),
+                       linewidth=1.0, alpha=0.9,
+                       label=f'excluded ({til})')
     ax.axvline(0, color='k', lw=0.7, alpha=0.6)
     df['_abs_bias'] = df['bias'].abs()
     for _, r in df.nlargest(15, '_abs_bias').iterrows():
         ax.annotate(_stratum_label(r), (r['bias'], r['spread']),
-                    fontsize=6.5, alpha=0.85,
+                    fontsize=6.5,
+                    color=EXCLUDED_STYLE['edge'] if r['excluded'] else 'black',
+                    alpha=0.85,
                     xytext=(4, 3), textcoords='offset points')
     ax.set_xlabel('bias  (C_new − C_ref)  →  S2 systematically higher')
     ax.set_ylabel('within-stratum spread of C_new (σ across pixels)')
@@ -443,6 +588,7 @@ def plot_box_per_stratum(per_pixel: pd.DataFrame, out: str,
 
     Crops are kept together: boxes are sorted by crop_de first, then by
     stratum label, so the reader can scan a crop's 6 strata side-by-side.
+    Excluded-from-fit strata are hatched + grey-edged.
     """
     grp_cols = ['crop_de', 'region', 'tillage']
     counts = per_pixel.groupby(grp_cols).size()
@@ -461,27 +607,52 @@ def plot_box_per_stratum(per_pixel: pd.DataFrame, out: str,
                       & (sub['tillage'] == t), 'C_predicted'].values
               for (c, r, t) in order]
     labels = [f"{str(c)[:18]} | {r[0]}/{t[:3]}" for (c, r, t) in order]
+    if 'excluded_from_fit' in sub.columns:
+        exc_by_key = (sub.groupby(grp_cols, observed=True)['excluded_from_fit']
+                         .any().to_dict())
+    else:
+        exc_by_key = {}
+    excluded_flags = [bool(exc_by_key.get(k, False)) for k in order]
     fig, ax = plt.subplots(figsize=(max(10, 0.30 * len(order)), 6))
-    ax.boxplot(data, labels=labels, showfliers=False,
-               medianprops=dict(color='steelblue', lw=1.5))
+    bp = ax.boxplot(data, labels=labels, showfliers=False,
+                    patch_artist=True,
+                    medianprops=dict(color='steelblue', lw=1.5))
+    for box, is_exc in zip(bp['boxes'], excluded_flags):
+        if is_exc:
+            box.set(facecolor='white', edgecolor=EXCLUDED_STYLE['edge'],
+                    hatch=EXCLUDED_STYLE['hatch'], linewidth=1.0)
+        else:
+            box.set(facecolor='white', edgecolor='black', linewidth=1.0)
+    for tick, is_exc in zip(ax.get_xticklabels(), excluded_flags):
+        if is_exc:
+            tick.set_color(EXCLUDED_STYLE['edge'])
     for i, (c, r, t) in enumerate(order, start=1):
         ref_vals = sub.loc[(sub['crop_de'] == c)
                             & (sub['region'] == r)
                             & (sub['tillage'] == t), 'C_ref']
-        if len(ref_vals):
+        if len(ref_vals) and ref_vals.notna().any():
             ax.scatter(i, ref_vals.iloc[0], color='red', s=30, zorder=5,
                        label='C_ref (stratum)' if i == 1 else None)
+    handles, labels = ax.get_legend_handles_labels()
+    if any(excluded_flags):
+        from matplotlib.patches import Patch
+        handles.append(Patch(facecolor='white',
+                             edgecolor=EXCLUDED_STYLE['edge'],
+                             hatch=EXCLUDED_STYLE['hatch'],
+                             label='excluded from fit'))
     ax.set_ylabel('C-factor')
     ax.set_title('Calibration sample — C_new distribution per stratum, with C_ref')
     plt.xticks(rotation=80, ha='right', fontsize=7)
-    ax.legend(loc='upper left')
+    ax.legend(handles=handles, loc='upper left')
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
 
 
 def plot_interannual_stratum(per_pixel: pd.DataFrame, out: str,
                               min_n: int = 30) -> None:
-    """Mean C_new per (crop, region, tillage, year). One line per stratum."""
+    """Mean C_new per (crop, region, tillage, year). One line per stratum.
+    Excluded-from-fit strata drawn dashed + faded.
+    """
     if 'yr' not in per_pixel.columns or per_pixel['yr'].nunique() < 2:
         return
     grp_cols = ['crop_de', 'region', 'tillage']
@@ -490,14 +661,23 @@ def plot_interannual_stratum(per_pixel: pd.DataFrame, out: str,
     sub = per_pixel.set_index(grp_cols).loc[keep_keys].reset_index()
     if sub.empty:
         return
+    if 'excluded_from_fit' in sub.columns:
+        exc_by_key = (sub.groupby(grp_cols)['excluded_from_fit']
+                         .any().to_dict())
+    else:
+        exc_by_key = {}
     fig, ax = plt.subplots(figsize=(11, 6))
     for (c, r, t), g in sub.groupby(grp_cols):
         yearly = g.groupby('yr')['C_predicted'].mean()
+        is_exc = bool(exc_by_key.get((c, r, t), False))
         ax.plot(yearly.index, yearly.values,
-                color=REGION_COLORS.get(r, 'grey'),
+                color=EXCLUDED_STYLE['edge'] if is_exc else REGION_COLORS.get(r, 'grey'),
                 marker=TILLAGE_MARKERS.get(t, 'x'),
-                alpha=0.7, lw=1.0,
-                label=f"{str(c)[:18]}|{r[0]}/{t[:3]}")
+                linestyle=EXCLUDED_STYLE['linestyle'] if is_exc else '-',
+                alpha=EXCLUDED_STYLE['line_alpha'] if is_exc else 0.7,
+                lw=1.0,
+                label=f"{str(c)[:18]}|{r[0]}/{t[:3]}"
+                      + (' (excl.)' if is_exc else ''))
     ax.set_xlabel('Year')
     ax.set_ylabel('Mean C_new on calibration sample')
     ax.set_title('Interannual variation per stratum — '
@@ -508,23 +688,35 @@ def plot_interannual_stratum(per_pixel: pd.DataFrame, out: str,
 
 
 def plot_residual_vs_n_stratum(per_stratum: pd.DataFrame, out: str) -> None:
-    """|bias| vs n at the stratum level, coloured by region."""
+    """|bias| vs n at the stratum level, coloured by region.
+    Excluded-from-fit strata drawn hollow grey-edged."""
     df = per_stratum.dropna(subset=['bias', 'n']).copy()
     if df.empty:
         return
+    if 'excluded' not in df.columns:
+        df['excluded'] = False
     df['abs_bias'] = df['bias'].abs()
     fig, ax = plt.subplots(figsize=(8, 5.5))
-    for (reg, til), sub in df.groupby(['region', 'tillage']):
+    for (reg, til), sub in df[~df['excluded']].groupby(['region', 'tillage']):
         ax.scatter(sub['n'], sub['abs_bias'], s=40, alpha=0.7,
                    c=REGION_COLORS.get(reg, 'grey'),
                    marker=TILLAGE_MARKERS.get(til, 'x'),
                    edgecolor='k', lw=0.4,
                    label=f'{reg}/{til}')
+    exc = df[df['excluded']]
+    if len(exc):
+        for til, sub in exc.groupby('tillage'):
+            ax.scatter(sub['n'], sub['abs_bias'], s=40,
+                       facecolors='none', edgecolor=EXCLUDED_STYLE['edge'],
+                       marker=TILLAGE_MARKERS.get(til, 'x'),
+                       lw=1.0, label=f'excluded ({til})')
     median = df['abs_bias'].median()
     for _, r in df.iterrows():
         if r['abs_bias'] > median:
             ax.annotate(_stratum_label(r), (r['n'], r['abs_bias']),
-                        fontsize=6, alpha=0.7,
+                        fontsize=6,
+                        color=EXCLUDED_STYLE['edge'] if r['excluded'] else 'black',
+                        alpha=0.7,
                         xytext=(4, 3), textcoords='offset points')
     ax.set_xscale('log')
     ax.set_xlabel('Sample size n (parcel-pixels per stratum)')
@@ -601,6 +793,7 @@ def run(cfg: dict) -> None:
             m['region'] = reg
             m['tillage'] = til
             m['C_ref'] = g['C_ref'].iloc[0] if g['C_ref'].notna().any() else np.nan
+            m['excluded'] = _group_excluded(g)
             rows.append(m)
         per_stratum = (pd.DataFrame(rows)
                          .sort_values('MAE', ascending=False)
@@ -620,7 +813,8 @@ def run(cfg: dict) -> None:
                                   RMSE=('RMSE', 'mean'),
                                   spread=('spread', 'mean'),
                                   n_strata=('n', 'size'),
-                                  C_ref=('C_ref', 'mean')))
+                                  C_ref=('C_ref', 'mean'),
+                                  excluded=('excluded', 'any')))
         per_crop = rollup.sort_values('MAE', ascending=False).reset_index(drop=True)
     else:
         print("\nPer-crop diagnostics...")
@@ -630,6 +824,7 @@ def run(cfg: dict) -> None:
             m['crop_de'] = crop
             m['lnf_code'] = g['lnf_code'].iloc[0]
             m['C_ref'] = g['C_ref'].iloc[0] if g['C_ref'].notna().any() else np.nan
+            m['excluded'] = _group_excluded(g)
             rows.append(m)
         per_crop = (pd.DataFrame(rows)
                       .sort_values('MAE', ascending=False)
@@ -739,14 +934,23 @@ def run(cfg: dict) -> None:
     plot_quality_bars(by_q, plot_dir / 'cal_quality_bars.png')
 
     # ---------------------------------------------------------------------
-    # Headline summary
+    # Headline summary — excludes crops dropped from the β fit so the
+    # numbers reflect what the calibration actually optimised against.
     # ---------------------------------------------------------------------
-    valid = per_pixel.dropna(subset=['C_ref', 'C_predicted'])
+    if 'excluded_from_fit' in per_pixel.columns:
+        fit_mask = ~per_pixel['excluded_from_fit'].astype(bool)
+    else:
+        fit_mask = pd.Series(True, index=per_pixel.index)
+    valid = per_pixel.loc[fit_mask].dropna(subset=['C_ref', 'C_predicted'])
     overall_bias = float((valid['C_predicted'] - valid['C_ref']).mean())
     overall_mae  = float((valid['C_predicted'] - valid['C_ref']).abs().mean())
 
     target_df = per_stratum if stratified else per_crop
-    target_means = target_df.dropna(subset=['mean_ref', 'mean_new'])
+    if 'excluded' in target_df.columns:
+        target_df_fit = target_df[~target_df['excluded'].astype(bool)]
+    else:
+        target_df_fit = target_df
+    target_means = target_df_fit.dropna(subset=['mean_ref', 'mean_new'])
     target_bias = float((target_means['mean_new'] - target_means['mean_ref']).mean())
     target_mae  = float((target_means['mean_new'] - target_means['mean_ref']).abs().mean())
 

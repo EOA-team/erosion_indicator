@@ -1418,12 +1418,18 @@ def run_calibration_stratified(config: dict) -> None:
                                                 sampled_lnf_codes,
                                                 manual_overrides_path=manual_overrides_path,
                                                 area_years=area_years)
+    # Keep an unfiltered copy: the calibration loss uses `df_ref` (excluded
+    # crops removed), but the per-pixel output below still needs C_ref for
+    # *every* sampled crop so excluded crops remain visible in the analysis
+    # plots (flagged as "excluded from fit").
+    df_ref_full = df_ref.copy()
     if exclude_lnf_codes:
         before = df_ref[crop_col].nunique()
         df_ref = df_ref[~df_ref[crop_col].isin(exclude_lnf_codes)].reset_index(drop=True)
         print(f"[stratified] Excluded {before - df_ref[crop_col].nunique()} crops "
               f"from calibration.")
     df_ref[crop_col] = df_ref[crop_col].astype(df_fc[crop_col].dtype)
+    df_ref_full[crop_col] = df_ref_full[crop_col].astype(df_fc[crop_col].dtype)
  
     # Assign strata onto FC
     df_fc = assign_strata(df_fc,
@@ -1468,12 +1474,16 @@ def run_calibration_stratified(config: dict) -> None:
     df_strata.to_csv(results_path_strat, index=False)
     print(f"[stratified] Per-stratum results → {results_path_strat}")
  
-    # Per-pixel output at β_opt with stratum labels and matched C_ref
+    # Per-pixel output at β_opt with stratum labels and matched C_ref.
+    # `df_ref_full` (not `df_ref`) so excluded crops also carry their tabulated
+    # C_ref into the analysis plots; `excluded_from_fit` lets the analysis
+    # script visually flag them.
     df_pix = compute_cfactors_stratified(df, beta_opt, ts_cols)
     df_pix = df_pix.merge(
-        df_ref[[crop_col, 'region', 'tillage', 'C_ref']],
+        df_ref_full[[crop_col, 'region', 'tillage', 'C_ref']],
         on=[crop_col, 'region', 'tillage'], how='left',
     )
+    df_pix['excluded_from_fit'] = df_pix[crop_col].isin(exclude_lnf_codes)
     df_pix.to_csv(pixel_path_strat, index=False)
     print(f"[stratified] Per-pixel C-factors → {pixel_path_strat}")
  
@@ -1593,6 +1603,7 @@ def run_calibration(config: dict) -> None:
     # One row per sampled pixel, i.e. per (lnf_code, yr, poly_id) — see the
     # module docstring for why "pixel" is the right granularity here.
     df_pixel_c = compute_cfactors_per_pixel(df, beta_opt, ts_cols)
+    df_pixel_c['excluded_from_fit'] = df_pixel_c[crop_col].isin(exclude_lnf_codes)
     pixel_c_path = results_path.replace('.csv', '_per_pixel.csv')
     df_pixel_c.to_csv(pixel_c_path, index=False)
     print(f"Per-pixel C-factors at β_opt saved to {pixel_c_path}")
