@@ -108,7 +108,7 @@ CONFIG = {
 
     'min_n_per_crop':           10,
     # None → auto-detect (region + tillage columns present).
-    'stratified_mode':          None,
+    'stratified_mode':          None, #group analysis by strata or crop
 }
 
 
@@ -116,19 +116,23 @@ CONFIG = {
 # Loading
 # ===========================================================================
 def _detect_split_mode(df: pd.DataFrame) -> str:
-    """Return 'parcel', 'loyo', or 'none' based on the split column values."""
+    """Return 'parcel', 'loyo', or 'none' based on the split column values.
+
+    'excluded' rows (crops dropped from training but predicted at inference)
+    are ignored for the mode detection — they coexist with either layout.
+    """
     if 'split' not in df.columns:
         return 'none'
-    vals = set(df['split'].dropna().unique())
+    vals = set(df['split'].dropna().unique()) - {'excluded'}
+    if not vals:
+        return 'none'
     if vals <= {'train', 'test'}:
         return 'parcel'
     # Year values (int or string like '2019') → LOYO
     if all(str(v).isdigit() and len(str(v)) == 4 for v in vals):
-        # Normalise to string so downstream groupby/filtering is consistent
         df['split'] = df['split'].astype(str)
         return 'loyo'
-    return 'parcel'  # fallback
-
+    return 'parcel'
 
 def load_nn_pixels(cfg: dict, stratified_override) -> tuple[pd.DataFrame, bool, str]:
     """Load NN per-pixel predictions, rename C_pred→C_predicted, attach crop_de.
@@ -250,6 +254,84 @@ def plot_loyo_per_year(per_pixel: pd.DataFrame, group_cols: list[str],
     ax.legend(loc='upper left', fontsize=7)
     plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
     print(f"  saved {out}")
+
+
+def plot_excluded_crops(per_pixel: pd.DataFrame, group_cols: list[str],
+                        out_scatter: str, out_box: str, stratified: bool,
+                        min_n: int = 1) -> None:
+    """Scatter (mean C_pred vs C_ref) + boxplot of per-pixel C_pred for crops
+    that were excluded from training.
+
+    The scatter only includes excluded groups for which a tabulated C_ref is
+    available, so the model's zero-shot accuracy is visible against the 1:1
+    line. The boxplot shows the prediction distribution for every excluded
+    crop regardless of C_ref availability.
+    """
+    excl = per_pixel.loc[per_pixel.get('split', '') == 'excluded'].copy()
+    if excl.empty:
+        return
+    unit = 'stratum' if stratified else 'crop'
+
+    # ---- Scatter (needs C_ref) ----------------------------------------
+    t = metrics_table(excl, group_cols).dropna(subset=['mean_ref', 'mean_new'])
+    if not t.empty:
+        fig, ax = plt.subplots(figsize=(7.5, 7.5))
+        n = t['n'].clip(lower=1).values
+        sizes = 25 + 200 * np.sqrt(n / max(n.max(), 1))
+        bias = (t['mean_new'] - t['mean_ref']).mean()
+        mae = (t['mean_new'] - t['mean_ref']).abs().mean()
+        ax.scatter(t['mean_ref'], t['mean_new'], s=sizes, alpha=0.7,
+                   c='#6A4C93', edgecolor='k', linewidth=0.4,
+                   label=f'excluded {unit}s  (bias={bias:+.4f}, MAE={mae:.4f})')
+        label_col = 'crop_de' if 'crop_de' in t.columns else group_cols[0]
+        for _, r in t.iterrows():
+            ax.annotate(str(r.get(label_col, '')),
+                        (r['mean_ref'], r['mean_new']),
+                        fontsize=7, alpha=0.7,
+                        xytext=(4, 4), textcoords='offset points')
+        mx = max(t['mean_ref'].max(), t['mean_new'].max()) * 1.1
+        ax.plot([0, mx], [0, mx], 'k--', lw=1, alpha=0.5, label='1:1')
+        ax.set_xlim(0, mx); ax.set_ylim(0, mx)
+        ax.set_xlabel('C_ref (tabulated)')
+        ax.set_ylabel(f'C_pred ({unit}-mean, zero-shot)')
+        ax.set_title(f'Excluded {unit}s: zero-shot predicted vs reference\n'
+                     '(crops not used in training — model never saw their label)')
+        ax.legend(loc='upper left', fontsize=8)
+        plt.tight_layout(); plt.savefig(out_scatter, dpi=150); plt.close()
+        print(f"  saved {out_scatter}")
+    else:
+        print(f"  (no excluded {unit}s with C_ref — skipping scatter)")
+
+    # ---- Boxplot of predictions per excluded crop ---------------------
+    label_col = 'crop_de' if 'crop_de' in excl.columns else 'lnf_code'
+    counts = excl.groupby(label_col).size()
+    keep = counts[counts >= min_n].index.tolist()
+    if not keep:
+        return
+    sub = excl[excl[label_col].isin(keep)].copy()
+    order = (sub.groupby(label_col)['C_predicted'].median()
+                .sort_values().index.tolist())
+    data = [sub.loc[sub[label_col] == k, 'C_predicted'].values for k in order]
+
+    fig, ax = plt.subplots(figsize=(max(6, 0.5 * len(order) + 2), 5))
+    bp = ax.boxplot(data, labels=order, patch_artist=True, showfliers=False)
+    for patch in bp['boxes']:
+        patch.set_facecolor('#6A4C93'); patch.set_alpha(0.55)
+
+    if 'C_ref' in sub.columns:
+        for i, k in enumerate(order, start=1):
+            cr = sub.loc[sub[label_col] == k, 'C_ref'].dropna()
+            if not cr.empty:
+                ax.scatter([i], [cr.iloc[0]], marker='D', s=40,
+                           c='#D7263D', edgecolor='k', linewidth=0.5,
+                           zorder=5)
+    ax.set_ylabel('C_pred (per pixel)')
+    ax.set_title('Excluded crops: predicted C-factor distribution\n'
+                 'red diamond = tabulated C_ref where available')
+    plt.setp(ax.get_xticklabels(), rotation=40, ha='right')
+    plt.tight_layout(); plt.savefig(out_box, dpi=150); plt.close()
+    print(f"  saved {out_box}")
+
 
 
 def plot_loyo_vs_final(per_pixel: pd.DataFrame, group_cols: list[str],
@@ -456,6 +538,22 @@ def run(cfg: dict) -> None:
                            plot_dir / 'nn_train_vs_test_scatter.png', stratified)
 
     # -------------------------------------------------------------------
+    # Excluded crops — predicted but not used for training.
+    # Available for both 'parcel' and 'loyo' modes.
+    # -------------------------------------------------------------------
+    excl_rows = per_pixel.loc[per_pixel['split'] == 'excluded']
+    if not excl_rows.empty:
+        plot_excluded_crops(per_pixel, group_cols,
+                            plot_dir / 'nn_excluded_crops_scatter.png',
+                            plot_dir / 'nn_excluded_crops_box.png',
+                            stratified, min_n=cfg['min_n_per_crop'])
+        excl_table = metrics_table(excl_rows, group_cols)
+        excl_table.to_csv(out_dir / f'nn_excluded_{unit}s.csv', index=False)
+        print(f"  wrote nn_excluded_{unit}s.csv "
+              f"({len(excl_rows):,} pixel rows from {len(excl_table)} {unit}s)")
+
+
+    # -------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------
     def _split_headline(sp_df: pd.DataFrame, label: str) -> list[str]:
@@ -489,13 +587,14 @@ def run(cfg: dict) -> None:
                  if 'yr' in per_pixel.columns else '')
 
     if split_mode == 'loyo':
-        # Aggregate LOYO (all rows are OOF)
-        lines += _split_headline(per_pixel, 'LOYO aggregate (all rows are OOF)')
+        # Aggregate LOYO (trainable rows only — each was held out exactly once)
+        loyo_trainable = per_pixel[per_pixel['split'] != 'excluded']
+        lines += _split_headline(loyo_trainable,
+                                 'LOYO aggregate (trainable rows, all OOF)')
         # Per-year breakdown
-        for yr in sorted(per_pixel['split'].unique()):
+        for yr in sorted(s for s in per_pixel['split'].unique() if s != 'excluded'):
             yr_df = per_pixel[per_pixel['split'] == yr]
             lines += _split_headline(yr_df, f'Year {yr} (OOF)')
-        # Final model (trained on all years, in-sample)
         if 'C_predicted_final' in per_pixel.columns:
             tmp = per_pixel.copy()
             tmp['C_predicted'] = tmp['C_predicted_final']
@@ -506,6 +605,11 @@ def run(cfg: dict) -> None:
                 continue
             sp_df = per_pixel[per_pixel['split'] == sp]
             lines += _split_headline(sp_df, sp.upper())
+
+    # Excluded crops block — zero-shot inference, never used in training.
+    if 'excluded' in per_pixel['split'].unique():
+        excl_df = per_pixel[per_pixel['split'] == 'excluded']
+        lines += _split_headline(excl_df, 'EXCLUDED crops (zero-shot, inference-only)')
 
     # Model-reported metrics from JSON
     if model_metrics is not None:

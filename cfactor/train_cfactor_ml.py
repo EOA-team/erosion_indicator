@@ -204,9 +204,10 @@ def assemble_training_table(config: dict) -> tuple[pd.DataFrame, list[str], bool
         join_cols = [crop_col]
 
     if exclude_lnf_codes:
-        before = df_ref[crop_col].nunique()
-        df_ref = df_ref[~df_ref[crop_col].isin(exclude_lnf_codes)].reset_index(drop=True)
-        print(f"[ml] Excluded {before - df_ref[crop_col].nunique()} crops.")
+        n_excl = df_ref[df_ref[crop_col].isin(exclude_lnf_codes)][crop_col].nunique()
+        print(f"[ml] {n_excl} crop(s) flagged as excluded from TRAINING "
+              f"(codes: {exclude_lnf_codes}). They are kept in df_ref so "
+              "inference still runs and C_ref is carried through for plotting.")
     df_ref[crop_col] = df_ref[crop_col].astype(df_fc[crop_col].dtype)
 
     if stratified:
@@ -236,23 +237,34 @@ def assemble_training_table(config: dict) -> tuple[pd.DataFrame, list[str], bool
     ref_merge_cols = join_cols + ['C_ref']
     if 'area_ha' in df_ref.columns:
         ref_merge_cols.append('area_ha')
-    feats = feats.merge(df_ref[ref_merge_cols], on=join_cols, how='inner')
+    # Left merge: rows whose crop/stratum has no reference entry keep NaN C_ref
+    # rather than being dropped. They are flagged 'excluded' below and used for
+    # inference only.
+    feats = feats.merge(df_ref[ref_merge_cols], on=join_cols, how='left')
     feats.attrs.update(feats_attrs)
-    n_drop = n_feat_rows - len(feats)
-    if n_drop:
-        print(f"[ml] {n_drop} pixel rows dropped (crop/stratum not in reference "
-              "table or excluded).")
+
+    # Flag rows excluded from training: either explicitly listed in the config
+    # OR no reference C-factor available. Both are predicted at inference time
+    # but never contribute to the loss.
+    feats['excluded'] = (feats[crop_col].isin(exclude_lnf_codes)
+                         | feats['C_ref'].isna())
+
     feature_columns = get_feature_columns(feats)
     attrs = dict(feats.attrs)
-    feats = feats.dropna(subset=feature_columns + ['C_ref']).reset_index(drop=True)
+    # Only require feature columns to be non-NA; rows with missing C_ref are
+    # kept (they are inference-only). Trainable rows have C_ref non-NA AND
+    # excluded == False.
+    feats = feats.dropna(subset=feature_columns).reset_index(drop=True)
     feats.attrs.update(attrs)
-    print(f"[ml] {len(feats)} training rows after target join + NA drop.")
+    n_train = int((~feats['excluded']).sum())
+    n_excl = int(feats['excluded'].sum())
+    print(f"[ml] {len(feats)} feature rows after feature NA drop "
+          f"({n_train} trainable, {n_excl} inference-only/excluded).")
 
-    if len(feats) < 10:
-        raise RuntimeError("Too few training rows — check reference matching / inputs.")
+    if int((~feats['excluded']).sum()) < 10:
+        raise RuntimeError("Too few trainable rows — check reference matching / inputs.")
 
     return feats, join_cols, stratified
-
 
 # ---------------------------------------------------------------------------
 # Sample weights (mirrors β calibration's _compute_stratum_weights logic)
@@ -360,7 +372,7 @@ CONFIG: dict = {
     #   'loyo'   — Leave-One-Year-Out. Loops over all years: for each, trains on
     #              the remaining years, predicts the held-out year. Reports per-year
     #              and aggregate metrics. The saved model is fitted on ALL data.
-    'split_strategy':        'parcel',
+    'split_strategy':        'loyo',
     'test_fraction':         0.3,        # only used when split_strategy='parcel'
     'random_seed':           42,
 
@@ -392,61 +404,73 @@ CONFIG: dict = {
 # ===========================================================================
 # Model factory
 # ===========================================================================
-def _resolve_alpha(model_kind: str, model_params: dict,
-                   json_path: str) -> tuple[float | None, str]:
-    """Return (alpha, source_msg). User override > tuner JSON > model default.
+def _resolve_tuned_params(json_path: str) -> tuple[dict, str]:
+    """Read the full ``selected_nn_params`` block from the tuner's JSON.
 
-    For ridge, the JSON's alpha is used but with a printed warning since the
-    tuner selected it against an MLP loss surface — different scales of L2
-    penalty are typical between the two.
+    Returns (tuned_params, source_msg). Empty dict + 'model default' if the
+    JSON is missing or unreadable. JSON serialises tuples as lists, so we
+    restore ``hidden_layer_sizes`` to a tuple for sklearn.
     """
-    if 'alpha' in model_params:
-        return float(model_params['alpha']), 'user override (model_params)'
     if json_path and os.path.exists(json_path):
         try:
             with open(json_path) as f:
                 j = json.load(f)
-            a = j.get('selected_nn_params', {}).get('alpha')
-            if a is not None:
-                msg = f'tune_best_config.json ({json_path})'
-                if model_kind == 'ridge':
-                    print(f"[ml] NOTE: applying tuned alpha={a} from {json_path}, "
-                          "but it was selected for the MLP. Ridge typically wants "
-                          "a different scale of regularisation — treat this as a "
-                          "starting point and re-tune if predictions look poor.")
-                return float(a), msg
+            p = j.get('selected_nn_params')
+            if p:
+                p = dict(p)
+                if isinstance(p.get('hidden_layer_sizes'), list):
+                    p['hidden_layer_sizes'] = tuple(p['hidden_layer_sizes'])
+                return p, f'tune_best_config.json ({json_path})'
         except (json.JSONDecodeError, KeyError, OSError) as e:
-            print(f"[ml] WARN: could not read alpha from {json_path}: {e}")
-    return None, 'model default'
+            print(f"[ml] WARN: could not read tuned params from {json_path}: {e}")
+    return {}, 'model default'
 
 
 def build_estimator(model_kind: str, model_params: dict, seed: int,
                     json_path: str) -> tuple[Pipeline, dict, str]:
     """Build the (scaler, model) pipeline. Returns (pipe, effective_params,
-    alpha_source) so downstream logging/joblib can record what was used."""
-    alpha, alpha_src = _resolve_alpha(model_kind, model_params, json_path)
+    params_source) so downstream logging/joblib can record what was used.
+
+    Precedence (for MLP): DEFAULT_NN_PARAMS < tuner JSON < user model_params.
+    For ridge only ``alpha`` is borrowed from the JSON (with a warning) since
+    the rest of ``selected_nn_params`` is MLP-specific.
+    """
+    tuned_params, tuned_src = _resolve_tuned_params(json_path)
 
     if model_kind == 'mlp':
-        params = {**DEFAULT_NN_PARAMS, **model_params}
-        if alpha is not None:
-            params['alpha'] = alpha
+        params = {**DEFAULT_NN_PARAMS, **tuned_params, **model_params}
         params.setdefault('random_state', seed)
+        if tuned_params and model_params:
+            src = f'{tuned_src} + user override (keys: {sorted(model_params)})'
+        elif tuned_params:
+            src = tuned_src
+        elif model_params:
+            src = f'user override (model_params, keys: {sorted(model_params)})'
+        else:
+            src = 'model default'
         pipe = Pipeline([('scaler', StandardScaler()),
                          ('mlp', WeightedMLPRegressor(**params))])
-        return pipe, params, alpha_src
+        return pipe, params, src
 
     if model_kind == 'ridge':
-        # Ridge default — explicit so the joblib record is complete.
         defaults = {'alpha': 1.0, 'random_state': seed, 'solver': 'auto'}
         params = {**defaults, **model_params}
-        if alpha is not None:
-            params['alpha'] = alpha
+        src = 'model default'
+        if 'alpha' in model_params:
+            src = 'user override (model_params)'
+        elif 'alpha' in tuned_params:
+            params['alpha'] = tuned_params['alpha']
+            src = tuned_src
+            print(f"[ml] NOTE: applying tuned alpha={tuned_params['alpha']} "
+                  f"from {json_path}, but it was selected for the MLP. Ridge "
+                  "typically wants a different scale of regularisation — "
+                  "treat this as a starting point and re-tune if predictions "
+                  "look poor.")
         pipe = Pipeline([('scaler', StandardScaler()),
                          ('ridge', Ridge(**params))])
-        return pipe, params, alpha_src
+        return pipe, params, src
 
     raise ValueError(f"Unknown model_kind={model_kind!r}; expected 'mlp' or 'ridge'.")
-
 
 # ===========================================================================
 # Ridge-specific diagnostic plot
@@ -592,17 +616,30 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                 n_steps, seed, results_dir, config, *,
                 sample_weights=None):
     test_fraction = float(config.get('test_fraction', 0.2))
-    groups = feats['poly_id'].astype(str).values if 'poly_id' in feats.columns \
-        else np.arange(len(feats))
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=seed)
-    train_idx, test_idx = next(gss.split(feats, groups=groups))
 
-    feats['split'] = 'train'
-    feats.loc[feats.index[test_idx], 'split'] = 'test'
-    print(f"[ml] Parcel-grouped split: {len(train_idx)} train, {len(test_idx)} test")
+    # Split only over trainable rows; excluded rows are predicted but never
+    # part of train/test.
+    train_mask = (~feats['excluded']).values
+    train_positions = np.where(train_mask)[0]
+    groups_all = feats['poly_id'].astype(str).values if 'poly_id' in feats.columns \
+        else np.arange(len(feats))
+    groups_train = groups_all[train_positions]
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=seed)
+    rel_train_idx, rel_test_idx = next(gss.split(train_positions, groups=groups_train))
+    train_idx = train_positions[rel_train_idx]
+    test_idx  = train_positions[rel_test_idx]
+
+    feats['split'] = 'excluded'
+    feats.loc[feats.index[train_idx], 'split'] = 'train'
+    feats.loc[feats.index[test_idx],  'split'] = 'test'
+    n_excl = int((feats['split'] == 'excluded').sum())
+    print(f"[ml] Parcel-grouped split: {len(train_idx)} train, "
+          f"{len(test_idx)} test, {n_excl} excluded (inference-only)")
 
     print(f"[ml] Training on {len(train_idx)} rows ...")
     _weighted_fit(pipe, X, y, model_kind, sample_weights, train_idx, seed)
+    # Predict on ALL rows (trainable + excluded)
     feats['C_pred'] = pipe.predict(X)
 
     metrics = {
@@ -613,6 +650,7 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                              for k, v in effective_params.items()},
         'stratified': stratified,
         'area_weight_loss': sample_weights is not None,
+        'n_excluded_rows': n_excl,
         'pixel_level': {
             'train': _metrics(y[train_idx],
                               feats.loc[feats['split'] == 'train', 'C_pred'].values),
@@ -624,12 +662,20 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
     agg = (feats.groupby(join_cols, as_index=False)
                 .agg(C_pred_crop=('C_pred', 'mean'),
                      n_pixels=('C_pred', 'size'),
-                     C_ref=('C_ref', 'first')))
-    metrics['crop_level'] = _metrics(agg['C_ref'].values, agg['C_pred_crop'].values)
+                     C_ref=('C_ref', 'first'),
+                     excluded=('excluded', 'any')))
+    # Crop-level metric is computed on trainable groups only — including
+    # excluded crops here would mix in zero-shot inference and inflate or
+    # deflate the headline number depending on how those crops scatter.
+    agg_train = agg.loc[~agg['excluded']].dropna(subset=['C_ref'])
+    metrics['crop_level'] = _metrics(agg_train['C_ref'].values,
+                                     agg_train['C_pred_crop'].values)
     print(f"[ml] Pixel test  R²={metrics['pixel_level']['test']['r2']:.3f} "
           f"MAE={metrics['pixel_level']['test']['mae']:.4f}")
     print(f"[ml] Group level R²={metrics['crop_level']['r2']:.3f} "
-          f"MAE={metrics['crop_level']['mae']:.4f}")
+          f"MAE={metrics['crop_level']['mae']:.4f}  "
+          f"(trainable groups only; {int(agg['excluded'].sum())} excluded "
+          "groups carried for inference)")
 
     _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
                   alpha_src, feature_columns, join_cols, ts_cols, extra,
@@ -643,39 +689,47 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
               stratified, model_kind, pipe_template, effective_params, alpha_src,
               n_steps, seed, json_path, model_params, results_dir, config, *,
               sample_weights=None):
-    years = sorted(feats['yr'].unique())
-    print(f"[ml] LOYO evaluation over {len(years)} years: {years}")
+    trainable_mask = (~feats['excluded']).values
+    years = sorted(feats.loc[trainable_mask, 'yr'].unique())
+    n_excl = int((~trainable_mask).sum())
+    print(f"[ml] LOYO evaluation over {len(years)} trainable years: {years}  "
+          f"({n_excl} excluded rows will be predicted by each year's fold "
+          "and by the final model)")
 
-    # Out-of-fold predictions — each row gets exactly one C_pred from a model
-    # that never saw its year.
+    # OOF C_pred for trainable rows, year-matched inference for excluded rows.
     feats['C_pred'] = np.nan
-    feats['split'] = ''       # will hold the held-out year label
+    feats['split'] = ''
+    feats.loc[~trainable_mask, 'split'] = 'excluded'
     per_year_metrics = {}
 
     for yr in years:
-        test_mask = feats['yr'] == yr
-        train_mask = ~test_mask
-        train_idx = np.where(train_mask)[0]
+        # Train: trainable rows from OTHER years
+        train_idx = np.where(trainable_mask & (feats['yr'] != yr).values)[0]
+        # Test (for metrics): trainable rows from THIS year
+        test_mask = trainable_mask & (feats['yr'] == yr).values
         test_idx  = np.where(test_mask)[0]
+        # Inference targets: ALL rows from this year (trainable + excluded)
+        all_yr_mask = (feats['yr'] == yr).values
+        all_yr_idx  = np.where(all_yr_mask)[0]
 
-        # Fresh estimator per fold (same architecture)
         fold_pipe, _, _ = build_estimator(
             model_kind, model_params, seed, json_path)
         _weighted_fit(fold_pipe, X, y, model_kind, sample_weights, train_idx, seed)
 
-        preds = fold_pipe.predict(X[test_idx])
-        feats.loc[feats.index[test_idx], 'C_pred'] = preds
+        # Predict on every row of this year, then assign
+        preds_all = fold_pipe.predict(X[all_yr_idx])
+        feats.loc[feats.index[all_yr_idx], 'C_pred'] = preds_all
+        # Trainable rows get split=str(yr); excluded rows keep split='excluded'
         feats.loc[feats.index[test_idx], 'split'] = str(yr)
 
-        # Per-year pixel metrics
-        yr_pix = _metrics(y[test_idx], preds)
+        yr_pix = _metrics(y[test_idx], feats.loc[feats.index[test_idx], 'C_pred'].values)
 
-        # Per-year crop/stratum metrics — only for groups present in this year
         yr_feats = feats.loc[test_mask].copy()
         yr_agg = (yr_feats.groupby(join_cols, as_index=False)
                           .agg(C_pred_crop=('C_pred', 'mean'),
                                n_pixels=('C_pred', 'size'),
                                C_ref=('C_ref', 'first')))
+        yr_agg = yr_agg.dropna(subset=['C_ref'])
         yr_crop = _metrics(yr_agg['C_ref'].values, yr_agg['C_pred_crop'].values)
 
         per_year_metrics[int(yr)] = {
@@ -684,39 +738,55 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
             'pixel': yr_pix,
             'crop_level': yr_crop,
         }
-        print(f"[ml]   {yr}: {yr_pix['n']} rows, {yr_agg.shape[0]} groups  "
+        print(f"[ml]   {yr}: {yr_pix['n']} trainable rows, "
+              f"{yr_agg.shape[0]} groups, "
+              f"{int(all_yr_mask.sum() - test_mask.sum())} excluded rows  "
               f"pixel MAE={yr_pix['mae']:.4f}  group MAE={yr_crop['mae']:.4f}")
 
-    # ---- Aggregate LOYO metrics (all OOF predictions pooled) -----------
-    all_pred = feats['C_pred'].values
-    agg_pixel = _metrics(y, all_pred)
+    # ---- Aggregate LOYO metrics (trainable rows only) ------------------
+    agg_pixel = _metrics(y[trainable_mask],
+                         feats.loc[trainable_mask, 'C_pred'].values)
 
-    agg = (feats.groupby(join_cols, as_index=False)
-                .agg(C_pred_crop=('C_pred', 'mean'),
-                     n_pixels=('C_pred', 'size'),
-                     C_ref=('C_ref', 'first')))
-    agg_crop = _metrics(agg['C_ref'].values, agg['C_pred_crop'].values)
+    feats_train = feats.loc[trainable_mask]
+    agg_train = (feats_train.groupby(join_cols, as_index=False)
+                            .agg(C_pred_crop=('C_pred', 'mean'),
+                                 n_pixels=('C_pred', 'size'),
+                                 C_ref=('C_ref', 'first')))
+    agg_train = agg_train.dropna(subset=['C_ref'])
+    agg_crop = _metrics(agg_train['C_ref'].values, agg_train['C_pred_crop'].values)
 
-    print(f"[ml] LOYO aggregate — pixel R²={agg_pixel['r2']:.3f} "
+    print(f"[ml] LOYO aggregate (trainable only) — pixel R²={agg_pixel['r2']:.3f} "
           f"MAE={agg_pixel['mae']:.4f}  "
           f"group R²={agg_crop['r2']:.3f} MAE={agg_crop['mae']:.4f}")
 
-    # ---- Fit final model on ALL data ----------------------------------
-    print(f"[ml] Fitting final model on all {len(feats)} rows ...")
-    _weighted_fit(pipe_template, X, y, model_kind, sample_weights, seed=seed)
+    # ---- Fit final model on ALL TRAINABLE data ------------------------
+    trainable_idx = np.where(trainable_mask)[0]
+    print(f"[ml] Fitting final model on {len(trainable_idx)} trainable rows ...")
+    _weighted_fit(pipe_template, X, y, model_kind, sample_weights,
+                  trainable_idx, seed)
 
-    # Final-model in-sample predictions (operational model applied to training data)
+    # Final-model predictions on ALL rows (trainable + excluded)
     feats['C_pred_final'] = pipe_template.predict(X)
-    agg_final = (feats.groupby(join_cols, as_index=False)
-                      .agg(C_pred_final_crop=('C_pred_final', 'mean'),
-                           n_pixels=('C_pred_final', 'size'),
-                           C_ref=('C_ref', 'first')))
-    final_pixel = _metrics(y, feats['C_pred_final'].values)
+    feats_train = feats.loc[trainable_mask]
+    agg_final = (feats_train.groupby(join_cols, as_index=False)
+                            .agg(C_pred_final_crop=('C_pred_final', 'mean'),
+                                 n_pixels=('C_pred_final', 'size'),
+                                 C_ref=('C_ref', 'first')))
+    agg_final = agg_final.dropna(subset=['C_ref'])
+    final_pixel = _metrics(y[trainable_mask],
+                           feats.loc[trainable_mask, 'C_pred_final'].values)
     final_crop  = _metrics(agg_final['C_ref'].values,
                            agg_final['C_pred_final_crop'].values)
-    print(f"[ml] Final model (all years, in-sample) — "
+    print(f"[ml] Final model (trainable rows, in-sample) — "
           f"pixel R²={final_pixel['r2']:.3f} MAE={final_pixel['mae']:.4f}  "
           f"group R²={final_crop['r2']:.3f} MAE={final_crop['mae']:.4f}")
+
+    # Aggregate (for saving) — keeps all groups including excluded.
+    agg = (feats.groupby(join_cols, as_index=False)
+                .agg(C_pred_crop=('C_pred', 'mean'),
+                     n_pixels=('C_pred', 'size'),
+                     C_ref=('C_ref', 'first'),
+                     excluded=('excluded', 'any')))
 
     metrics = {
         'model_kind': model_kind,
@@ -726,6 +796,7 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                              for k, v in effective_params.items()},
         'stratified': stratified,
         'area_weight_loss': sample_weights is not None,
+        'n_excluded_rows': n_excl,
         'loyo_aggregate': {
             'pixel': agg_pixel,
             'crop_level': agg_crop,
@@ -740,7 +811,6 @@ def _run_loyo(feats, X, y, feature_columns, join_cols, ts_cols, extra,
     _save_outputs(feats, agg, metrics, pipe_template, model_kind,
                   effective_params, alpha_src, feature_columns, join_cols,
                   ts_cols, extra, stratified, n_steps, results_dir, 'loyo')
-
 
 # ---------------------------------------------------------------------------
 # Shared save/plot logic
@@ -761,7 +831,7 @@ def _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
     print(f"[ml] Model → {model_path}")
 
     feats.to_csv(os.path.join(results_dir, 'nn_training_features.csv'), index=False)
-    pixel_cols = ts_cols + extra + ['C_ref', 'C_pred', 'split']
+    pixel_cols = ts_cols + extra + ['C_ref', 'C_pred', 'split', 'excluded']
     if 'C_pred_final' in feats.columns:
         pixel_cols.append('C_pred_final')
     feats[pixel_cols].to_csv(
@@ -771,7 +841,13 @@ def _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
     with open(os.path.join(results_dir, 'nn_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
 
-    plot_crop_scatter(agg.dropna(subset=['C_ref', 'C_pred_crop']),
+    # Scatter is the headline diagnostic — show trainable groups only so the
+    # 1:1 line is meaningful. Excluded groups appear in the analyser's
+    # dedicated plots.
+    scatter_df = agg.dropna(subset=['C_ref', 'C_pred_crop'])
+    if 'excluded' in scatter_df.columns:
+        scatter_df = scatter_df.loc[~scatter_df['excluded']]
+    plot_crop_scatter(scatter_df,
                       os.path.join(results_dir, 'nn_scatter.png'), stratified)
 
     if model_kind == 'mlp':
