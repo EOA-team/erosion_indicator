@@ -95,10 +95,10 @@ from analyse_calibration_sample import (
 # Config
 # ===========================================================================
 CONFIG = {
-    'results_dir':              'calibration_analysis_mlp/',
-    'per_pixel_path':           'calibration_analysis_mlp/nn_predictions_per_pixel.csv',
-    'per_crop_path':            'calibration_analysis_mlp/nn_predictions_per_crop.csv',
-    'metrics_json_path':        'calibration_analysis_mlp/nn_metrics.json',
+    'results_dir':              'calibration_analysis_mlp_strat/',
+    'per_pixel_path':           'calibration_analysis_mlp_strat/nn_predictions_per_pixel.csv',
+    'per_crop_path':            'calibration_analysis_mlp_strat/nn_predictions_per_crop.csv',
+    'metrics_json_path':        'calibration_analysis_mlp_strat/nn_metrics.json',
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/'
                                 'LNF_code_classification_20260217.xlsx',
 
@@ -106,7 +106,7 @@ CONFIG = {
     # pooled), 'test' = honest generalisation only, 'train' = fit only.
     'analyse_split':            'all',
 
-    'min_n_per_crop':           10,
+    'min_n_per_crop':           1,
     # None → auto-detect (region + tillage columns present).
     'stratified_mode':          None, #group analysis by strata or crop
 }

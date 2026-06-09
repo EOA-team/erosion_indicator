@@ -21,6 +21,17 @@ low hundreds), not the number of pixel rows. Capacity should be sized against
 that. This script makes the train-vs-CV gap visible so you can see where extra
 capacity stops buying generalisation and starts buying memorisation.
 
+Mirroring the train split
+-------------------------
+If ``config['split_strategy'] == 'stratified'`` (the per-stratum parcel split
+used by ``train_cfactor_ml``), this script evaluates under the SAME geometry
+instead of GroupKFold: parcels (poly_id) are split within each stratum so every
+multi-parcel stratum is in both train and test, and single-parcel strata are
+pinned to train. ``cv_group`` is ignored in that mode. Note this no longer
+holds out whole strata, so the CV score then measures per-stratum *coverage*,
+not unseen-stratum generalisation — the train-vs-CV gap reading below does not
+apply in that mode.
+
 What it does
 ------------
 1. Assembles the per-pixel feature+target table via
@@ -80,7 +91,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import Ridge
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.model_selection import GroupKFold, cross_validate
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold, cross_validate
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error
 
@@ -252,7 +263,7 @@ def assemble_training_table(config: dict) -> tuple[pd.DataFrame, list[str], bool
 
 DEFAULT_TUNE_PARAMS = {
     'cv_group':   'stratum',     # 'crop' (lnf_code) or 'stratum' (crop×reg×till)
-    'n_splits':   5,
+    'n_splits':   2,
     'random_state': 42,
     'baselines':  True,
     # MLP architectures to compare — kept small on purpose; the effective
@@ -281,6 +292,53 @@ def _group_vector(feats: pd.DataFrame, cv_group: str, join_cols: list[str],
         return (feats[join_cols].astype(str)
                      .agg('|'.join, axis=1).values)
     return feats['lnf_code'].astype(str).values
+
+
+class StratifiedParcelKFold:
+    """CV splitter that mirrors ``train_cfactor_ml``'s 'stratified' split.
+
+    Parcels (``poly_id``) are the atomic unit, so no parcel — and therefore no
+    pixel — is split across the train/test boundary of a fold. Within each
+    stratum (the full ``join_cols`` key) parcels are distributed across folds
+    via :class:`sklearn.model_selection.StratifiedGroupKFold`, so every
+    multi-parcel stratum sits in BOTH the train and test side of the folds it
+    appears in (its label is always seen during fitting). Strata with fewer
+    than ``min_parcels`` parcels cannot be held out without vanishing from
+    training, so — exactly like the train script — they are pinned to TRAIN in
+    every fold and never appear in a test set.
+
+    Consequence: unlike ``GroupKFold`` grouped by crop/stratum, this does NOT
+    measure generalisation to UNSEEN strata. It measures the same thing the
+    train 'stratified' split measures (per-stratum coverage), so the
+    train-vs-CV gap reading elsewhere in this script does not apply here.
+    """
+
+    def __init__(self, n_splits, parcels, strata, seed=42, min_parcels=2):
+        self.n_splits = int(n_splits)
+        self.parcels = np.asarray(parcels)
+        self.strata = np.asarray(strata)
+        self.seed = int(seed)
+        self.min_parcels = int(min_parcels)
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
+    def split(self, X=None, y=None, groups=None):
+        n = len(self.parcels)
+        all_idx = np.arange(n)
+        n_parcels_per_stratum = (pd.DataFrame({'p': self.parcels, 's': self.strata})
+                                 .groupby('s')['p'].transform('nunique').values)
+        pinned_mask = n_parcels_per_stratum < self.min_parcels   # single-parcel → train-only
+        split_idx = all_idx[~pinned_mask]
+        pinned_idx = all_idx[pinned_mask]
+
+        sgkf = StratifiedGroupKFold(n_splits=self.n_splits, shuffle=True,
+                                    random_state=self.seed)
+        X_dummy = np.zeros((len(split_idx), 1))
+        for tr_rel, te_rel in sgkf.split(X_dummy, self.strata[~pinned_mask],
+                                         self.parcels[~pinned_mask]):
+            yield (np.concatenate([split_idx[tr_rel], pinned_idx]),
+                   split_idx[te_rel])
 
 
 def _group_mean_mae(estimator, X, y, groups) -> float:
@@ -414,16 +472,47 @@ def run_tuning(config: dict) -> None:
     feature_columns = get_feature_columns(feats)
     X = feats[feature_columns].values
     y = feats['C_ref'].values
-    groups = _group_vector(feats, tp['cv_group'], join_cols, stratified)
-    n_groups = len(np.unique(groups))
-    n_splits = int(min(tp['n_splits'], n_groups))
-    if n_splits < 2:
-        raise RuntimeError(f"Only {n_groups} CV group(s) for cv_group="
-                           f"'{tp['cv_group']}' — cannot cross-validate. "
-                           "Use more crops or cv_group='crop'.")
-    cv = GroupKFold(n_splits=n_splits)
-    print(f"[tune] {len(feats):,} rows, {n_groups} groups "
-          f"({tp['cv_group']}), {n_splits}-fold GroupKFold.")
+
+    # When train is configured for the per-stratum parcel split, mirror it here
+    # so tuning evaluates the same split geometry (rather than GroupKFold, which
+    # holds out whole strata). cv_group is ignored in this mode.
+    split_strategy = config.get('split_strategy', 'parcel')
+    if split_strategy == 'stratified':
+        groups = feats[join_cols].astype(str).agg('|'.join, axis=1).values
+        n_groups = len(np.unique(groups))
+        if 'poly_id' in feats.columns:
+            parcels = feats['poly_id'].astype(str).values
+        else:
+            print("[tune] WARNING: no 'poly_id' column — stratified CV falls "
+                  "back to pixel-level splitting (possible label leakage).")
+            parcels = np.arange(len(feats)).astype(str)
+        # only parcels in multi-parcel strata are test-eligible
+        npp = (pd.DataFrame({'p': parcels, 's': groups})
+               .groupby('s')['p'].transform('nunique').values)
+        n_test_parcels = int(pd.unique(parcels[npp >= 2]).size)
+        n_splits = int(min(tp['n_splits'], n_test_parcels))
+        if n_splits < 2:
+            raise RuntimeError(
+                f"Only {n_test_parcels} parcel(s) in multi-parcel strata — "
+                "cannot build a stratified parcel CV. Need >=2 strata with "
+                ">=2 parcels each, or set split_strategy != 'stratified'.")
+        cv = StratifiedParcelKFold(n_splits, parcels, groups, seed=seed)
+        print(f"[tune] {len(feats):,} rows, {n_groups} strata; stratified "
+              f"parcel {n_splits}-fold CV (mirrors train split_strategy="
+              "'stratified').")
+        print("[tune] NOTE: strata are NOT held out whole — this CV measures "
+              "per-stratum coverage, not unseen-stratum generalisation.")
+    else:
+        groups = _group_vector(feats, tp['cv_group'], join_cols, stratified)
+        n_groups = len(np.unique(groups))
+        n_splits = int(min(tp['n_splits'], n_groups))
+        if n_splits < 2:
+            raise RuntimeError(f"Only {n_groups} CV group(s) for cv_group="
+                               f"'{tp['cv_group']}' — cannot cross-validate. "
+                               "Use more crops or cv_group='crop'.")
+        cv = GroupKFold(n_splits=n_splits)
+        print(f"[tune] {len(feats):,} rows, {n_groups} groups "
+              f"({tp['cv_group']}), {n_splits}-fold GroupKFold.")
     print(f"[tune] Effective independent labels ≈ {n_groups}; sizing against that.")
 
     # ---- Sample weights (optional, mirrors β calibration) ----------------
@@ -515,6 +604,13 @@ def run_tuning(config: dict) -> None:
                               os.path.join(plot_dir, 'tune_model_comparison.png'))
 
     # ---- Best-config JSON + summary -----------------------------------
+    if split_strategy == 'stratified':
+        cv_label = f"stratified-parcel, {n_splits}-fold (mirrors train split)"
+        cv_group_field = 'stratified-parcel'
+    else:
+        cv_label = f"cv_group={tp['cv_group']}, {n_splits}-fold GroupKFold"
+        cv_group_field = tp['cv_group']
+
     best_params = {**DEFAULT_NN_PARAMS,
                    'hidden_layer_sizes': best['hidden'], 'alpha': best['alpha']}
     ridge_mae = baseline_df.loc[baseline_df['model'] == 'ridge',
@@ -531,7 +627,8 @@ def run_tuning(config: dict) -> None:
                        "capacity helps — adopt the selected config.")
 
     json.dump({
-        'cv_group': tp['cv_group'], 'n_groups': int(n_groups),
+        'split_strategy': split_strategy,
+        'cv_group': cv_group_field, 'n_groups': int(n_groups),
         'n_splits': n_splits,
         'area_weight_loss': sw is not None,
         'selected_nn_params': {k: (list(v) if isinstance(v, tuple) else v)
@@ -544,8 +641,7 @@ def run_tuning(config: dict) -> None:
 
     lines = [
         '=' * 70,
-        f'NN right-sizing / model selection  (cv_group={tp["cv_group"]}, '
-        f'{n_splits}-fold GroupKFold)',
+        f'NN right-sizing / model selection  ({cv_label})',
         '=' * 70,
         f'Rows                          : {len(feats):>10,}',
         f'Independent groups (≈ labels) : {n_groups:>10}',

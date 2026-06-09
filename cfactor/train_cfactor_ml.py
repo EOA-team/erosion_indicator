@@ -354,7 +354,7 @@ CONFIG: dict = {
     'model_kind':            'mlp',     # 'mlp' or 'ridge'
 
     # Where the tuner's JSON lives. If present, its alpha is used.
-    'tune_best_config_path': 'calibration_analysis_tune/tune_best_config.json',
+    'tune_best_config_path': 'calibration_analysis_tune_strat/tune_best_config.json',
 
     # Per-model overrides; if alpha is set here, the JSON is ignored.
     'model_params': {
@@ -363,17 +363,27 @@ CONFIG: dict = {
 
     # ---- Output ----
     # If the path contains '{model}', it is filled with model_kind.
-    'results_folder':        'calibration_analysis_{model}',
+    'results_folder':        'calibration_analysis_{model}_strat',
 
     # ---- Train/test split ----
     # split_strategy:
-    #   'parcel' — GroupShuffleSplit grouped by poly_id (default, original behaviour).
-    #              Fits one model, evaluates on the held-out parcels.
-    #   'loyo'   — Leave-One-Year-Out. Loops over all years: for each, trains on
-    #              the remaining years, predicts the held-out year. Reports per-year
-    #              and aggregate metrics. The saved model is fitted on ALL data.
-    'split_strategy':        'loyo',
-    'test_fraction':         0.3,        # only used when split_strategy='parcel'
+    #   'parcel'     — GroupShuffleSplit grouped by poly_id (original behaviour).
+    #                  Fits one model, evaluates on held-out parcels. Strata may
+    #                  land entirely in train OR test.
+    #   'stratified' — Per-stratum parcel holdout. Within each stratum (crop, or
+    #                  crop×region×tillage when stratified) parcels are split so
+    #                  EVERY stratum with >=2 parcels appears in both train and
+    #                  test. Single-parcel strata can't be split → all their rows
+    #                  go to TRAIN only (still learned from, never in the test
+    #                  set). Note: with broadcast labels a stratum's C_ref is then
+    #                  seen in both sets, so the test metric reflects coverage,
+    #                  not unseen-stratum generalisation.
+    #   'loyo'       — Leave-One-Year-Out. Loops over all years: for each, trains
+    #                  on the remaining years, predicts the held-out year.
+    #                  Reports per-year and aggregate metrics. The saved model is
+    #                  fitted on ALL data.
+    'split_strategy':        'stratified',
+    'test_fraction':         0.3,        # used by 'parcel' and 'stratified'
     'random_seed':           42,
 
     # ====================================================================
@@ -387,7 +397,7 @@ CONFIG: dict = {
     'manual_overrides_path':  None,
     'ts_cols':                ['lnf_code', 'yr', 'poly_id'],
     'crop_col':               'lnf_code',
-    'exclude_calibration_lnf_codes': [601, 602],
+    'exclude_calibration_lnf_codes': None, #[601, 602],
     'area_years':             None,
     'area_weight_loss':       True,       # weight training loss by Swiss arable area per stratum (mirrors β calibration)
 
@@ -532,8 +542,9 @@ def run_ml_training(config: dict) -> None:
         raise ValueError(f"model_kind must be 'mlp' or 'ridge', got {model_kind!r}.")
 
     strategy = config.get('split_strategy', 'parcel')
-    if strategy not in ('parcel', 'loyo'):
-        raise ValueError(f"Unknown split_strategy={strategy!r}; expected 'parcel' or 'loyo'.")
+    if strategy not in ('parcel', 'loyo', 'stratified'):
+        raise ValueError(f"Unknown split_strategy={strategy!r}; "
+                         "expected 'parcel', 'loyo' or 'stratified'.")
 
     results_dir = config.get('results_folder', 'calibration_analysis_{model}')
     results_dir = results_dir.replace('{model}', model_kind)
@@ -577,6 +588,11 @@ def run_ml_training(config: dict) -> None:
                   stratified, model_kind, pipe, effective_params, alpha_src,
                   n_steps, seed, json_path, model_params, results_dir, config,
                   sample_weights=sample_weights)
+    elif strategy == 'stratified':
+        _run_stratified(feats, X, y, feature_columns, join_cols, ts_cols, extra,
+                        stratified, model_kind, pipe, effective_params, alpha_src,
+                        n_steps, seed, results_dir, config,
+                        sample_weights=sample_weights)
     else:
         _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
                     stratified, model_kind, pipe, effective_params, alpha_src,
@@ -680,6 +696,131 @@ def _run_parcel(feats, X, y, feature_columns, join_cols, ts_cols, extra,
     _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
                   alpha_src, feature_columns, join_cols, ts_cols, extra,
                   stratified, n_steps, results_dir, 'parcel')
+
+
+# ---------------------------------------------------------------------------
+# Stratified holdout: every stratum represented in both train and test
+# ---------------------------------------------------------------------------
+def _stratified_parcel_split(feats, join_cols, test_fraction, seed,
+                             min_parcels=2):
+    """Split parcels (poly_id) into train/test *within each stratum*.
+
+    Every stratum (defined by ``join_cols`` — crop, or crop×region×tillage
+    when stratified) with at least ``min_parcels`` distinct parcels is put in
+    BOTH train and test (>=1 parcel each side, so no parcel — and therefore no
+    pixel — leaks across the split). Strata with fewer parcels cannot honour
+    "both sides", so all their rows go to TRAIN only (the model still learns
+    from them; they are simply never in the test set). Their positions are
+    also returned separately for reporting.
+
+    Returns (train_idx, test_idx, train_only_idx) as positional int arrays into
+    ``feats`` (which carries a RangeIndex after assemble_training_table).
+    ``train_only_idx`` is the single-parcel subset of ``train_idx``.
+    """
+    rng = np.random.default_rng(seed)
+    has_poly = 'poly_id' in feats.columns
+    trainable_pos = np.where((~feats['excluded']).values)[0]
+    sub = feats.iloc[trainable_pos]
+
+    train_idx, test_idx, train_only_idx = [], [], []
+    for _, g in sub.groupby(join_cols, sort=False):
+        pos = g.index.to_numpy()                    # == positional (RangeIndex)
+        parcels = g['poly_id'].to_numpy() if has_poly else pos
+        uniq = pd.unique(parcels)
+        if len(uniq) < min_parcels:
+            # Can't be on both sides → keep for training, exclude from test.
+            train_idx.extend(pos.tolist())
+            train_only_idx.extend(pos.tolist())
+            continue
+        shuffled = rng.permutation(uniq)
+        n_test = int(round(test_fraction * len(uniq)))
+        n_test = min(max(n_test, 1), len(uniq) - 1)  # guarantee >=1 each side
+        test_parcels = set(np.atleast_1d(shuffled[:n_test]).tolist())
+        is_test = np.fromiter((p in test_parcels for p in parcels),
+                              dtype=bool, count=len(parcels))
+        test_idx.extend(pos[is_test].tolist())
+        train_idx.extend(pos[~is_test].tolist())
+
+    return (np.array(train_idx,      dtype=int),
+            np.array(test_idx,       dtype=int),
+            np.array(train_only_idx, dtype=int))
+
+
+def _run_stratified(feats, X, y, feature_columns, join_cols, ts_cols, extra,
+                    stratified, model_kind, pipe, effective_params, alpha_src,
+                    n_steps, seed, results_dir, config, *,
+                    sample_weights=None):
+    test_fraction = float(config.get('test_fraction', 0.2))
+
+    train_idx, test_idx, train_only_idx = _stratified_parcel_split(
+        feats, join_cols, test_fraction, seed, min_parcels=2)
+
+    # Single-parcel strata can't be on both sides → they are train-only: still
+    # learned from, just never in the test set. They stay non-excluded so they
+    # count in the group-level metric and plot as 'train'.
+    n_strata_train_only = 0
+    if len(train_only_idx):
+        n_strata_train_only = (feats.loc[feats.index[train_only_idx], join_cols]
+                               .drop_duplicates().shape[0])
+
+    feats['split'] = 'excluded'
+    feats.loc[feats.index[train_idx], 'split'] = 'train'
+    feats.loc[feats.index[test_idx],  'split'] = 'test'
+
+    n_excl = int((feats['split'] == 'excluded').sum())
+    n_strata_split = feats.loc[~feats['excluded'], join_cols].drop_duplicates().shape[0]
+    print(f"[ml] Stratified split (per-stratum parcel holdout, "
+          f"{1 - test_fraction:.0%}/{test_fraction:.0%}): "
+          f"{len(train_idx)} train, {len(test_idx)} test rows across "
+          f"{n_strata_split} strata; "
+          f"{n_strata_train_only} single-parcel strata "
+          f"({len(train_only_idx)} rows) are train-only (no test pixels); "
+          f"{n_excl} excluded rows (config/missing-C_ref) predicted only.")
+
+    print(f"[ml] Training on {len(train_idx)} rows ...")
+    _weighted_fit(pipe, X, y, model_kind, sample_weights, train_idx, seed)
+    # Predict on ALL rows (train + test + excluded) so every stratum is covered.
+    feats['C_pred'] = pipe.predict(X)
+
+    metrics = {
+        'model_kind': model_kind,
+        'split_strategy': (f"stratified parcel-holdout "
+                           f"({1 - test_fraction:.0%}/{test_fraction:.0%}, per stratum)"),
+        'alpha_source': alpha_src,
+        'effective_params': {k: (list(v) if isinstance(v, tuple) else v)
+                             for k, v in effective_params.items()},
+        'stratified': stratified,
+        'area_weight_loss': sample_weights is not None,
+        'n_excluded_rows': n_excl,
+        'n_single_parcel_strata_train_only': int(n_strata_train_only),
+        'pixel_level': {
+            'train': _metrics(y[train_idx],
+                              feats.loc[feats['split'] == 'train', 'C_pred'].values),
+            'test':  _metrics(y[test_idx],
+                              feats.loc[feats['split'] == 'test',  'C_pred'].values),
+        },
+    }
+
+    agg = (feats.groupby(join_cols, as_index=False)
+                .agg(C_pred_crop=('C_pred', 'mean'),
+                     n_pixels=('C_pred', 'size'),
+                     C_ref=('C_ref', 'first'),
+                     excluded=('excluded', 'any')))
+    # Group-level metric over all non-excluded strata (now includes the
+    # train-only single-parcel strata); only config/missing-C_ref groups drop.
+    agg_train = agg.loc[~agg['excluded']].dropna(subset=['C_ref'])
+    metrics['crop_level'] = _metrics(agg_train['C_ref'].values,
+                                     agg_train['C_pred_crop'].values)
+    print(f"[ml] Pixel test  R²={metrics['pixel_level']['test']['r2']:.3f} "
+          f"MAE={metrics['pixel_level']['test']['mae']:.4f}")
+    print(f"[ml] Group level R²={metrics['crop_level']['r2']:.3f} "
+          f"MAE={metrics['crop_level']['mae']:.4f}  "
+          f"({int(agg['excluded'].sum())} config/missing-C_ref groups "
+          "carried for inference only)")
+
+    _save_outputs(feats, agg, metrics, pipe, model_kind, effective_params,
+                  alpha_src, feature_columns, join_cols, ts_cols, extra,
+                  stratified, n_steps, results_dir, 'stratified')
 
 
 # ---------------------------------------------------------------------------
