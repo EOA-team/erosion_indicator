@@ -12,17 +12,21 @@ side-by-side comparison of:
 
 The "fair" comparison assumed here
 ----------------------------------
-  - empirical: one β fit to all data. In-sample but cannot over-fit (1 DoF),
+  - empirical: one β fit to all data. In-sample but cannot over-fit (1-2 DoF),
     so in-sample MAE ≈ generalisation MAE.
-  - ML: trained with split_strategy='loyo'. Each row of nn_predictions_per_pixel.csv
-    is out-of-fold: the model never saw its year. This is an honest
-    generalisation estimate, slightly pessimistic vs the deployed all-years
-    final model. Set ml_predictions_source='final' to use the deployed
-    (in-sample) MLP predictions for a sanity check.
+  - ML: the per-pixel CSV's `split` column determines what each row is. For the
+    'stratified' / 'parcel' holdouts, `ml_predictions_source='test'` (default)
+    uses only the held-out test parcels — no parcel/pixel leakage, an honest
+    generalisation estimate that is slightly pessimistic vs the deployed model
+    (which trains on all parcels). For a 'loyo' run, set source='loyo' to use
+    the out-of-fold rows. Set source='final' to use the deployed in-sample MLP
+    predictions as an optimistic ceiling sanity check.
 
-Direction of the residual asymmetry: against the ML (LOYO underestimates the
-deployed model). So if ML wins under this comparison, deployed ML is at least
-as good as β. If they tie, ML is probably marginally better at deployment.
+Because the comparison inner-joins on (lnf_code, yr, poly_id), the common set
+reduces to the ML rows selected by `source` (e.g. the held-out test pixels), so
+β and ML are scored on exactly the same pixels and strata. The residual
+asymmetry runs against the ML: if ML wins here, deployed ML is at least as good
+as β; if they tie, ML is probably marginally better at deployment.
 
 Area weighting
 --------------
@@ -67,26 +71,27 @@ import matplotlib.pyplot as plt
 
 CONFIG = {
     # Inputs
-    'beta_per_pixel_path':      'calibration_analysis_noley/calibration_results_stratified_per_pixel.csv',
-    'beta_per_stratum_path':    'calibration_analysis_noley/calibration_results_stratified.csv',
-    'ml_per_pixel_path':        'calibration_analysis_mlp_loyo_noley/nn_predictions_per_pixel.csv',
+    'beta_per_pixel_path':      'calibration_analysis_twobeta_noley/calibration_results_stratified_per_pixel.csv',
+    'beta_per_stratum_path':    'calibration_analysis_twobeta_noley/calibration_results_stratified.csv',
+    'ml_per_pixel_path':        'calibration_analysis_mlp_strat_noley/nn_predictions_per_pixel.csv',
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/'
                                 'LNF_code_classification_20260217.xlsx',
 
     # Which ML predictions to use:
-    #   'auto'   -> LOYO OOF if split looks like years, else test split (parcel mode)
-    #   'test'   -> parcel-mode test rows only
-    #   'all'    -> all rows (parcel mode train+test pooled — optimistic, not honest)
-    #   'loyo'   -> all rows (LOYO mode; every row is OOF — recommended)
-    #   'final'  -> use C_pred_final column (LOYO deployed model in-sample —
-    #               optimistic, sanity-check only)
-    'ml_predictions_source':    'final',
+    #   'auto'   -> 'loyo' if split looks like years, else 'test' (holdout modes)
+    #   'test'   -> held-out test rows only (stratified/parcel holdout — default,
+    #               recommended; auto-drops 'excluded' config crops)
+    #   'all'    -> all rows (train+test pooled — optimistic, not honest)
+    #   'loyo'   -> all rows (LOYO mode; every row is OOF)
+    #   'final'  -> use C_pred_final column (deployed model in-sample —
+    #               optimistic, sanity-check only; written in LOYO mode)
+    'ml_predictions_source':    'test',
 
     # Output
-    'out_dir':                  'compare_Bnoley_MLloyonoley',
+    'out_dir':                  'compare',
 
     # Reporting knobs
-    'top_n_crops':              15,
+    'top_n_crops':              20,
     'min_n_pixels_per_stratum': 1,    # drop very small strata; 1 = no filter
 }
 
@@ -104,6 +109,31 @@ def load_beta_per_pixel(path: str) -> pd.DataFrame:
     return df.rename(columns={'C_predicted': 'C_pred_beta'})
 
 
+def _read_split_strategy(per_pixel_path: str) -> str:
+    """Read the precise split strategy from the sibling nn_metrics.json.
+
+    The per-pixel `split` column is {train,test,excluded} for BOTH the
+    'parcel' and 'stratified' holdouts, so the column alone can't tell them
+    apart. nn_metrics.json carries the exact 'split_strategy' string written
+    by the trainer; we map its leading word to a short mode tag for labels.
+    Falls back to a generic 'holdout' if the JSON is missing/unreadable.
+    """
+    metrics_path = os.path.join(os.path.dirname(per_pixel_path), 'nn_metrics.json')
+    try:
+        import json
+        with open(metrics_path) as f:
+            strat = str(json.load(f).get('split_strategy', '')).lower()
+    except Exception:
+        return 'holdout'
+    if strat.startswith('stratified'):
+        return 'stratified'
+    if strat.startswith('parcel'):
+        return 'parcel'
+    if strat.startswith('loyo'):
+        return 'loyo'
+    return 'holdout'
+
+
 def load_ml_per_pixel(path: str, source: str
                        ) -> tuple[pd.DataFrame, str, str]:
     """Return (df, split_mode, effective_source)."""
@@ -115,12 +145,16 @@ def load_ml_per_pixel(path: str, source: str
     if 'split' not in df.columns:
         df['split'] = 'all'
 
+    # 'excluded' (config-excluded crops / missing C_ref) is an inference-only
+    # tag present in every holdout mode; ignore it when classifying the split.
     vals = set(df['split'].dropna().astype(str).unique())
-    if vals <= {'train', 'test', 'all'}:
-        split_mode = 'parcel'
-    elif all(v.isdigit() and len(v) == 4 for v in vals):
+    non_excluded = vals - {'excluded'}
+    if non_excluded and all(v.isdigit() and len(v) == 4 for v in non_excluded):
         split_mode = 'loyo'
         df['split'] = df['split'].astype(str)
+    elif non_excluded <= {'train', 'test', 'all'}:
+        # parcel vs stratified holdout — disambiguate via nn_metrics.json.
+        split_mode = _read_split_strategy(path)
     else:
         split_mode = 'unknown'
 
@@ -144,6 +178,30 @@ def load_ml_per_pixel(path: str, source: str
         raise ValueError(f"Unknown ml_predictions_source={source!r}")
 
     return df_use, split_mode, source
+
+
+def ml_source_phrase(source: str, split_mode: str) -> str:
+    """Short phrase describing the ML predictions, for plot titles/legends."""
+    if source == 'final':
+        return 'final, in-sample'
+    if split_mode == 'loyo':
+        return 'LOYO OOF'
+    if split_mode in ('stratified', 'parcel', 'holdout'):
+        return 'held-out test'
+    return source
+
+
+def ml_eval_description(source: str, split_mode: str) -> str:
+    """One-line description of what the ML predictions represent."""
+    if source == 'final':
+        return 'final model, in-sample (optimistic ceiling)'
+    if split_mode == 'loyo':
+        return 'leave-one-year-out, out-of-fold (honest generalisation)'
+    if split_mode == 'stratified':
+        return 'held-out test parcels, per-stratum holdout (no leakage)'
+    if split_mode in ('parcel', 'holdout'):
+        return 'held-out test parcels (no leakage)'
+    return source
 
 
 def load_area_ha(beta_per_stratum_path: str) -> pd.DataFrame:
@@ -321,7 +379,7 @@ def plot_scatter_side_by_side(strata: pd.DataFrame, out: str, h: dict,
 
     panels = [
         (axes[0], 'mean_pred_beta', 'abs_bias_beta',
-         'Empirical (one β, in-sample)',
+         'Empirical (in-sample)',
          h['beta_stratum_mae'], h['beta_stratum_bias'], '#1f77b4'),
         (axes[1], 'mean_pred_ml',   'abs_bias_ml',
          f'ML ({ml_label})',
@@ -579,14 +637,14 @@ def plot_per_crop_bars(crops: pd.DataFrame, out: str, top_n: int) -> None:
     print(f"  saved {out}")
 
 
-def plot_per_year(per_yr: pd.DataFrame, out: str) -> None:
+def plot_per_year(per_yr: pd.DataFrame, out: str, ml_label: str = 'ML') -> None:
     if len(per_yr) < 2:
         return
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(per_yr['yr'], per_yr['beta_mae'], 'o-',
-            color='#1f77b4', label='β (in-sample, but 1 DoF ⇒ ≈ OOS)', lw=2)
+            color='#1f77b4', label='β (in-sample)', lw=2)
     ax.plot(per_yr['yr'], per_yr['ml_mae'], 's-',
-            color='#d62728', label='ML (LOYO OOF)', lw=2)
+            color='#d62728', label=ml_label, lw=2)
     ax.set_xlabel('Year'); ax.set_ylabel('Area-weighted stratum MAE')
     ax.set_title('Per-year stratum MAE — β vs ML')
     ax.legend(); plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
@@ -610,6 +668,7 @@ def write_summary(h: dict, strata: pd.DataFrame, crops: pd.DataFrame,
         'β vs ML comparison — stratum-level, area-weighted by crop',
         '=' * 72,
         f'ML source            : {effective_source}  (split_mode={split_mode})',
+        f'ML evaluation        : {ml_eval_description(effective_source, split_mode)}',
         f'n_pixels (common)    : {h["n_pixels"]:>10,}',
         f'n_strata (common)    : {h["n_strata"]:>10}',
         f'n_crops              : {h["n_crops"]:>10}',
@@ -651,23 +710,39 @@ def write_summary(h: dict, strata: pd.DataFrame, crops: pd.DataFrame,
                 bigs[cols].to_string(index=False, float_format='%.4f'),
             ]
 
+    if split_mode == 'loyo':
+        eval_note = (
+"- In LOYO mode every ML prediction is out-of-fold: the model never saw its\n"
+"  year. β predictions are in-sample but β has only 1-2 DoF, so its in-sample\n"
+"  MAE is approximately its generalisation MAE. The residual asymmetry: LOYO\n"
+"  ML slightly understates the deployed all-years model. Direction: against ML.")
+    elif effective_source == 'final':
+        eval_note = (
+"- ML predictions here are the FINAL model in-sample (source='final'): trained\n"
+"  on all trainable rows, so this flatters ML (an MLP can over-fit; β with 1-2\n"
+"  DoF cannot). Treat it as an optimistic ceiling, not the headline number.")
+    else:
+        eval_note = (
+"- ML predictions are on HELD-OUT test parcels (per-stratum holdout, no parcel\n"
+"  or pixel leakage). β predictions are in-sample but β has only 1-2 DoF, so its\n"
+"  in-sample MAE ≈ its generalisation MAE. The inner-join scores BOTH models on\n"
+"  the same held-out pixels per stratum. Mild asymmetry: the deployed ML is\n"
+"  trained on all parcels, so test-set ML slightly understates it (direction:\n"
+"  against ML). Single-parcel strata are train-only and absent from this set.")
+
     lines += [
         '',
         '=' * 72,
         'How to read this',
         '=' * 72,
-        """
+        f"""
 - The headline area-weighted stratum MAE is the operational number: for each
   stratum (crop x region x tillage), how far is the mean predicted C-factor
   from the tabulated C_ref, averaged with weights proportional to
   A_c × n_pixels_in_stratum / n_pixels_in_crop. Crops contribute proportional
   to their Swiss arable area.
 
-- In LOYO mode every ML prediction is out-of-fold: the model never saw its
-  year. β predictions are in-sample but β has only 1 DoF, so its in-sample MAE
-  is approximately its generalisation MAE. The residual asymmetry: LOYO ML
-  slightly understates the deployed all-years model's performance. Direction
-  of bias: against the ML.
+{eval_note}
 
 - If ML wins this comparison, deployed ML is at least as good as β. If they
   tie, ML is probably marginally better at deployment. If β wins, ML might
@@ -781,13 +856,15 @@ def run(cfg: dict) -> None:
 
     # ---- Plots ----
     print("Plots ...")
+    ml_phrase = ml_source_phrase(effective_source, split_mode)
     plot_scatter_side_by_side(strata, str(plot_dir / 'compare_scatter.png'),
-                               h, ml_label=effective_source)
+                               h, ml_label=ml_phrase)
     plot_paired_residuals(strata, str(plot_dir / 'compare_paired.png'))
     plot_per_crop_bars(crops, str(plot_dir / 'compare_per_crop_bars.png'),
                        cfg.get('top_n_crops', 15))
     if len(per_yr):
-        plot_per_year(per_yr, str(plot_dir / 'compare_per_year.png'))
+        plot_per_year(per_yr, str(plot_dir / 'compare_per_year.png'),
+                      ml_label=f'ML ({ml_phrase})')
 
     # ---- Summary ----
     write_summary(h, strata, crops, per_yr,
