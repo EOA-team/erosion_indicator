@@ -775,6 +775,427 @@ def sample_locations_with_field_agis(
     return
 
 
+# ===========================================================================
+# VERFAHREN (conservation-tillage) sampling.
+#
+# Augments the AGIS sample with fields whose soil-tillage method (VERFAHREN) is
+# known *per crop*, so the (crop, tillage) C-factor stratum can be assigned to a
+# polygon without the farm-year-level stochastic guess used elsewhere. Run
+# automatically by `run_sampling_pipeline` whenever sampling_strategy == 'agis'.
+#
+# The conservation-tillage file (`schonende_bodenbearbeitung.csv`, latin-1/';')
+# is at farm x year x tillage x crop level and contains ONLY conservation
+# tillage (Mulchsaat / Streifensaat / Direktsaat) — never Pflug. It can't see a
+# farm's full land use, so farm-composition rules are still evaluated on the
+# full AGIS table via `_agis_shortlist`; the file only attaches the per-crop
+# VERFAHREN. A farm-crop (betr_ID, Jahr, CODE_KULTUR) is kept only if it lists a
+# single VERFAHREN, giving every AGIS-clean polygon of that crop an unambiguous
+# tillage label.
+# ===========================================================================
+
+# VERFAHREN -> C-factor tillage stratum. Mirrors the (commented) mapping in
+# 05-Dataprep.R: Mulchsaat -> Mulch, Direktsaat | Streifensaat -> Direkt.
+# (The file never contains Pflug, so Pflug is not represented here.)
+VERFAHREN_TO_TILLAGE = {
+    'Mulchsaat':    'Mulch',
+    'Direktsaat':   'Direkt',
+    'Streifensaat': 'Direkt',
+}
+
+
+def _norm_id(s):
+    """Normalise a farm id to a clean integer-string so the AGIS<->VERFAHREN
+    merge is robust to int/float/str representations (e.g. 10000000.0 vs
+    10000000 vs '10000000')."""
+    num = pd.to_numeric(s, errors='coerce')
+    if num.notna().all():
+        return num.astype('Int64').astype(str)
+    return s.astype(str)  # non-numeric ids: keep verbatim
+
+
+def _read_verfahren_file(path, sheet_name=0):
+    """Read the conservation-tillage source, picking the reader by extension.
+
+    The canonical source is the CSV at
+    `.../Erosionsrisiko/schonende_bodenbearbeitung.csv` (latin-1, ';'-delimited),
+    which carries a real `betr_ID` column matching AGIS `tbl_nutzungsdaten`.
+    The `*_Kultur.xlsx` export is also supported but uses `BBS_ID`/`KT_ID_P`
+    instead, which do NOT match AGIS `betr_ID`.
+    """
+    path = os.path.expanduser(path)
+    if path.lower().endswith('.csv'):
+        return pd.read_csv(path, encoding='latin-1', delimiter=';')
+    return pd.read_excel(path, sheet_name=sheet_name)
+
+
+def build_verfahren_lookup(
+    verfahren_path,
+    sheet_name=0,
+    betr_id_col='betr_ID',
+    verfahren_to_tillage=VERFAHREN_TO_TILLAGE,
+    uniqueness_on='verfahren',
+):
+    """Read the conservation-tillage file and return one clean row per farm-crop.
+
+    Parameters
+    ----------
+    verfahren_path : str
+        Path to the conservation-tillage source. `.csv` -> read latin-1 / ';'
+        (the canonical `schonende_bodenbearbeitung.csv`); anything else ->
+        read_excel.
+    betr_id_col : str
+        Column to use as the farm key (renamed to `betr_ID`). Defaults to
+        'betr_ID' (present in the CSV and matching AGIS `betr_ID`). For the
+        `*_Kultur.xlsx` export use 'BBS_ID' or 'KT_ID_P' — but note neither was
+        found to match AGIS `betr_ID`.
+    uniqueness_on : {'verfahren', 'tillage_class'}
+        Which column the "exactly one per farm-crop" test is applied to.
+        'verfahren' (default) is the literal rule: a farm-crop is dropped if it
+        lists more than one raw VERFAHREN. 'tillage_class' is more permissive
+        (e.g. a farm-crop with both Direktsaat and Streifensaat collapses to a
+        single 'Direkt' and is kept).
+
+    Returns
+    -------
+    DataFrame with columns: betr_ID (str), Jahr (int), kulturcode (int),
+        verfahren (str), tillage_class (str).
+        One row per kept (betr_ID, Jahr, kulturcode).
+    """
+    df = _read_verfahren_file(verfahren_path, sheet_name=sheet_name)
+
+    required = {betr_id_col, 'JAHR', 'VERFAHREN', 'CODE_KULTUR'}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"VERFAHREN file is missing columns {missing}. "
+                       f"Found: {df.columns.tolist()}")
+
+    df = df.rename(columns={
+        betr_id_col:   'betr_ID',
+        'JAHR':        'Jahr',
+        'CODE_KULTUR': 'kulturcode',
+        'VERFAHREN':   'verfahren',
+    })
+
+    # Normalise key dtypes for the later merge against the AGIS shortlist.
+    df['betr_ID']    = _norm_id(df['betr_ID'])
+    df['Jahr']       = df['Jahr'].astype(int)
+    df['kulturcode'] = pd.to_numeric(df['kulturcode'], errors='coerce').astype('Int64')
+
+    # Map VERFAHREN -> tillage stratum; flag anything unmapped instead of
+    # silently dropping it.
+    df['tillage_class'] = df['verfahren'].map(verfahren_to_tillage)
+    unmapped = df.loc[df['tillage_class'].isna(), 'verfahren'].unique().tolist()
+    if unmapped:
+        raise ValueError(
+            f"Unmapped VERFAHREN value(s): {unmapped}. "
+            f"Add them to verfahren_to_tillage."
+        )
+
+    # One row per (farm, crop) listing distinct tillage info.
+    by_crop = (
+        df.groupby(['betr_ID', 'Jahr', 'kulturcode'], as_index=False)
+          .agg(verfahren=('verfahren',      lambda s: sorted(set(s))),
+               tillage_class=('tillage_class', lambda s: sorted(set(s))))
+    )
+    by_crop['n_verfahren']     = by_crop['verfahren'].apply(len)
+    by_crop['n_tillage_class'] = by_crop['tillage_class'].apply(len)
+
+    if uniqueness_on == 'verfahren':
+        clean = by_crop[by_crop['n_verfahren'] == 1].copy()
+    elif uniqueness_on == 'tillage_class':
+        clean = by_crop[by_crop['n_tillage_class'] == 1].copy()
+    else:
+        raise ValueError("uniqueness_on must be 'verfahren' or 'tillage_class'")
+
+    # Unpack the single-element lists back to scalars.
+    clean['verfahren']     = clean['verfahren'].str[0]
+    clean['tillage_class'] = clean['tillage_class'].str[0]
+    clean = clean[['betr_ID', 'Jahr', 'kulturcode', 'verfahren', 'tillage_class']]
+
+    n_drop = len(by_crop) - len(clean)
+    print(f"VERFAHREN lookup: {len(clean)} clean farm-crops kept, "
+          f"{n_drop} dropped for ambiguous tillage "
+          f"(uniqueness on '{uniqueness_on}').")
+    return clean.reset_index(drop=True)
+
+
+def sample_locations_with_field_verfahren(
+    lnf_dir,
+    nutzung_csv,
+    lnf_mapping_csv,
+    lnf_labels_path,
+    verfahren_path,
+    tot_samples,
+    save_path,
+    arable_codes,
+    grass_codes_for_shares,
+    yrs,
+    rules=('single_crop_farm', 'grassland_plus_one', 'dominant_crop'),
+    grass_min_share=0.50,
+    arable_min_share=0.02,
+    other_max_share=0.10,
+    dominant_share=0.80,
+    betr_id_col='betr_ID',
+    uniqueness_on='verfahren',
+    stratify_cols=('lnf_code', 'tillage_class'),
+    target_crs=32632,
+    seed=42,
+    lnf_id_col_by_year=None,
+    analogy_to_main=None,
+    combine_with=None,
+):
+    """AGIS-clean fields, enriched with a per-crop VERFAHREN, then point-sampled.
+
+    Pipeline
+    --------
+    1. Build the AGIS shortlist of clean arable fields (full-farm composition
+       rules) via `_agis_shortlist`, on TRUE crop codes (analogy_to_main=None
+       inside the shortlist) so `kulturcode` joins cleanly to CODE_KULTUR in the
+       VERFAHREN file.
+    2. Build the per-farm-crop VERFAHREN lookup and INNER-join it onto the
+       shortlist on (betr_ID, Jahr, kulturcode). Only fields that are both
+       AGIS-clean AND have a single VERFAHREN survive.
+    3. Per year: join the surviving shortlist onto LNF geometries via the LNF
+       field-id column (uuid <=2022, identifikator_be >=2023), fold analogy
+       crops into their main code (`analogy_to_main`; true code kept in
+       `orig_lnf_code`), and sample one point per field, area-weighted, without
+       replacement, capped per stratum.
+
+    Sampling budget
+    ---------------
+    `tot_samples` is split evenly across years and across the strata defined by
+    `stratify_cols`. Default stratification is (lnf_code, tillage_class) so the
+    (under-represented) Direkt fields are not crowded out by Mulch within a
+    crop. Set `stratify_cols=('lnf_code',)` to match the AGIS sampler's
+    crop-only budgeting exactly. With folding on, the budget is computed on the
+    folded `lnf_code` so pooled crops share one per-stratum budget.
+
+    Notes
+    -----
+    - Arable only: the conservation-tillage file is an arable concept, so no
+      grassland is drawn here (grassland is handled by the AGIS/random sampler).
+      `grass_codes_for_shares` is still needed so the AGIS rules can compute
+      farm-level grassland shares.
+    - `betr_ID` is assumed to share the same id space as LNF `betriebsnummer`
+      and AGIS `betr_ID`. The actual LNF join is on the field id (uuid), so this
+      assumption only affects the shortlist <-> VERFAHREN merge.
+    """
+    stratify_cols = list(stratify_cols)
+    # Analogy folding ({analogy_code: main_code}) is applied *after* the
+    # VERFAHREN join (which must use true CODE_KULTUR codes), mirroring the AGIS
+    # sampler: `lnf_code` is relabelled to the main crop, the true code is kept
+    # in `orig_lnf_code`. Budgeting (n_strata below) also uses the folded code so
+    # pooled crops share one per-stratum budget.
+    analogy_to_main = dict(analogy_to_main or {})
+
+    default_id_col_by_year = {
+        2019: 'uuid', 2020: 'uuid', 2021: 'uuid', 2022: 'uuid',
+        2023: 'identifikator_be', 2024: 'identifikator_be', 2025: 'identifikator_be',
+    }
+    if lnf_id_col_by_year:
+        default_id_col_by_year.update(lnf_id_col_by_year)
+    lnf_id_col_by_year = default_id_col_by_year
+
+    # --- 1. AGIS shortlist (full-farm rules), true crop codes, no folding ---
+    shortlist = _agis_shortlist(
+        nutzung_csv=nutzung_csv,
+        lnf_mapping_csv=lnf_mapping_csv,
+        lnf_labels_path=lnf_labels_path,
+        yrs=yrs,
+        top_arable_codes=arable_codes,
+        grassland_codes=grass_codes_for_shares,
+        rules=rules,
+        grass_min_share=grass_min_share,
+        arable_min_share=arable_min_share,
+        other_max_share=other_max_share,
+        dominant_share=dominant_share,
+        analogy_to_main=None,
+    )
+    shortlist['Flaechen_ID'] = shortlist['Flaechen_ID'].astype(str)
+    shortlist['betr_ID']     = _norm_id(shortlist['betr_ID'])
+    shortlist['Jahr']        = shortlist['Jahr'].astype(int)
+    shortlist['kulturcode']  = pd.to_numeric(shortlist['kulturcode'],
+                                             errors='coerce').astype('Int64')
+
+    # --- 2. attach per-crop VERFAHREN; keep only unambiguous-tillage fields ---
+    verf = build_verfahren_lookup(
+        verfahren_path,
+        betr_id_col=betr_id_col,
+        uniqueness_on=uniqueness_on,
+    )
+    n_before = len(shortlist)
+    shortlist = shortlist.merge(
+        verf, on=['betr_ID', 'Jahr', 'kulturcode'], how='inner'
+    )
+    print(f"After VERFAHREN join: {len(shortlist)} / {n_before} AGIS-clean "
+          f"fields also have a single known VERFAHREN "
+          f"(across {shortlist['kulturcode'].nunique()} crops, "
+          f"{shortlist['Jahr'].nunique()} years).")
+    if shortlist.empty:
+        raise RuntimeError(
+            "No fields are both AGIS-clean and VERFAHREN-unambiguous. "
+            "Check that betr_id_col matches AGIS betr_ID and that the year "
+            "ranges overlap."
+        )
+
+    # --- budget: even split across years and strata present in the shortlist --
+    lnf_files = sorted(f for f in os.listdir(lnf_dir) if f.endswith('.gpkg'))
+    lnf_files = [f for f in lnf_files
+                 if yrs[0] <= int(f.split('lnf')[-1].split('.gpkg')[0]) <= yrs[-1]]
+    n_years = max(len(lnf_files), 1)
+
+    # strata are defined post-join; for budgeting we need the lnf_code/tillage
+    # combos that actually exist. `lnf_code` mirrors the shortlist `kulturcode`.
+    strat_for_budget = shortlist.rename(columns={'kulturcode': 'lnf_code'})
+    if analogy_to_main:
+        strat_for_budget['lnf_code'] = strat_for_budget['lnf_code'].replace(analogy_to_main)
+    n_strata = max(strat_for_budget[stratify_cols].drop_duplicates().shape[0], 1)
+    samples_per_year   = int(np.floor(tot_samples / n_years))
+    samples_per_stratum = int(np.floor(samples_per_year / n_strata))
+    print(f"Target: {tot_samples} total -> {samples_per_year}/year, "
+          f"{samples_per_stratum}/stratum/year over {n_strata} strata "
+          f"({stratify_cols}); area-weighted, no replacement, capped.")
+
+    # --- 3. per-year LNF join + point draw ---
+    all_samples = []
+    for lnf_yr in lnf_files:
+        yr = int(lnf_yr.split('lnf')[-1].split('.gpkg')[0])
+        clean_yr = shortlist[shortlist['Jahr'] == yr][
+            ['Flaechen_ID', 'betr_ID', 'kulturcode', 'verfahren', 'tillage_class']
+        ]
+        if clean_yr.empty:
+            continue
+
+        lnf = gpd.read_file(os.path.join(lnf_dir, lnf_yr))
+        # de-dup duplicated geometries (some LNF years have them)
+        lnf['geom_wkb'] = lnf.geometry.to_wkb()
+        lnf = lnf.drop_duplicates(subset=['lnf_code', 'geom_wkb']).drop(columns='geom_wkb')
+        lnf = lnf[lnf.lnf_code.isin(arable_codes)]
+        lnf['poly_id'] = lnf.index
+        if not len(lnf):
+            continue
+
+        # resolve the field-id column for this year (schema changed in 2023)
+        expected = lnf_id_col_by_year.get(yr)
+        if expected is None:
+            raise KeyError(
+                f"[{yr}] No LNF id column configured. Extend lnf_id_col_by_year "
+                f"with {{{yr}: '<colname>'}}. Columns: {lnf.columns.tolist()}"
+            )
+        cand = {c.strip().lower(): c for c in lnf.columns}
+        if expected.lower() not in cand:
+            raise KeyError(
+                f"[{yr}] Expected LNF id column '{expected}' not in {lnf_yr}. "
+                f"Columns: {lnf.columns.tolist()}."
+            )
+        id_col = cand[expected.lower()]
+        if id_col != 'uuid':
+            lnf = lnf.rename(columns={id_col: 'uuid'})
+        lnf['uuid'] = lnf['uuid'].astype(str)
+
+        lnf_keep = lnf.merge(
+            clean_yr.rename(columns={'Flaechen_ID': 'uuid'}),
+            on='uuid', how='inner'
+        )
+        if not len(lnf_keep):
+            continue
+
+        # AGIS crop vs LNF crop sanity check (true codes on both sides)
+        mism = lnf_keep[lnf_keep['lnf_code'] != lnf_keep['kulturcode']]
+        if len(mism):
+            print(f"  [{yr}] {len(mism)} fields with AGIS kulturcode != LNF "
+                  f"lnf_code — keeping LNF code")
+        lnf_keep = lnf_keep.drop(columns='kulturcode')
+        lnf_keep['orig_lnf_code'] = lnf_keep['lnf_code']
+        # Fold analogy crops into their main crop (true code kept above).
+        if analogy_to_main:
+            n_relabel = lnf_keep['lnf_code'].isin(analogy_to_main).sum()
+            if n_relabel:
+                lnf_keep['lnf_code'] = lnf_keep['lnf_code'].replace(analogy_to_main)
+                print(f"  [{yr}] folded {n_relabel} analogy field(s) into main crops")
+        lnf_keep = gpd.GeoDataFrame(lnf_keep, geometry='geometry', crs=lnf.crs)
+
+        print(f"  [{yr}] LNF universe {len(lnf)} -> after AGIS+VERFAHREN join: "
+              f"{len(lnf_keep)} fields")
+
+        seed += 1
+        # draw per (lnf_code, tillage_class) stratum
+        for strat_vals, grp in lnf_keep.groupby(stratify_cols):
+            grp = grp.to_crs(target_crs)
+            n_target = min(samples_per_stratum, len(grp))
+            if n_target == 0:
+                continue
+            if n_target < samples_per_stratum:
+                print(f"  [{yr}] stratum {strat_vals}: requested "
+                      f"{samples_per_stratum}, only {len(grp)} fields — using all")
+
+            sampled = grp.sample(n=n_target, weights=grp.area,
+                                 replace=False, random_state=seed)
+
+            buffered = sampled.copy()
+            buffered['geometry'] = buffered.geometry.buffer(-10)
+            buffered = buffered[~buffered.geometry.is_empty]
+            buffered = buffered[buffered.geometry.notnull()]
+            if not len(buffered):
+                continue
+            buffered['orig_idx'] = buffered.index
+
+            keep_cols = ['orig_idx', 'poly_id', 'lnf_code', 'orig_lnf_code',
+                         'uuid', 'betr_ID', 'verfahren', 'tillage_class',
+                         'geometry']
+            keep_cols = [c for c in keep_cols if c in buffered.columns]
+
+            pts = buffered.sample_points(1, random_state=seed).explode(index_parts=False)
+            pts = gpd.GeoDataFrame(pts, geometry='sampled_points', crs=target_crs) \
+                     .rename(columns={'sampled_points': 'point_geom'})
+            pts['orig_idx'] = pts.index
+            pts = pts.merge(buffered[keep_cols], on='orig_idx', how='left')
+            pts = pts.rename(columns={'geometry': 'polygon_geom'}).drop(columns='orig_idx')
+
+            pts['x'] = pts.point_geom.x
+            pts['y'] = pts.point_geom.y
+            pts['yr'] = str(yr)
+            all_samples.append(pts)
+
+    if not all_samples:
+        raise RuntimeError("VERFAHREN sampling produced no samples.")
+
+    samples = gpd.GeoDataFrame(pd.concat(all_samples, ignore_index=True),
+                               geometry='point_geom', crs=target_crs)
+    print(f"VERFAHREN-sampled fields: {len(samples)} "
+          f"across {samples['lnf_code'].nunique()} crops, "
+          f"{samples['yr'].nunique()} years, "
+          f"tillage: {samples['tillage_class'].value_counts().to_dict()}")
+
+    # Optionally ADD these onto an existing AGIS sample (additive, not the
+    # intersection). The two sets are unioned; where the same field-year
+    # (uuid, yr) appears in both, the VERFAHREN row wins because it carries the
+    # known tillage label. AGIS-only rows keep verfahren/tillage_class = NaN.
+    if combine_with is not None:
+        agis = pd.read_pickle(os.path.expanduser(combine_with))
+        agis = gpd.GeoDataFrame(agis, geometry='point_geom', crs=samples.crs) \
+            if not isinstance(agis, gpd.GeoDataFrame) else agis.to_crs(samples.crs)
+        for col in ('verfahren', 'tillage_class'):
+            if col not in agis.columns:
+                agis[col] = np.nan
+        agis['_src'], samples['_src'] = 'agis', 'verfahren'
+        combined = pd.concat([agis, samples], ignore_index=True)
+        # Prefer the VERFAHREN row on (uuid, yr) collisions (sort so it's last).
+        if 'uuid' in combined.columns:
+            combined = combined.sort_values('_src')  # 'agis' < 'verfahren'
+            has_id = combined['uuid'].notna()
+            dedup = combined[has_id].drop_duplicates(subset=['uuid', 'yr'], keep='last')
+            combined = pd.concat([dedup, combined[~has_id]], ignore_index=True)
+        combined = combined.drop(columns='_src')
+        samples = gpd.GeoDataFrame(combined, geometry='point_geom', crs=samples.crs)
+        n_known = samples['tillage_class'].notna().sum()
+        print(f"Combined with AGIS sample '{combine_with}': {len(samples)} total "
+              f"field-years ({n_known} with a known VERFAHREN).")
+
+    samples.to_pickle(save_path)
+    return samples
+
+
 def snap_to_grid(x, y, ds):
 
     res = abs(ds.rename({'lat':'y', 'lon':'x'}).rio.resolution()[0])
@@ -914,7 +1335,8 @@ def extract_s2_data_field(save_path_sampledloc, s2_grid_path, s2_dir, soil_dir, 
         df_s2_sampled["poly_id"] = poly_df.iloc[0]["poly_id"]
         # Propagate AGIS identifiers (NaN for grass polys / random-sampling
         # mode where they don't exist) so calibrate_cfactor can stratify.
-        for opt in ("uuid", "betr_ID"):
+        # `tillage_class` is the known VERFAHREN tillage (NaN otherwise).
+        for opt in ("uuid", "betr_ID", "tillage_class"):
             df_s2_sampled[opt] = poly_df.iloc[0][opt] if opt in poly_df.columns else np.nan
 
         # Extract soil data for the polygon
@@ -1054,7 +1476,7 @@ def extract_precomputed_fc_field(save_path_sampledloc, s2_grid_path, fc_dir, s2_
         df_fc["lnf_code"] = poly_df.iloc[0]["lnf_code"]
         df_fc["yr"] = yr
         df_fc["poly_id"] = poly_id
-        for opt in ("uuid", "betr_ID"):
+        for opt in ("uuid", "betr_ID", "tillage_class"):
             df_fc[opt] = poly_df.iloc[0][opt] if opt in poly_df.columns else np.nan
 
         # ---- Soil group (same logic as extract_s2_data_field) ----
@@ -2224,6 +2646,40 @@ def run_sampling_pipeline(config: dict) -> None:
                 lnf_id_col_by_year=config.get('lnf_id_col_by_year'),
                 analogy_to_main=analogy_to_main,
             )
+            # AGIS sampling ALWAYS augments with VERFAHREN (known-tillage)
+            # fields: the conservation-tillage sampler runs and its fields are
+            # unioned onto the AGIS sample just written (de-duped on (uuid, yr);
+            # VERFAHREN rows win so the known tillage survives). Same crop
+            # grouping via `analogy_to_main`. The known `tillage_class` flows to
+            # the gapfilled parquet and is consumed by stratified calibration.
+            print("Augmenting AGIS sample with VERFAHREN (known-tillage) fields ...")
+            sample_locations_with_field_verfahren(
+                lnf_dir=lnf_dir,
+                nutzung_csv=os.path.expanduser(config['nutzung_csv']),
+                lnf_mapping_csv=os.path.expanduser(config['lnf_mapping_csv']),
+                lnf_labels_path=lnf_labels_path,
+                verfahren_path=os.path.expanduser(config['verfahren_path']),
+                tot_samples=config.get('verfahren_tot_samples', config['tot_samples']),
+                save_path=samples_path,
+                arable_codes=arable_codes,          # already includes analogy codes
+                grass_codes_for_shares=grass_codes_for_shares,
+                yrs=config.get('verfahren_years', yrs),
+                rules=tuple(config.get('agis_rules',
+                                       ('single_crop_farm',
+                                        'grassland_plus_one',
+                                        'dominant_crop'))),
+                grass_min_share=config.get('agis_grass_min_share',  0.50),
+                arable_min_share=config.get('agis_arable_min_share', 0.02),
+                other_max_share=config.get('agis_other_max_share',   0.10),
+                dominant_share=config.get('agis_dominant_share',     0.80),
+                betr_id_col=config.get('verfahren_betr_id_col', 'betr_ID'),
+                uniqueness_on=config.get('verfahren_uniqueness_on', 'verfahren'),
+                stratify_cols=tuple(config.get('verfahren_stratify_cols',
+                                               ('lnf_code', 'tillage_class'))),
+                lnf_id_col_by_year=config.get('lnf_id_col_by_year'),
+                analogy_to_main=analogy_to_main,
+                combine_with=samples_path,          # read AGIS set, write union back
+            )
         else:
             raise ValueError(
                 f"Unknown sampling_strategy={strategy!r}. Use 'random' or 'agis'."
@@ -2292,10 +2748,13 @@ def run_sampling_pipeline(config: dict) -> None:
 
     # De-duplicate overlapping satellite pixels
     group_cols = ['poly_id', 'x', 'y', 'time', 'yr', 'sampled_x', 'sampled_y', 'lnf_code', 'is_sample_pixel']
-    # Stash AGIS identifiers (`uuid`, `betr_ID`) before the groupby — they're
-    # non-numeric strings, so `numeric_only=True` drops them. They're constant
-    # per (poly_id, yr), so we can join them back after aggregation.
-    id_cols = [c for c in ('uuid', 'betr_ID') if c in df_clean_filtered.columns]
+    # Stash AGIS identifiers (`uuid`, `betr_ID`) and the known VERFAHREN tillage
+    # (`tillage_class`) before the groupby — they're non-numeric strings, so
+    # `numeric_only=True` drops them. They're constant per (poly_id, yr), so we
+    # can join them back after aggregation. `tillage_class` reaches the gapfilled
+    # parquet this way and is consumed (then dropped) by calibration's stratum
+    # assignment; it is NaN for non-VERFAHREN field-years.
+    id_cols = [c for c in ('uuid', 'betr_ID', 'tillage_class') if c in df_clean_filtered.columns]
     if id_cols:
         ids_clean   = (df_clean_filtered[['poly_id', 'yr'] + id_cols]
                        .drop_duplicates(subset=['poly_id', 'yr']))
