@@ -57,9 +57,9 @@ DROP_FRACTION_THRESHOLD = 0.7
 MAX_GAP_DAYS = 15
 
 # Input files
-SAMPLES_PATH = 'samples.pkl'
-FC_RAW_PATH = 'samples_data_pred.pkl'
-GAPFILLED_PATH = 'samples_data_gpr.parquet'
+SAMPLES_PATH = 'samplesv2.pkl'
+FC_RAW_PATH = 'samples_data_predv2.pkl'
+GAPFILLED_PATH = 'samples_data_gprv2.parquet'
 LNF_LABELS_PATH = os.path.expanduser(
     '~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx'
 )
@@ -67,7 +67,7 @@ LNF_LABELS_PATH = os.path.expanduser(
 # Cross-validation
 N_CV_FIELDS = 100
 
-OUT_DIR = 'sample_analysis'
+OUT_DIR = 'sample_analysisv2'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
