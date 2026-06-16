@@ -633,7 +633,9 @@ def plot_per_crop_bars(crops: pd.DataFrame, out: str, top_n: int) -> None:
                  f'β wins {n_b}, tie {n_t}',
                  y=0.995, fontsize=10, alpha=0.7)
 
-    plt.tight_layout(); plt.savefig(out, dpi=150); plt.close()
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches='tight', pad_inches=0.2)
+    plt.close()
     print(f"  saved {out}")
 
 
