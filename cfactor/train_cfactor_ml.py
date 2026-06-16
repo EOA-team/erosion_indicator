@@ -354,7 +354,7 @@ CONFIG: dict = {
     'model_kind':            'mlp',     # 'mlp' or 'ridge'
 
     # Where the tuner's JSON lives. If present, its alpha is used.
-    'tune_best_config_path': 'calibration_analysis_tune_strat/tune_best_config.json',
+    'tune_best_config_path': 'calibration_analysis_tune_strat_noley/tune_best_config.json',
 
     # Per-model overrides; if alpha is set here, the JSON is ignored.
     'model_params': {
@@ -363,7 +363,7 @@ CONFIG: dict = {
 
     # ---- Output ----
     # If the path contains '{model}', it is filled with model_kind.
-    'results_folder':        'calibration_analysis_{model}_strat',
+    'results_folder':        'calibration_analysis_{model}_strat_noley',
 
     # ---- Train/test split ----
     # split_strategy:
@@ -390,14 +390,14 @@ CONFIG: dict = {
     # Data paths and pipeline knobs (copy values from your main.py CONFIG)
     # ====================================================================
     'stratified_calibration': True,
-    'gapfilled_fc_path':      'samples_data_gpr.parquet',
+    'gapfilled_fc_path':      'samples_data_gprv2.parquet',
     'ei_path':                '../erosivity_index/predictions/grid_EI_daily_avg_pred_20260424_nn3.parquet',
     'c_factor_table_path':    '~/mnt/Data-Labo-RE/27_Natural_Resources-RE/321.4_WAUM_protected/Daten/Erosionsrisiko/C_Faktoren.csv',
     'lnf_classification_path':'~/mnt/eo-nas1/data/landuse/documentation/LNF_code_classification_20260217.xlsx',
     'manual_overrides_path':  None,
     'ts_cols':                ['lnf_code', 'yr', 'poly_id'],
     'crop_col':               'lnf_code',
-    'exclude_calibration_lnf_codes': None, #[601, 602],
+    'exclude_calibration_lnf_codes': [601, 602],
     'area_years':             None,
     'area_weight_loss':       True,       # weight training loss by Swiss arable area per stratum (mirrors β calibration)
 
