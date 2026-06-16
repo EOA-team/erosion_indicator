@@ -97,7 +97,7 @@ import matplotlib.pyplot as plt
 # Default config — edit paths to your environment.
 # ===========================================================================
 CONFIG = {
-    'results_dir':              'calibration_analysis_single_noley',
+    'results_dir':              'calibration_analysis_twobeta_noley',
     'per_pixel_path':           'calibration_results_stratified_per_pixel.csv',
     'per_crop_path':            'calibration_results_stratified.csv',
     'c_factor_table_path':      'C_Faktoren.csv',
@@ -106,8 +106,8 @@ CONFIG = {
 
     # Optional — gives you per-quality-flag diagnostics. Same parquet the
     # calibration consumed.
-    'gapfilled_fc_path':        'samples_data_gpr.parquet',
-    'min_n_per_crop':           10,   # crops with fewer pixels are downweighted
+    'gapfilled_fc_path':        'samples_data_gprv2.parquet',
+    'min_n_per_crop':           1,   # crops with fewer pixels are downweighted
                                        # in the strengths/weaknesses scatter
 
     # Stratified mode: None → auto-detect from per-pixel CSV columns

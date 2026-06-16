@@ -95,10 +95,10 @@ from analyse_calibration_sample import (
 # Config
 # ===========================================================================
 CONFIG = {
-    'results_dir':              'calibration_analysis_mlp_strat/',
-    'per_pixel_path':           'calibration_analysis_mlp_strat/nn_predictions_per_pixel.csv',
-    'per_crop_path':            'calibration_analysis_mlp_strat/nn_predictions_per_crop.csv',
-    'metrics_json_path':        'calibration_analysis_mlp_strat/nn_metrics.json',
+    'results_dir':              'calibration_analysis_mlp_strat_noley/',
+    'per_pixel_path':           'calibration_analysis_mlp_strat_noley/nn_predictions_per_pixel.csv',
+    'per_crop_path':            'calibration_analysis_mlp_strat_noley/nn_predictions_per_crop.csv',
+    'metrics_json_path':        'calibration_analysis_mlp_strat_noley/nn_metrics.json',
     'lnf_classification_path':  '~/mnt/eo-nas1/data/landuse/documentation/'
                                 'LNF_code_classification_20260217.xlsx',
 
