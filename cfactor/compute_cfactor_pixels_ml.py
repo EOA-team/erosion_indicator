@@ -137,7 +137,7 @@ CONFIG = {
     # ---- EI join (training-faithful default) ----
     # False: snap raw x/y to EI grid (== train_cfactor_ml.join_ei_to_fc).
     # True : apply x-5, y+5 before snapping (== compute_cfactor_pixels).
-    "ei_half_pixel_shift": False,
+    "ei_half_pixel_shift": True,
 
     # ---- Output ----
     "write_geotiff":       False,
