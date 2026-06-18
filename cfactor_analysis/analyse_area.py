@@ -1,27 +1,29 @@
 """
 Area analysis for the Seeland district — 2021 vs 2022.
-
+ 
 Produces figures and summary statistics characterising the study area:
   1. Climate (MeteoSwiss: rainfall, temperature, sunshine)
   2. Crop distribution (from LNF gpkg)
-  3. Tillage distribution (from REB / Schonende Bodenbearbeitung)
-  4. Reference C-factor landscape (C_Faktoren.csv × crop/tillage/region mix)
+  3. Tillage distribution — two variants: real arable area (LNF + conservation
+     CSV) and Bodenbearbeitung as reported in the erosion-risk results
+  4. Reported C-factor landscape (from per-farm × crop erosion-risk results)
   5. Rainfall erosivity (EI)
   6. Sentinel-2 data quality (from pixel-level outputs)
-
+  7. Erosion risk — potential & P-combined (stats, plots, municipality maps)
+ 
 Usage:
-    python area_analysis.py
-    python area_analysis.py --skip-meteo   # skip slow MeteoSwiss loading
-    python area_analysis.py --skip-s2      # skip pixel-output quality section
+    python analyse_area.py
+    python analyse_area.py --skip-meteo   # skip slow MeteoSwiss loading
+    python analyse_area.py --skip-s2      # skip pixel-output quality section
 """
 from __future__ import annotations
-
+ 
 import argparse
 import os
 import sys
 import warnings
 from pathlib import Path
-
+ 
 import geopandas as gpd
 import matplotlib
 matplotlib.use("Agg")
@@ -32,20 +34,20 @@ import pandas as pd
 import rasterio
 from rasterio.mask import mask as rio_mask
 import xarray as xr
-
+ 
 warnings.filterwarnings("ignore")
-
+ 
 # ---------------------------------------------------------------------------
 # Configuration — EDIT PATHS HERE
 # ---------------------------------------------------------------------------
-
+ 
 CONFIG = {
     # Region boundary (passed to compute_cfactor_pixels.py --region)
     "region_path":      "../cfactor/seeland.gpkg",  # adjust if different
-
+ 
     # LNF land-use polygons (one gpkg per year — used for elevation + ref C)
     "lnf_dir":          "~/mnt/eo-nas1/data/landuse/raw",
-
+ 
     # Crop1990 raster predictions (wall-to-wall crop map per year)
     "crop_raster_pattern": "~/mnt/eo-nas1/eoa-share/projects/020_crop1990/"
                            "Crop1990/storage/CDL_Sentinel/predictions/"
@@ -53,92 +55,111 @@ CONFIG = {
     "crop_colors_path":    "~/mnt/eo-nas1/eoa-share/projects/020_crop1990/"
                            "Crop1990/storage/CDL_Sentinel/predictions/"
                            "crop1990_colors.txt.txt",
-
+ 
     # LNF classification spreadsheet (Crop_Label bridges crop1990 ↔ lnf_code)
     "lnf_labels_path":  "~/mnt/eo-nas1/eoa-share/projects/020_crop1990/"
                         "data/LNF_code_classification_20260217.xlsx",
-
+ 
     # Crop name mapping (kulturcode <-> Kultur_nutzung)
     "kulturmapping_csv": "~/mnt/Data-Labo-RE/27_Natural_Resources-RE/"
                          "321.4_WAUM_protected/Daten/Core_Snapshot/"
                          "Agrarbericht_2025/tbl_kulturmapping.csv",
-
-    # C-factor reference table
+ 
+    # C-factor reference table (no longer used for Section 4; kept for reference)
     "c_factor_csv":     "~/mnt/Data-Labo-RE/27_Natural_Resources-RE/"
                         "321.4_WAUM_protected/Daten/Erosionsrisiko/C_Faktoren.csv",
-
+ 
+    # Previously reported erosion-risk results (per farm × crop), one folder per
+    # year. Section 4 auto-picks the most recent
+    #   *_Kultur_Betrieb_Erosionsrisiko_2x2_{year}.csv  in each {year}/ folder.
+    # NB: the O:\ drive maps to ~/mnt/Data-Labo-Cert here — adjust if your mount
+    # differs.
+    "erosion_results_dir": "~/mnt/Data-Labo-RE/27_Natural_Resources-RE/"
+                           "321.4_WAUM_protected/Resultate/Erosionsrisiko",
+ 
     # Conservation tillage (canonical CSV with real betr_ID matching LNF
     # betriebsnummer). Keyed on betr_ID + JAHR + CODE_KULTUR.
     "tillage_csv":      "~/mnt/Data-Labo-RE/27_Natural_Resources-RE/"
                         "321.4_WAUM_protected/Daten/Erosionsrisiko/"
                         "schonende_bodenbearbeitung.csv",
-
+ 
     # Nutzungsdaten (field-level: Flaechen_ID, betr_ID, swissALTI3D, Kultur_nutzung)
     "nutzung_csv":      "~/mnt/Data-Labo-RE/27_Natural_Resources-RE/"
                         "321.4_WAUM_protected/Daten/Core_Snapshot/"
                         "Agrarbericht_2025/tbl_nutzungsdaten.csv",
-
+ 
     # Swiss canton boundaries (swissBOUNDARIES3D or similar — set None to use naturalearth)
     "canton_boundaries_path": None,
-
+ 
+    # Municipality (Gemeinde) boundaries for the erosion-risk choropleth maps.
+    # Must contain a name field matching the 'Gemeinde' column of the result
+    # files. Set to None to skip the maps (stats/plots are still produced).
+    "gemeinde_boundaries_path": "~/mnt/eo-nas1/eoa-share/projects/028_Erosion/"
+                                "Erosion/FC_mapping/swissBOUNDARIES3D_1_5_LV95_LN02.gpkg",
+    "gemeinde_name_field":      "name",
+ 
+    # Erosion-risk threshold (t ha⁻¹ y⁻¹) used to report the "share of area at
+    # risk" in the potential / P-risk section. Adjust to your tolerated soil loss.
+    "erosion_risk_threshold_t_ha_y": 2.0,
+ 
     # REB table (farm-level tillage for all years)
     "reb_csv":          "~/mnt/Data-Labo-RE/27_Natural_Resources-RE/"
                         "321.4_WAUM_protected/Daten/Core_Snapshot/"
                         "Agrarbericht_2025/tbl_ressourceneffizienzbeitrag.csv",
-
+ 
     # MeteoSwiss gridded data (zarr, same tiling as S2)
     # Pattern: {meteo_base}/{var}/MeteoSwiss_{var}D_{minx}_{maxy}_{year}0101_{year}1231.zarr
     "meteo_base":       "~/mnt/eo-nas1/data/meteo",
     "meteo_vars":       ["RhiresD", "TabsD", "SrelD"],  # rainfall, T_mean, sunshine
-
+ 
     # Climatological EI (erosivity index)
     "ei_path":          "../erosivity_index/predictions/"
                         "grid_EI_daily_avg_pred_20260424_nn3.parquet",
-
+ 
     # S2 tile grid (to discover which tiles overlap the region)
     "s2_grid_path":     "~/mnt/eo-nas1/eoa-share/projects/"
                         "012_EO_dataInfrastructure/Project layers/"
                         "gridface_s2tiles_CH.shp",
     "s2_dir":           "~/mnt/eo-nas1/data/satellite/sentinel2/raw/CH",
-
+ 
     # Pixel-level C-factor outputs from compute_cfactor_pixels.py
     "pixel_output_dir": "../cfactor/output/cfactor_pixels",
-
+ 
     # Altitude threshold for Tal/Berg classification
     "grenze_tal_berg":  600,
-
+ 
     # Years to analyse
     "years":            [2021, 2022],
-
+ 
     # Output
     "out_dir":          "figures",
 }
-
+ 
 TILE_SIZE_M = 1280  # same as in compute_cfactor_pixels.py
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
+ 
 def _expand(p: str) -> str:
     return os.path.expanduser(p)
-
-
+ 
+ 
 def _ensure_dir(d: str):
     os.makedirs(d, exist_ok=True)
-
-
+ 
+ 
 def load_region(cfg: dict) -> gpd.GeoDataFrame:
     """Load the region boundary and return in EPSG:2056 + EPSG:32632."""
     region = gpd.read_file(_expand(cfg["region_path"]))
     return region
-
-
+ 
+ 
 def region_bounds_32632(region: gpd.GeoDataFrame) -> tuple:
     return tuple(region.to_crs("EPSG:32632").total_bounds)
-
-
+ 
+ 
 def discover_meteo_tiles(cfg: dict, region: gpd.GeoDataFrame) -> list[tuple[int, int]]:
     """Find (minx, maxy) tile keys overlapping the region, using the S2 grid."""
     grid = gpd.read_file(_expand(cfg["s2_grid_path"]))
@@ -146,23 +167,23 @@ def discover_meteo_tiles(cfg: dict, region: gpd.GeoDataFrame) -> list[tuple[int,
     hits = grid[grid.intersects(region_crs.union_all())]
     # The grid has 'left' and 'top' columns matching the tile naming
     return list(zip(hits["left"].astype(int), hits["top"].astype(int)))
-
-
+ 
+ 
 def savefig(fig, name: str, cfg: dict, dpi: int = 180):
     _ensure_dir(cfg["out_dir"])
     path = os.path.join(cfg["out_dir"], name)
     fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"  Saved {path}")
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Crop1990 raster helpers
 # ---------------------------------------------------------------------------
-
+ 
 def load_crop1990_labels(cfg: dict) -> dict[int, dict]:
     """Parse crop1990_colors.txt.txt → {code: {name, rgb}}.
-
+ 
     Format: ``code R G B label_with_spaces``  (space-separated, 1-indexed)
     """
     path = _expand(cfg["crop_colors_path"])
@@ -183,19 +204,19 @@ def load_crop1990_labels(cfg: dict) -> dict[int, dict]:
                 name = " ".join(parts[4:])
             labels[code] = {"name": name, "rgb": (r, g, b)}
     return labels
-
-
+ 
+ 
 def load_crop_raster(year: int, region: gpd.GeoDataFrame,
                      cfg: dict) -> tuple[np.ndarray, dict, float]:
     """Load the crop1990 prediction raster clipped to the region.
-
+ 
     Returns (data_2d, transform_meta, pixel_area_m2).
     ``data_2d`` contains crop1990 class codes; 0 / nodata = outside region.
     """
     path = _expand(cfg["crop_raster_pattern"].format(year=year))
     if not os.path.exists(path):
         raise FileNotFoundError(f"Crop raster not found: {path}")
-
+ 
     with rasterio.open(path) as src:
         region_reproj = region.to_crs(src.crs)
         geoms = region_reproj.geometry.values
@@ -209,11 +230,11 @@ def load_crop_raster(year: int, region: gpd.GeoDataFrame,
             "width": out_image.shape[1],
         }
     return out_image, meta, pixel_area
-
-
+ 
+ 
 def crop1990_to_lnf_bridge(cfg: dict) -> pd.DataFrame:
     """Build a bridge: crop1990 label name → list of lnf_codes.
-
+d
     Uses `Crop_Label` in the LNF classification Excel to link the two systems.
     Returns DataFrame with columns [crop_label, lnf_code, Crop_Label_lv3].
     """
@@ -223,24 +244,24 @@ def crop1990_to_lnf_bridge(cfg: dict) -> pd.DataFrame:
         columns={"LNF_code": "lnf_code", "Crop_Label": "crop_label"})
     df = df.dropna(subset=["crop_label"])
     return df
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Shared style
 # ---------------------------------------------------------------------------
-
+ 
 YEAR_COLORS = {2021: "#4477AA", 2022: "#CC6677"}
 YEAR_LABELS = {2021: "2021", 2022: "2022"}
-
-
+ 
+ 
 def _year_color(yr: int) -> str:
     return YEAR_COLORS.get(yr, "#999999")
-
-
+ 
+ 
 # ===========================================================================
 # Section 0 — Study area overview
 # ===========================================================================
-
+ 
 def _load_swiss_outline() -> gpd.GeoDataFrame | None:
     """Try to load a Switzerland country outline for the context map."""
     # Option 1: naturalearth via geopandas (bundled low-res)
@@ -264,22 +285,22 @@ def _load_swiss_outline() -> gpd.GeoDataFrame | None:
     except Exception:
         pass
     return None
-
-
+ 
+ 
 def _load_canton_boundaries(cfg: dict) -> gpd.GeoDataFrame | None:
     """Load canton boundaries if a path is configured."""
     path = cfg.get("canton_boundaries_path")
     if path and os.path.exists(_expand(path)):
         return gpd.read_file(_expand(path))
     return None
-
-
+ 
+ 
 def _plot_switzerland_context(ax, region: gpd.GeoDataFrame, cfg: dict):
     """Plot the region within Switzerland, with a web-tile basemap if available."""
     region_3857 = region.to_crs("EPSG:3857")
     region_2056 = region.to_crs("EPSG:2056")
     centroid = region_2056.union_all().centroid
-
+ 
     # Try a contextily basemap (needs internet + the package)
     basemap_ok = False
     try:
@@ -302,7 +323,7 @@ def _plot_switzerland_context(ax, region: gpd.GeoDataFrame, cfg: dict):
     except Exception as e:
         print(f"  [INFO] contextily basemap unavailable ({type(e).__name__}); "
               f"using vector outline")
-
+ 
     if not basemap_ok:
         # Fallback: plain Swiss outline in EPSG:2056
         ch = _load_swiss_outline()
@@ -328,43 +349,48 @@ def _plot_switzerland_context(ax, region: gpd.GeoDataFrame, cfg: dict):
         ax.tick_params(labelsize=7)
         ax.set_xlabel("E (m)", fontsize=8)
         ax.set_ylabel("N (m)", fontsize=8)
-
+ 
     ax.set_aspect("equal")
     ax.set_title("Seeland district in Switzerland", fontsize=11)
-
-
+ 
+ 
 def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
     """Produce the study-area overview: context map, crop raster, elevation."""
     print("\n=== Section 0: Study area overview ===")
     region_2056 = region.to_crs("EPSG:2056")
     area_km2 = region_2056.union_all().area / 1e6
     print(f"  Region area: {area_km2:.1f} km²")
-
-    # --- Load crop raster for the first year ---
-    yr0 = cfg["years"][0]
+ 
+    # --- Crop labels + crop1990 -> lv3 bridge (year-independent) ---
     crop_labels = load_crop1990_labels(cfg)
-    try:
-        crop_data, crop_meta, pix_area = load_crop_raster(yr0, region, cfg)
-        print(f"  Crop raster ({yr0}): {crop_data.shape}, "
-              f"pixel = {pix_area:.0f} m², "
-              f"{np.count_nonzero(crop_data)} classified pixels")
-    except FileNotFoundError as e:
-        print(f"  [WARN] {e}")
-        crop_data = None
+    bridge = crop1990_to_lnf_bridge(cfg)
+    label_to_lv3 = (bridge.drop_duplicates("crop_label")
+                    .set_index("crop_label")["Crop_Label_lv3"].to_dict())
+    code_to_name = {c: v["name"] for c, v in crop_labels.items()}
+    code_to_lv3 = {c: label_to_lv3.get(v["name"], "Other")
+                   for c, v in crop_labels.items()}
 
-    # --- Area stats from the raster ---
+    # --- Load crop rasters for every configured year ---
+    crop_rasters = {}  # year -> (data, meta, pix_area)
+    for yr in cfg["years"]:
+        try:
+            data, meta, pix_area = load_crop_raster(yr, region, cfg)
+            crop_rasters[yr] = (data, meta, pix_area)
+            print(f"  Crop raster ({yr}): {data.shape}, "
+                  f"pixel = {pix_area:.0f} m², "
+                  f"{np.count_nonzero(data)} classified pixels")
+        except FileNotFoundError as e:
+            print(f"  [WARN] {e}")
+
+    # --- Area stats from the first year's raster (drives the lv3 panel) ---
+    yr0 = cfg["years"][0]
     total_ag_ha = 0
     lv3_summary = {}
-    if crop_data is not None:
-        bridge = crop1990_to_lnf_bridge(cfg)
-        # crop1990 code → Crop_Label_lv3 (take most common lv3 per crop label)
-        label_to_lv3 = (bridge.drop_duplicates("crop_label")
-                        .set_index("crop_label")["Crop_Label_lv3"].to_dict())
-        code_to_name = {c: v["name"] for c, v in crop_labels.items()}
-        code_to_lv3 = {c: label_to_lv3.get(v["name"], "Other")
-                       for c, v in crop_labels.items()}
-
-        codes, counts = np.unique(crop_data[crop_data > 0], return_counts=True)
+    n_crop_types = 0
+    arable_ha = grassland_ha = 0
+    if yr0 in crop_rasters:
+        data, _, pix_area = crop_rasters[yr0]
+        codes, counts = np.unique(data[data > 0], return_counts=True)
         for code, cnt in zip(codes, counts):
             ha = cnt * pix_area / 1e4
             lv3 = code_to_lv3.get(int(code), "Other")
@@ -373,7 +399,7 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
         n_crop_types = len(codes)
         arable_ha = lv3_summary.get("Arable Land", 0)
         grassland_ha = lv3_summary.get("Grassland", 0)
-        print(f"  Classified area: {total_ag_ha:.0f} ha, "
+        print(f"  Classified area ({yr0}): {total_ag_ha:.0f} ha, "
               f"{n_crop_types} crop types")
         for cat in sorted(lv3_summary, key=lv3_summary.get, reverse=True):
             print(f"    {cat}: {lv3_summary[cat]:.0f} ha "
@@ -382,15 +408,19 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
     # --- Elevation stats from tbl_nutzungsdaten + LNF gpkg ---
     elev_stats = _elevation_stats(cfg, region)
 
-    # --- Figure: 3-panel overview ---
-    #   (1) Switzerland context with basemap
-    #   (2) per-crop map
-    #   (3) lv3 (arable / grassland / permanent / ...) classification
-    fig = plt.figure(figsize=(16, 5.5))
-    fig = plt.figure(figsize=(16, 6.5))
-    ax_ch = fig.add_axes([0.02, 0.20, 0.27, 0.72])
-    ax_crop = fig.add_axes([0.34, 0.20, 0.30, 0.72])
-    ax_lv3 = fig.add_axes([0.68, 0.20, 0.30, 0.72])
+    # --- Figure: 2x2 overview ---
+    #   row 1: (CH context)         (lv3 arable / grassland / other map)
+    #   row 2: (crop map year 1)    (crop map year 2)
+    from matplotlib.patches import Patch
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 12.5))
+    ax_ch = axes[0, 0]
+    ax_lv3 = axes[0, 1]
+    crop_years = cfg["years"][:2]
+    crop_axes = {yr: axes[1, i] for i, yr in enumerate(crop_years)}
+    # Hide any unused bottom-row cell (if only one year configured)
+    for j in range(len(crop_years), 2):
+        axes[1, j].set_visible(False)
 
     lv3_rgb = {
         "Arable Land":                (232, 197, 71),
@@ -400,66 +430,28 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
         "Other":                      (189, 189, 189),
     }
 
-    # ---- Panel 1: Switzerland context map with basemap ----
+    # ---- Panel (0,0): Switzerland context map ----
     _plot_switzerland_context(ax_ch, region, cfg)
 
-    # ---- Panel 2: per-crop map ----
-    region_2056.boundary.plot(ax=ax_crop, color="#333333", linewidth=1.2,
-                              linestyle="--", zorder=5)
-    if crop_data is not None:
-        tf = crop_meta["transform"]
-        h, w = crop_data.shape
-        extent = [tf.c, tf.c + tf.a * w, tf.f + tf.e * h, tf.f]
-
-        # per-crop RGB
-        rgb_crop = np.ones((h, w, 3), dtype=np.uint8) * 255
-        for code, info in crop_labels.items():
-            mask = crop_data == code
-            if mask.any():
-                rgb_crop[mask] = info["rgb"]
-        ax_crop.imshow(rgb_crop, extent=extent, origin="upper",
-                       interpolation="nearest")
-
-        # Compact legend: top crops by area, restricted to Arable Land /
-        # Grassland classes (skip forest, built-up, water, etc.)
-        from matplotlib.patches import Patch
-        crop_lv3 = {"Arable Land", "Grassland"}
-        codes, counts = np.unique(crop_data[crop_data > 0], return_counts=True)
-        order = np.argsort(counts)[::-1]
-        top_handles = []
-        for i in order:
-            code = int(codes[i])
-            if code not in crop_labels:
-                continue
-            if code_to_lv3.get(code) not in crop_lv3:
-                continue
-            top_handles.append(
-                Patch(facecolor=np.array(crop_labels[code]["rgb"]) / 255,
-                      label=code_to_name.get(code, str(code))))
-            if len(top_handles) >= 12:
-                break
-        ax_crop.legend(handles=top_handles, loc="upper center",
-                       bbox_to_anchor=(0.5, -0.12), fontsize=6,
-                       framealpha=0.9, title="Top crops", title_fontsize=7,
-                       ncol=3, columnspacing=1.0, handletextpad=0.4)
-    ax_crop.set_aspect("equal")
-    ax_crop.set_title(f"Crop map ({yr0})", fontsize=11)
-
-    # ---- Panel 3: lv3 classification ----
+    # ---- Panel (0,1): lv3 classification (year yr0) ----
     region_2056.boundary.plot(ax=ax_lv3, color="#333333", linewidth=1.2,
                               linestyle="--", zorder=5)
-    if crop_data is not None:
+    if yr0 in crop_rasters:
+        data, meta, _ = crop_rasters[yr0]
+        tf = meta["transform"]
+        h, w = data.shape
+        extent_lv3 = [tf.c, tf.c + tf.a * w, tf.f + tf.e * h, tf.f]
+
         rgb_lv3 = np.ones((h, w, 3), dtype=np.uint8) * 255
         for code in crop_labels:
-            mask = crop_data == code
+            mask = data == code
             if not mask.any():
                 continue
             lv3 = code_to_lv3.get(code, "Other")
             rgb_lv3[mask] = lv3_rgb.get(lv3, lv3_rgb["Other"])
-        ax_lv3.imshow(rgb_lv3, extent=extent, origin="upper",
+        ax_lv3.imshow(rgb_lv3, extent=extent_lv3, origin="upper",
                       interpolation="nearest")
 
-        from matplotlib.patches import Patch
         lv3_handles = [
             Patch(facecolor=np.array(c) / 255,
                   label=f"{cat} ({lv3_summary.get(cat, 0):.0f} ha)")
@@ -471,21 +463,71 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
     ax_lv3.set_aspect("equal")
     ax_lv3.set_title(f"Land-use classification ({yr0})", fontsize=11)
 
-    # Shared axis formatting for the two zoom panels
-    for ax in (ax_crop, ax_lv3):
+    # ---- Panels (1, *): per-crop maps, one per year ----
+    for yr, ax_crop in crop_axes.items():
+        region_2056.boundary.plot(ax=ax_crop, color="#333333", linewidth=1.2,
+                                  linestyle="--", zorder=5)
+        if yr in crop_rasters:
+            data, meta, _ = crop_rasters[yr]
+            tf = meta["transform"]
+            h, w = data.shape
+            extent = [tf.c, tf.c + tf.a * w, tf.f + tf.e * h, tf.f]
+            rgb_crop = np.ones((h, w, 3), dtype=np.uint8) * 255
+            for code, info in crop_labels.items():
+                mask = data == code
+                if mask.any():
+                    rgb_crop[mask] = info["rgb"]
+            ax_crop.imshow(rgb_crop, extent=extent, origin="upper",
+                           interpolation="nearest")
+        ax_crop.set_aspect("equal")
+        ax_crop.set_title(f"Crop map ({yr})", fontsize=11)
+
+    # Shared axis formatting for all Seeland-zoom panels
+    for ax in (ax_lv3, *crop_axes.values()):
         ax.tick_params(labelsize=7)
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(
             lambda x, _: f"{x / 1e3:.0f}"))
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(
             lambda x, _: f"{x / 1e3:.0f}"))
-    # crop panel x-label omitted (legend sits below it); lv3 keeps it
-    ax_lv3.set_xlabel("E (km)", fontsize=8)
-    ax_crop.set_ylabel("N (km)", fontsize=8)
+    for ax in crop_axes.values():
+        ax.set_xlabel("E (km)", fontsize=8)
+    if crop_axes:
+        list(crop_axes.values())[0].set_ylabel("N (km)", fontsize=8)
+    ax_lv3.set_ylabel("N (km)", fontsize=8)
+
+    # --- Shared crop legend: top crops by area combined across all years,
+    # restricted to Arable Land / Grassland classes ---
+    if crop_rasters:
+        crop_lv3 = {"Arable Land", "Grassland"}
+        combined_counts: dict[int, int] = {}
+        for yr, (data, _, _) in crop_rasters.items():
+            codes, counts = np.unique(data[data > 0], return_counts=True)
+            for c, n in zip(codes, counts):
+                combined_counts[int(c)] = combined_counts.get(int(c), 0) + int(n)
+        ordered = sorted(combined_counts.items(), key=lambda kv: kv[1],
+                         reverse=True)
+        top_handles = []
+        for code, _ in ordered:
+            if code not in crop_labels:
+                continue
+            if code_to_lv3.get(code) not in crop_lv3:
+                continue
+            top_handles.append(
+                Patch(facecolor=np.array(crop_labels[code]["rgb"]) / 255,
+                      label=code_to_name.get(code, str(code))))
+            if len(top_handles) >= 12:
+                break
+        if top_handles:
+            fig.legend(handles=top_handles, loc="lower center",
+                       bbox_to_anchor=(0.5, 0.0), fontsize=7,
+                       framealpha=0.9, title="Top crops (combined across years)",
+                       title_fontsize=8, ncol=6, columnspacing=1.2,
+                       handletextpad=0.5)
 
     # --- Text box with key stats (on the lv3 panel) ---
     stats_text = f"District area: {area_km2:.0f} km²"
     if total_ag_ha > 0:
-        stats_text += f"\nClassified agric. land: {total_ag_ha:.0f} ha"
+        stats_text += f"\nClassified agric. land ({yr0}): {total_ag_ha:.0f} ha"
         stats_text += f"\n  Arable: {arable_ha:.0f} ha"
         stats_text += f"\n  Grassland: {grassland_ha:.0f} ha"
         stats_text += f"\n  Crop types: {n_crop_types}"
@@ -500,8 +542,11 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
                 bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
                           alpha=0.85, edgecolor="#CCCCCC"))
 
+    # Leave room at the bottom for the shared legend
+    fig.subplots_adjust(left=0.05, right=0.97, top=0.95, bottom=0.10,
+                        wspace=0.18, hspace=0.18)
     savefig(fig, "study_area_overview.png", cfg)
-
+ 
     # --- Elevation histogram ---
     if elev_stats is not None and "values" in elev_stats:
         fig_e, ax_e = plt.subplots(figsize=(7, 3.5))
@@ -515,33 +560,33 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
         ax_e.legend(fontsize=9)
         ax_e.grid(axis="y", alpha=0.3)
         savefig(fig_e, "elevation_distribution.png", cfg)
-
+ 
     return {"area_km2": area_km2, "elev_stats": elev_stats}
-
-
+ 
+ 
 def _elevation_stats(cfg: dict, region: gpd.GeoDataFrame) -> dict | None:
     """Get elevation stats for fields in the region.
-
+ 
     Loads the LNF gpkg to get Flaechen_IDs, then joins with tbl_nutzungsdaten.
     """
     nutzung_path = _expand(cfg.get("nutzung_csv", ""))
     if not os.path.exists(nutzung_path):
         print("  [WARN] tbl_nutzungsdaten not found — skipping elevation stats")
         return None
-
+ 
     yr = cfg["years"][0]
-
+ 
     # Load LNF gpkg to get field IDs within the region
     lnf_path = os.path.join(_expand(cfg["lnf_dir"]), f"lnf{yr}.gpkg")
     if not os.path.exists(lnf_path):
         print(f"  [WARN] {lnf_path} not found — skipping elevation stats")
         return None
-
+ 
     print(f"  Loading LNF gpkg for elevation join ...")
     lnf = gpd.read_file(lnf_path, bbox=tuple(region.to_crs("EPSG:2056").total_bounds))
     region_2056 = region.to_crs(lnf.crs).union_all()
     lnf = lnf[lnf.intersects(region_2056)]
-
+ 
     # Identify the field ID column (uuid for ≤2022, identifikator_be for ≥2023)
     if "uuid" in lnf.columns:
         field_ids = set(lnf["uuid"].astype(str).unique())
@@ -550,7 +595,7 @@ def _elevation_stats(cfg: dict, region: gpd.GeoDataFrame) -> dict | None:
     else:
         print("  [WARN] No uuid/id column in LNF — skipping elevation stats")
         return None
-
+ 
     print(f"  Loading elevation for {len(field_ids):,} fields from nutzungsdaten ...")
     chunks = pd.read_csv(nutzung_path, encoding="latin1", sep=";",
                          usecols=["Jahr", "Flaechen_ID", "swissALTI3D"],
@@ -566,7 +611,7 @@ def _elevation_stats(cfg: dict, region: gpd.GeoDataFrame) -> dict | None:
         print("  [WARN] No elevation data matched — "
               "Flaechen_IDs may differ between LNF gpkg and nutzungsdaten")
         return None
-
+ 
     df = pd.concat(rows).drop_duplicates("Flaechen_ID").dropna(subset=["swissALTI3D"])
     vals = df["swissALTI3D"].values
     cutoff = cfg["grenze_tal_berg"]
@@ -586,7 +631,7 @@ def _elevation_stats(cfg: dict, region: gpd.GeoDataFrame) -> dict | None:
           f"{stats['frac_tal']:.0f}% Tal / {stats['frac_berg']:.0f}% Berg "
           f"({stats['n_matched']} fields matched)")
     return stats
-
+ 
 def _load_meteo_var(var: str, year: int, tiles: list[tuple[int, int]],
                     cfg: dict) -> xr.Dataset:
     """Load and merge all tiles for one MeteoSwiss variable + year."""
@@ -613,8 +658,8 @@ def _load_meteo_var(var: str, year: int, tiles: list[tuple[int, int]],
     if not datasets:
         return None
     return xr.concat(datasets, dim="time") if len(datasets) > 1 else datasets[0]
-
-
+ 
+ 
 def _meteo_monthly_agg(var: str, year: int, tiles: list, cfg: dict,
                        agg: str = "sum") -> pd.Series | None:
     """Return monthly aggregated values (mean over spatial tiles) for one var+year."""
@@ -629,7 +674,7 @@ def _meteo_monthly_agg(var: str, year: int, tiles: list, cfg: dict,
         # pick the one that looks like the main variable
         candidates = [v for v in data_vars if var.replace("D", "").lower() in v.lower()]
         da = ds[candidates[0]] if candidates else ds[data_vars[0]]
-
+ 
     spatial_mean = da.mean(dim=[d for d in da.dims if d != "time"])
     df = spatial_mean.to_dataframe().reset_index()
     df["month"] = pd.to_datetime(df["time"]).dt.month
@@ -639,20 +684,20 @@ def _meteo_monthly_agg(var: str, year: int, tiles: list, cfg: dict,
     else:
         monthly = df.groupby("month")[col].mean()
     return monthly
-
-
+ 
+ 
 def analyse_climate(cfg: dict, region: gpd.GeoDataFrame):
     """Load MeteoSwiss grids, compute monthly stats, produce comparison plots."""
     print("\n=== Section 1: Climate analysis ===")
     tiles = discover_meteo_tiles(cfg, region)
     print(f"  {len(tiles)} tiles overlap the region")
-
+ 
     meteo_specs = {
         "RhiresD": {"agg": "sum",  "label": "Precipitation (mm)", "title": "Monthly precipitation"},
         "TabsD":   {"agg": "mean", "label": "Temperature (°C)",   "title": "Monthly mean temperature"},
         "SrelD":   {"agg": "mean", "label": "Sunshine rel. (%)",  "title": "Monthly relative sunshine duration"},
     }
-
+ 
     results = {}
     for var in cfg["meteo_vars"]:
         spec = meteo_specs.get(var, {"agg": "mean", "label": var, "title": var})
@@ -671,7 +716,7 @@ def analyse_climate(cfg: dict, region: gpd.GeoDataFrame):
             else:
                 ax.plot(monthly.index, monthly.values, "o-",
                         color=_year_color(yr), label=YEAR_LABELS[yr])
-
+ 
         ax.set_xlabel("Month")
         ax.set_ylabel(spec["label"])
         ax.set_title(spec["title"])
@@ -681,7 +726,7 @@ def analyse_climate(cfg: dict, region: gpd.GeoDataFrame):
         ax.legend()
         ax.grid(axis="y", alpha=0.3)
         savefig(fig, f"climate_{var}.png", cfg)
-
+ 
     # Annual totals / means summary
     summary_lines = []
     for var in cfg["meteo_vars"]:
@@ -696,12 +741,12 @@ def analyse_climate(cfg: dict, region: gpd.GeoDataFrame):
         for line in summary_lines:
             print(line)
     return results
-
-
+ 
+ 
 # ===========================================================================
 # Section 2 — Crop distribution (crop1990 raster)
 # ===========================================================================
-
+ 
 def _crop_area_from_raster(year: int, region: gpd.GeoDataFrame,
                            cfg: dict) -> pd.DataFrame | None:
     """Count pixels per crop class → area (ha). Returns DataFrame."""
@@ -715,19 +760,19 @@ def _crop_area_from_raster(year: int, region: gpd.GeoDataFrame,
                         "n_pixels": counts.astype(int)})
     df["area_ha"] = df["n_pixels"] * pix_area / 1e4
     return df
-
-
+ 
+ 
 def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
     """Crop distribution comparison for 2021 vs 2022 using crop1990 rasters."""
     print("\n=== Section 2: Crop distribution ===")
     crop_labels = load_crop1990_labels(cfg)
     code_to_name = {c: v["name"] for c, v in crop_labels.items()}
-
+ 
     # Build lv3 lookup via the bridge
     bridge = crop1990_to_lnf_bridge(cfg)
     label_to_lv3 = (bridge.drop_duplicates("crop_label")
                     .set_index("crop_label")["Crop_Label_lv3"].to_dict())
-
+ 
     crop_stats = {}
     for yr in cfg["years"]:
         print(f"  Loading crop raster {yr} ...")
@@ -740,11 +785,11 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
         crop_stats[yr] = df
         print(f"    {df['area_ha'].sum():.0f} ha classified, "
               f"{len(df)} crop types")
-
+ 
     if len(crop_stats) < 2:
         print("  [WARN] Need both years for comparison")
         return crop_stats
-
+ 
     # --- Top-N crops bar chart (Arable Land / Grassland only) ---
     n_top = 15
     crop_lv3 = {"Arable Land", "Grassland"}
@@ -752,7 +797,7 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
     for yr in cfg["years"]:
         cs_crop = crop_stats[yr][crop_stats[yr]["lv3"].isin(crop_lv3)]
         top_codes.update(cs_crop.head(n_top)["crop_code"].tolist())
-
+ 
     rows = []
     for code in top_codes:
         for yr in cfg["years"]:
@@ -765,7 +810,7 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
     merged = pd.DataFrame(rows)
     order = (merged.groupby("crop")["area_ha"].sum()
              .sort_values(ascending=True).index.tolist())
-
+ 
     fig, ax = plt.subplots(figsize=(8, max(5, len(order) * 0.35)))
     y_pos = np.arange(len(order))
     bar_h = 0.35
@@ -780,7 +825,7 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
     ax.legend()
     ax.grid(axis="x", alpha=0.3)
     savefig(fig, "crop_distribution.png", cfg)
-
+ 
     # --- Land-use category (lv3) summary ---
     for yr in cfg["years"]:
         lv3_area = (crop_stats[yr].groupby("lv3")["area_ha"].sum()
@@ -789,7 +834,7 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
         print(f"  {yr} land-use categories (ha):")
         for cat, area in lv3_area.items():
             print(f"    {cat}: {area:.0f} ha ({100 * area / total:.1f}%)")
-
+ 
     # --- Year-over-year change ---
     df_2021 = (crop_stats[2021].set_index("crop_code")
                [["area_ha", "crop_name"]].rename(columns={"area_ha": "ha_2021"}))
@@ -805,7 +850,7 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
     _ensure_dir(cfg["out_dir"])
     change.to_csv(change_path)
     print(f"  Saved {change_path}")
-
+ 
     big = change[(change["ha_2021"] + change["ha_2022"]) > 10]
     big_sorted = big.reindex(big["delta_ha"].abs().sort_values(ascending=False).index)
     print("  Largest area changes (>10 ha in either year):")
@@ -813,26 +858,34 @@ def analyse_crops(cfg: dict, region: gpd.GeoDataFrame):
         name = row["crop_name"] if pd.notna(row["crop_name"]) else str(code)
         print(f"    {name}: {row['ha_2021']:.0f} → {row['ha_2022']:.0f} ha "
               f"({row['delta_ha']:+.0f} ha)")
-
+ 
     return crop_stats
-
-
+ 
+ 
 # ===========================================================================
 # Section 3 — Tillage distribution
 # ===========================================================================
-
+ 
+def _norm_farm_id(s: pd.Series) -> pd.Series:
+    """Normalise farm id to a clean integer-string (robust to 1000.0 vs 1000)."""
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().all():
+        return num.astype("Int64").astype(str)
+    return s.astype(str)
+ 
+ 
 # Conservation-tillage VERFAHREN → standard class. Anything not in this CSV
-# is inferred to be conventional plough (Pflug).
+# is inferred to be conventional plough (Pflug). Used by Variant A only.
 VERFAHREN_TO_TILLAGE = {
     "Mulchsaat":     "Mulch",
     "Direktsaat":    "Direkt",
     "Streifensaat":  "Direkt",   # note: value is "Streifensaat" (not -fräs-)
 }
-
-
+ 
+ 
 def _load_tillage_lookup(cfg: dict) -> pd.DataFrame | None:
     """Load the conservation-tillage CSV → one row per (betr_ID, year, crop).
-
+ 
     Returns DataFrame [betr_ID, year, lnf_code, tillage] where tillage is
     'Mulch' or 'Direkt'. Farm-crops listing more than one distinct tillage
     class are dropped (ambiguous).
@@ -841,7 +894,7 @@ def _load_tillage_lookup(cfg: dict) -> pd.DataFrame | None:
     if not os.path.exists(path):
         print(f"  [WARN] {path} not found")
         return None
-
+ 
     df = pd.read_csv(path, encoding="latin-1", delimiter=";")
     required = {"betr_ID", "JAHR", "VERFAHREN", "CODE_KULTUR"}
     missing = required - set(df.columns)
@@ -849,19 +902,19 @@ def _load_tillage_lookup(cfg: dict) -> pd.DataFrame | None:
         print(f"  [WARN] tillage CSV missing columns {missing}; "
               f"found {df.columns.tolist()}")
         return None
-
+ 
     df = df.rename(columns={"JAHR": "year", "CODE_KULTUR": "lnf_code"})
     df["tillage"] = df["VERFAHREN"].map(VERFAHREN_TO_TILLAGE)
     unmapped = df.loc[df["tillage"].isna(), "VERFAHREN"].unique().tolist()
     if unmapped:
         print(f"  [WARN] unmapped VERFAHREN values treated as Other: {unmapped}")
     df = df.dropna(subset=["tillage"])
-
+ 
     # Normalise key dtypes
     df["betr_ID"] = _norm_farm_id(df["betr_ID"])
     df["year"] = df["year"].astype(int)
     df["lnf_code"] = pd.to_numeric(df["lnf_code"], errors="coerce").astype("Int64")
-
+ 
     # Collapse to one tillage class per (farm, year, crop); drop ambiguous
     grp = (df.groupby(["betr_ID", "year", "lnf_code"])["tillage"]
            .agg(lambda s: sorted(set(s))))
@@ -870,73 +923,77 @@ def _load_tillage_lookup(cfg: dict) -> pd.DataFrame | None:
     if n_drop:
         print(f"  Dropped {n_drop} farm-crops with ambiguous tillage")
     return clean
-
-
-def _norm_farm_id(s: pd.Series) -> pd.Series:
-    """Normalise farm id to a clean integer-string (robust to 1000.0 vs 1000)."""
-    num = pd.to_numeric(s, errors="coerce")
-    if num.notna().all():
-        return num.astype("Int64").astype(str)
-    return s.astype(str)
-
-
+ 
+ 
 def analyse_tillage(cfg: dict, region: gpd.GeoDataFrame):
-    """Field-level tillage distribution over the whole arable area of the region.
-
-    Conservation tillage (Mulch/Direkt) comes from the schonende_bodenbearbeitung
-    CSV, joined to LNF polygons by (betr_ID, year, lnf_code). Arable fields with
-    no conservation-tillage record are inferred to be Pflug. Areas are therefore
-    the *real arable area* of the district, not just the conservation subset.
+    """Tillage distribution — produced two ways so they can be cross-checked.
+ 
+    Variant A ('realarea'): the real arable area of the region from LNF
+    polygons, with conservation tillage (Mulch/Direkt) joined from the
+    schonende_bodenbearbeitung CSV and Pflug inferred for the rest.
+ 
+    Variant B ('results'): the Bodenbearbeitung as actually used in the erosion
+    run, read from the result files and weighted by reported Flaeche.
+ 
+    Output files are suffixed _realarea / _results so both are kept.
     """
     print("\n=== Section 3: Tillage distribution ===")
-
+    realarea = _tillage_from_realarea(cfg, region)
+    results = _tillage_from_results(cfg, region)
+    return {"realarea": realarea, "results": results}
+ 
+ 
+def _tillage_from_realarea(cfg: dict, region: gpd.GeoDataFrame):
+    """Variant A — real arable area from LNF + conservation-tillage CSV."""
+    print("\n  -- Variant A: real arable area (LNF + conservation CSV) --")
+ 
     tillage = _load_tillage_lookup(cfg)
     if tillage is None:
-        print("  [SKIP] No tillage data")
+        print("  [SKIP] No conservation-tillage data")
         return None
-
+ 
     # Restrict to arable crops via the lv3 bridge (Pflug only makes sense on arable)
     bridge = crop1990_to_lnf_bridge(cfg)
     arable_lnf = set(bridge.loc[
         bridge["Crop_Label_lv3"].isin(["Arable Land"]), "lnf_code"].tolist())
-
+ 
     results = {}      # year -> Series(area_ha by tillage)
     crosstabs = {}    # year -> DataFrame(crop × tillage area_ha)
-
+ 
     for yr in cfg["years"]:
         lnf_path = os.path.join(_expand(cfg["lnf_dir"]), f"lnf{yr}.gpkg")
         if not os.path.exists(lnf_path):
             print(f"  [WARN] {lnf_path} not found — skipping {yr}")
             continue
-
+ 
         lnf = gpd.read_file(
             lnf_path, bbox=tuple(region.to_crs("EPSG:2056").total_bounds))
         region_2056 = region.to_crs(lnf.crs).union_all()
         lnf = lnf[lnf.intersects(region_2056)].copy()
         lnf = lnf[lnf.geometry.is_valid & ~lnf.geometry.is_empty]
-
+ 
         if "betriebsnummer" not in lnf.columns:
             print(f"  [WARN] 'betriebsnummer' not in LNF {yr} "
                   f"(have {lnf.columns.tolist()}) — skipping")
             continue
-
+ 
         # Keep only arable fields
         lnf = lnf[lnf["lnf_code"].isin(arable_lnf)].copy()
         if lnf.empty:
             print(f"  [WARN] No arable fields in region for {yr}")
             continue
-
+ 
         lnf["area_ha"] = lnf.geometry.area / 1e4
         lnf["betr_ID"] = _norm_farm_id(lnf["betriebsnummer"])
         lnf["year"] = yr
         lnf["lnf_code"] = pd.to_numeric(lnf["lnf_code"],
                                         errors="coerce").astype("Int64")
-
+ 
         # Join conservation tillage; non-matches → Pflug
         merged = lnf.merge(tillage, on=["betr_ID", "year", "lnf_code"],
                            how="left")
         merged["tillage"] = merged["tillage"].fillna("Pflug")
-
+ 
         by_till = merged.groupby("tillage")["area_ha"].sum()
         results[yr] = by_till
         total = by_till.sum()
@@ -946,19 +1003,88 @@ def analyse_tillage(cfg: dict, region: gpd.GeoDataFrame):
         for t in ["Pflug", "Mulch", "Direkt"]:
             a = by_till.get(t, 0)
             print(f"    {t}: {a:.0f} ha ({100 * a / total:.1f}%)")
-
+ 
         # crop × tillage cross-tab (area ha), top crops
         ct = (merged.groupby(["lnf_code", "tillage"])["area_ha"].sum()
               .unstack(fill_value=0))
         crosstabs[yr] = ct
-
+ 
     if not results:
-        print("  [WARN] No tillage results produced")
+        print("  [WARN] No tillage results produced (Variant A)")
         return None
-
-    # --- Bar chart: tillage area by year ---
+ 
+    _plot_tillage(cfg, results, crosstabs, suffix="realarea",
+                  area_label="Arable area (ha)",
+                  subtitle="(real arable area; Pflug inferred)",
+                  crop_index_map={
+                      row.lnf_code: row.crop_label
+                      for row in bridge.drop_duplicates("lnf_code").itertuples()})
+    return results
+ 
+ 
+def _tillage_from_results(cfg: dict, region: gpd.GeoDataFrame):
+    """Variant B — Bodenbearbeitung as reported in the erosion results."""
+    print("\n  -- Variant B: from erosion-result Bodenbearbeitung --")
+ 
+    results = {}      # year -> Series(area_ha by Bodenbearbeitung)
+    crosstabs = {}    # year -> DataFrame(crop × tillage area_ha)
+ 
+    for yr in cfg["years"]:
+        res = _load_erosion_results(cfg, yr)
+        if res is None or res.empty:
+            continue
+        if res["Bodenbearbeitung"].isna().all():
+            print(f"  [WARN] {yr}: no Bodenbearbeitung in result file — skipping")
+            continue
+ 
+        # Restrict to farms present in the region (same mode as Section 4).
+        farm_ids = _region_farm_ids(cfg, region, yr)
+        if farm_ids is not None:
+            before = res["betr_ID"].nunique()
+            res = res[res["betr_ID"].isin(farm_ids)]
+            print(f"  {yr}: {res['betr_ID'].nunique()}/{before} farms within region")
+            if res.empty:
+                print(f"  [WARN] {yr}: no result rows fall within the region")
+                continue
+ 
+        res = res.assign(area_ha=res["Flaeche"] / 1e4)
+        by_till = res.groupby("Bodenbearbeitung")["area_ha"].sum()
+        results[yr] = by_till
+        total = by_till.sum()
+        print(f"  {yr}: {total:.0f} ha over {len(res)} polygons")
+        for t in ["Pflug", "Mulch", "Direkt"]:
+            a = by_till.get(t, 0.0)
+            print(f"    {t}: {a:.0f} ha ({100 * a / total:.1f}%)")
+        extra = sorted(set(by_till.index) - {"Pflug", "Mulch", "Direkt"})
+        if extra:
+            ex_area = by_till.reindex(extra).sum()
+            print(f"    Other ({', '.join(map(str, extra))}): {ex_area:.0f} ha "
+                  f"({100 * ex_area / total:.1f}%)")
+ 
+        # crop × tillage cross-tab (area ha)
+        ct = (res.groupby(["crop", "Bodenbearbeitung"])["area_ha"].sum()
+              .unstack(fill_value=0))
+        crosstabs[yr] = ct
+ 
+    if not results:
+        print("  [WARN] No tillage results produced (Variant B)")
+        return None
+ 
+    _plot_tillage(cfg, results, crosstabs, suffix="results",
+                  area_label="Area (ha)",
+                  subtitle="(Bodenbearbeitung as reported in the erosion results)",
+                  crop_index_map=None)
+    return results
+ 
+ 
+def _plot_tillage(cfg, results, crosstabs, suffix, area_label, subtitle,
+                  crop_index_map):
+    """Shared plotting for both tillage variants. Files suffixed by ``suffix``."""
     till_order = ["Pflug", "Mulch", "Direkt"]
     till_colors = {"Pflug": "#B07A56", "Mulch": "#E8C547", "Direkt": "#66BB6A"}
+    years_present = [y for y in cfg["years"] if y in results]
+ 
+    # --- Bar chart: tillage area by year ---
     fig, ax = plt.subplots(figsize=(6.5, 4))
     bar_w = 0.38
     x = np.arange(len(till_order))
@@ -970,164 +1096,234 @@ def analyse_tillage(cfg: dict, region: gpd.GeoDataFrame):
                color=_year_color(yr), label=YEAR_LABELS[yr])
     ax.set_xticks(x)
     ax.set_xticklabels(till_order)
-    ax.set_ylabel("Arable area (ha)")
-    ax.set_title("Tillage distribution — Seeland district\n"
-                 "(Pflug inferred where no conservation record)")
+    ax.set_ylabel(area_label)
+    ax.set_title(f"Tillage distribution — Seeland district\n{subtitle}")
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
-    savefig(fig, "tillage_distribution.png", cfg)
-
-    # --- Stacked share chart (proportions) ---
+    savefig(fig, f"tillage_distribution_{suffix}.png", cfg)
+ 
+    # --- Stacked share chart (proportions of Pflug/Mulch/Direkt) ---
     fig2, ax2 = plt.subplots(figsize=(6.5, 4))
-    years_present = [y for y in cfg["years"] if y in results]
     bottoms = np.zeros(len(years_present))
+    denom = {y: sum(results[y].get(t, 0) for t in till_order)
+             for y in years_present}
     for t in till_order:
-        shares = [100 * results[y].get(t, 0) / results[y].sum()
+        shares = [100 * results[y].get(t, 0) / denom[y] if denom[y] else 0
                   for y in years_present]
         ax2.bar([str(y) for y in years_present], shares, bottom=bottoms,
                 color=till_colors[t], label=t, width=0.5)
         bottoms += np.array(shares)
-    ax2.set_ylabel("Share of arable area (%)")
-    ax2.set_title("Tillage share — Seeland district")
+    ax2.set_ylabel("Share of tilled area (%)")
+    ax2.set_title(f"Tillage share — Seeland district {subtitle}")
     ax2.legend()
     ax2.set_ylim(0, 100)
-    savefig(fig2, "tillage_share.png", cfg)
-
-    # --- Crop × tillage cross-tab CSV (first year) ---
-    code_to_name = {row.lnf_code: row.crop_label
-                    for row in bridge.drop_duplicates("lnf_code").itertuples()}
+    savefig(fig2, f"tillage_share_{suffix}.png", cfg)
+ 
+    # --- Crop × tillage cross-tab CSV (top crops by area) ---
     for yr in years_present:
         ct = crosstabs[yr].copy()
         ct["total"] = ct.sum(axis=1)
         ct = ct.sort_values("total", ascending=False).head(15).drop(columns="total")
-        ct.index = [code_to_name.get(c, str(c)) for c in ct.index]
-        out_path = os.path.join(cfg["out_dir"], f"tillage_by_crop_{yr}.csv")
+        if crop_index_map is not None:
+            ct.index = [crop_index_map.get(c, str(c)) for c in ct.index]
+        out_path = os.path.join(cfg["out_dir"],
+                                f"tillage_by_crop_{suffix}_{yr}.csv")
         ct.to_csv(out_path)
         print(f"  Saved {out_path}")
-
-    return results
-
-
+ 
+ 
 # ===========================================================================
-# Section 4 — Reference C-factor landscape
+# Section 4 — Reported C-factor landscape (from erosion-risk results)
 # ===========================================================================
-
-def load_c_factor_table(cfg: dict) -> pd.DataFrame:
-    """Load the C-factor reference table."""
-    path = _expand(cfg["c_factor_csv"])
-    df = pd.read_csv(path, sep=";", encoding="latin1")
-    df = df.rename(columns={"Kultur Kategorien 2020": "Kultur_nutzung"})
-    return df
-
-
-def load_kulturmapping(cfg: dict) -> pd.DataFrame:
-    path = _expand(cfg["kulturmapping_csv"])
-    df = pd.read_csv(path, sep=";", encoding="latin1")
-    return df
-
-
-def _build_crop1990_cfactor_bridge(cfg: dict) -> pd.DataFrame:
-    """Build crop1990 label → mean reference C-factor.
-
-    Chain: crop_label (= Crop_Label in Excel) → lnf_code → kulturcode
-           → Kultur_nutzung → C_Faktoren columns.
-    Multiple lnf_codes may map to one crop_label; we average the C-factors.
+ 
+# Cache the parsed result frame per file so Sections 3 and 4 don't both re-read it.
+_RESULTS_CACHE: dict[str, pd.DataFrame] = {}
+ 
+ 
+def _load_erosion_results(cfg: dict, year: int) -> pd.DataFrame | None:
+    """Load the previously reported per-farm × crop erosion results for ``year``.
+ 
+    Picks the most recent ``*_Kultur_Betrieb_Erosionsrisiko_2x2_{year}.csv`` in
+    ``{erosion_results_dir}/{year}/`` (the date prefix sorts chronologically).
+    Returns a tidy frame: betr_ID, crop, Bodenbearbeitung, Region, Gemeinde,
+    Flaeche (m²), C_fact_detail, pot_risk (Pot_Erosionsrisiko_t_ha_y),
+    ers_risk_P — one row per polygon group.
     """
-    c_table = load_c_factor_table(cfg)
-    kmapping = load_kulturmapping(cfg)
-    bridge_lnf = crop1990_to_lnf_bridge(cfg)  # crop_label, lnf_code, lv3
-
-    # lnf_code → Kultur_nutzung
-    lnf_to_kultur = (kmapping[["kulturcode", "Kultur_nutzung"]]
-                     .drop_duplicates("kulturcode")
-                     .rename(columns={"kulturcode": "lnf_code"}))
-
-    c_cols = ["Total", "Tal_Pflug", "Tal_Mulch", "Tal_Direkt",
-              "Berg_Pflug", "Berg_Mulch", "Berg_Direkt"]
-    c_sub = c_table[["Kultur_nutzung"] + c_cols].copy()
-    for col in c_cols:
-        c_sub[col] = pd.to_numeric(c_sub[col], errors="coerce")
-
-    # Join: crop_label → lnf_code → Kultur_nutzung → C-factor
-    merged = (bridge_lnf
-              .merge(lnf_to_kultur, on="lnf_code", how="inner")
-              .merge(c_sub, on="Kultur_nutzung", how="inner"))
-
-    # Average C across lnf_codes within each crop_label
-    result = (merged.groupby("crop_label")[c_cols]
-              .mean().reset_index())
-    return result
-
-
-def analyse_reference_cfactors(cfg: dict, region: gpd.GeoDataFrame,
-                               crop_stats: dict | None = None):
-    """Compute the area-weighted reference C-factor distribution for each year.
-
-    Uses crop1990 raster areas bridged to C_Faktoren via the LNF classification.
+    import glob
+    base = _expand(cfg["erosion_results_dir"])
+    year_dir = os.path.join(base, str(year))
+    pattern = os.path.join(
+        year_dir, f"*_Kultur_Betrieb_Erosionsrisiko_2x2_{year}.csv")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        print(f"  [WARN] No result file matching {pattern}")
+        return None
+    path = matches[-1]  # latest date prefix
+    if path in _RESULTS_CACHE:
+        return _RESULTS_CACHE[path].copy()
+    print(f"  {year}: reading {os.path.basename(path)}")
+ 
+    df = pd.read_csv(path, sep=";", encoding="latin1")
+ 
+    # Crop column is 'Nutzung_DE_KatNutz' in the export; accept 'Nutzung_DE' too.
+    crop_col = next((c for c in ("Nutzung_DE_KatNutz", "Nutzung_DE")
+                     if c in df.columns), None)
+    required = {"betr_ID", "Flaeche", "C_fact_detail"}
+    missing = required - set(df.columns)
+    if crop_col is None:
+        missing.add("Nutzung_DE_KatNutz")
+    if missing:
+        print(f"  [WARN] result file missing columns {missing}; "
+              f"found {df.columns.tolist()}")
+        return None
+ 
+    out = pd.DataFrame({
+        "betr_ID":          _norm_farm_id(df["betr_ID"]),
+        "crop":             df[crop_col].astype(str),
+        "Bodenbearbeitung": (df["Bodenbearbeitung"].astype(str)
+                             if "Bodenbearbeitung" in df.columns else pd.NA),
+        "Region":           df["Region"] if "Region" in df.columns else pd.NA,
+        "Gemeinde":         (df["Gemeinde"].astype(str)
+                             if "Gemeinde" in df.columns else pd.NA),
+        "Flaeche":          pd.to_numeric(df["Flaeche"], errors="coerce"),
+        "C_fact_detail":    pd.to_numeric(df["C_fact_detail"], errors="coerce"),
+        "pot_risk":         (pd.to_numeric(df["Pot_Erosionsrisiko_t_ha_y"],
+                                           errors="coerce")
+                             if "Pot_Erosionsrisiko_t_ha_y" in df.columns
+                             else np.nan),
+        "ers_risk_P":       (pd.to_numeric(df["ers_risk_P"], errors="coerce")
+                             if "ers_risk_P" in df.columns else np.nan),
+    })
+    out = out.dropna(subset=["Flaeche", "C_fact_detail"])
+    out = out[out["Flaeche"] > 0]
+    _RESULTS_CACHE[path] = out
+    return out.copy()
+ 
+ 
+def _region_farm_ids(cfg: dict, region: gpd.GeoDataFrame,
+                     year: int) -> set | None:
+    """Return betr_IDs whose LNF fields intersect the region in ``year``.
+ 
+    Returns None if the LNF layer is unavailable (caller then keeps all farms).
+    Note: this is a farm-level filter — a farm with any field in the region is
+    kept in full, so a few of its out-of-region polygons may be included.
     """
-    print("\n=== Section 4: Reference C-factor landscape ===")
-    crop_labels = load_crop1990_labels(cfg)
-    code_to_name = {c: v["name"] for c, v in crop_labels.items()}
-    c_bridge = _build_crop1990_cfactor_bridge(cfg)
-
-    # If we have crop_stats from Section 2, use those
-    if crop_stats is None:
-        crop_stats = {}
-        for yr in cfg["years"]:
-            df = _crop_area_from_raster(yr, region, cfg)
-            if df is not None:
-                df["crop_name"] = df["crop_code"].map(code_to_name)
-                crop_stats[yr] = df
-
+    lnf_path = os.path.join(_expand(cfg["lnf_dir"]), f"lnf{year}.gpkg")
+    if not os.path.exists(lnf_path):
+        print(f"  [WARN] {lnf_path} not found — cannot restrict {year} to region")
+        return None
+    lnf = gpd.read_file(
+        lnf_path, bbox=tuple(region.to_crs("EPSG:2056").total_bounds))
+    if "betriebsnummer" not in lnf.columns:
+        print(f"  [WARN] 'betriebsnummer' not in LNF {year} "
+              f"(have {lnf.columns.tolist()}) — cannot restrict to region")
+        return None
+    region_geom = region.to_crs(lnf.crs).union_all()
+    lnf = lnf[lnf.intersects(region_geom)]
+    return set(_norm_farm_id(lnf["betriebsnummer"]).tolist())
+ 
+ 
+def _aggregate_farm_crop_c(res: pd.DataFrame) -> pd.DataFrame:
+    """Area-weighted mean C_fact_detail per (betr_ID, crop) across polygons."""
+    res = res.copy()
+    res["_wC"] = res["C_fact_detail"] * res["Flaeche"]
+    agg = (res.groupby(["betr_ID", "crop"], as_index=False)
+           .agg(_wC=("_wC", "sum"),
+                Flaeche=("Flaeche", "sum"),
+                n_poly=("C_fact_detail", "size")))
+    agg["C_fact_detail"] = agg["_wC"] / agg["Flaeche"]
+    agg["area_ha"] = agg["Flaeche"] / 1e4
+    return agg.drop(columns=["_wC", "Flaeche"])
+ 
+ 
+def analyse_reference_cfactors(cfg: dict, region: gpd.GeoDataFrame):
+    """Describe the previously reported C-factors over the area of interest.
+ 
+    Reads the per-farm × crop erosion-risk result files (one per year) and uses
+    the reported ``C_fact_detail`` directly — no longer derived from the
+    C_Faktoren reference table. Results are restricted to farms whose LNF fields
+    intersect the region, then aggregated to one value per (betr_ID, crop) by
+    area-weighting C_fact_detail with Flaeche (a farm-crop may span several
+    polygons).
+    """
+    print("\n=== Section 4: Reported C-factor landscape (from erosion results) ===")
+ 
+    per_year = {}   # year -> farm×crop frame [betr_ID, crop, n_poly, C_fact_detail, area_ha]
     for yr in cfg["years"]:
-        if yr not in crop_stats:
+        res = _load_erosion_results(cfg, yr)
+        if res is None or res.empty:
             continue
-        cs = crop_stats[yr].copy()
-        if "crop_name" not in cs.columns:
-            cs["crop_name"] = cs["crop_code"].map(code_to_name)
-        merged = cs.merge(c_bridge, left_on="crop_name", right_on="crop_label",
-                          how="inner")
-        total_area = merged["area_ha"].sum()
-        if total_area == 0:
-            print(f"  {yr}: no crops matched the C-factor table")
+ 
+        # Restrict to farms present in the region (chosen restriction mode).
+        farm_ids = _region_farm_ids(cfg, region, yr)
+        if farm_ids is not None:
+            before = res["betr_ID"].nunique()
+            res = res[res["betr_ID"].isin(farm_ids)]
+            print(f"  {yr}: {res['betr_ID'].nunique()}/{before} farms within region")
+            if res.empty:
+                print(f"  [WARN] {yr}: no result rows fall within the region")
+                continue
+ 
+        agg = _aggregate_farm_crop_c(res)
+        per_year[yr] = agg
+ 
+        cmean = np.average(agg["C_fact_detail"], weights=agg["area_ha"])
+        print(f"  {yr}: {len(agg)} farm×crop units, "
+              f"{agg['area_ha'].sum():.0f} ha")
+        print(f"       area-weighted mean C_fact_detail = {cmean:.4f}, "
+              f"median = {agg['C_fact_detail'].median():.4f}, "
+              f"range = [{agg['C_fact_detail'].min():.4f}, "
+              f"{agg['C_fact_detail'].max():.4f}]")
+ 
+    if not per_year:
+        print("  [WARN] No reported C-factor data produced")
+        return None
+ 
+    # --- Per-crop area-weighted summary (top crops by area) ---
+    for yr in cfg["years"]:
+        if yr not in per_year:
             continue
-
-        c_mean = np.average(merged["Total"], weights=merged["area_ha"])
-        print(f"  {yr}: area-weighted mean C_ref (Total) = {c_mean:.4f} "
-              f"({total_area:.0f} ha matched / "
-              f"{cs['area_ha'].sum():.0f} ha total)")
-
-        c_tal_pflug = np.average(merged["Tal_Pflug"], weights=merged["area_ha"])
-        print(f"       Tal_Pflug weighted mean = {c_tal_pflug:.4f}")
-
-    # Histogram of crop-level reference C (using Total) for both years
+        agg = per_year[yr].assign(
+            _wC=lambda d: d["C_fact_detail"] * d["area_ha"])
+        by_crop = (agg.groupby("crop")
+                   .agg(area_ha=("area_ha", "sum"),
+                        _wC=("_wC", "sum"),
+                        n_units=("crop", "size")))
+        by_crop["C_fact_detail"] = by_crop["_wC"] / by_crop["area_ha"]
+        by_crop = (by_crop.drop(columns="_wC")
+                   .sort_values("area_ha", ascending=False).head(20))
+        out_path = os.path.join(cfg["out_dir"],
+                                f"cfactor_reported_by_crop_{yr}.csv")
+        by_crop.to_csv(out_path)
+        print(f"  Saved {out_path}")
+ 
+    # --- Histogram of farm×crop C (area-weighted) for both years ---
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
     for i, yr in enumerate(cfg["years"]):
-        if yr not in crop_stats:
+        if yr not in per_year:
+            axes[i].set_visible(False)
             continue
-        cs = crop_stats[yr].copy()
-        if "crop_name" not in cs.columns:
-            cs["crop_name"] = cs["crop_code"].map(code_to_name)
-        merged = cs.merge(c_bridge, left_on="crop_name", right_on="crop_label",
-                          how="inner")
-        axes[i].hist(merged["Total"], weights=merged["area_ha"],
-                     bins=30, color=_year_color(yr), alpha=0.8, edgecolor="white")
-        axes[i].set_xlabel("Reference C-factor (Total)")
+        agg = per_year[yr]
+        axes[i].hist(agg["C_fact_detail"], weights=agg["area_ha"],
+                     bins=30, color=_year_color(yr), alpha=0.8,
+                     edgecolor="white")
+        axes[i].set_xlabel("Reported C-factor (C_fact_detail)")
         axes[i].set_title(f"{yr}")
-        axes[i].axvline(0.15, color="red", ls="--", lw=0.8, label="Risk threshold")
+        axes[i].axvline(0.15, color="red", ls="--", lw=0.8,
+                        label="Risk threshold")
         axes[i].legend(fontsize=8)
     axes[0].set_ylabel("Area (ha)")
-    fig.suptitle("Distribution of reference C-factors — Seeland district", y=1.02)
+    fig.suptitle("Distribution of reported C-factors — area of interest", y=1.02)
     fig.tight_layout()
-    savefig(fig, "cfactor_reference_distribution.png", cfg)
-
-    return c_bridge
-
-
+    savefig(fig, "cfactor_reported_distribution.png", cfg)
+ 
+    return per_year
+ 
+ 
 # ===========================================================================
 # Section 5 — Rainfall erosivity (EI)
 # ===========================================================================
-
+ 
 def analyse_ei(cfg: dict, region: gpd.GeoDataFrame):
     """Summarise climatological EI distribution across the region."""
     print("\n=== Section 5: Rainfall erosivity (EI) ===")
@@ -1135,7 +1331,7 @@ def analyse_ei(cfg: dict, region: gpd.GeoDataFrame):
     if not os.path.exists(ei_path):
         print(f"  [WARN] {ei_path} not found — skipping EI analysis")
         return None
-
+ 
     # Load EI for the region's bounding box
     import pyarrow.dataset as ds
     bounds = region_bounds_32632(region)
@@ -1149,23 +1345,23 @@ def analyse_ei(cfg: dict, region: gpd.GeoDataFrame):
     df_ei = table.to_pandas().rename(columns={"predicted_EI_daily_avg": "ei"})
     print(f"  Loaded {len(df_ei):,} EI rows "
           f"({df_ei[['x','y']].drop_duplicates().shape[0]} grid cells)")
-
+ 
     if df_ei.empty:
         return None
-
+ 
     # Annual total EI per grid cell
     annual_ei = df_ei.groupby(["x", "y"])["ei"].sum()
     print(f"  Annual EI: mean = {annual_ei.mean():.1f}, "
           f"median = {annual_ei.median():.1f}, "
           f"range = [{annual_ei.min():.1f}, {annual_ei.max():.1f}]")
-
+ 
     # Seasonal distribution (mean across grid cells)
     monthly_ei = df_ei.copy()
     # Convert DOY to month (approximate)
     monthly_ei["month"] = pd.to_datetime(
         monthly_ei["doy"], format="%j").dt.month
     monthly_mean = monthly_ei.groupby("month")["ei"].sum() / df_ei[["x", "y"]].drop_duplicates().shape[0]
-
+ 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.bar(monthly_mean.index, monthly_mean.values, color="#228833",
            edgecolor="white")
@@ -1177,14 +1373,14 @@ def analyse_ei(cfg: dict, region: gpd.GeoDataFrame):
                         "J", "A", "S", "O", "N", "D"])
     ax.grid(axis="y", alpha=0.3)
     savefig(fig, "ei_seasonal.png", cfg)
-
+ 
     return df_ei
-
-
+ 
+ 
 # ===========================================================================
 # Section 6 — Sentinel-2 data quality (from pixel outputs)
 # ===========================================================================
-
+ 
 def analyse_s2_quality(cfg: dict):
     """Load pixel-level outputs and summarise clean-obs counts."""
     print("\n=== Section 6: S2 data quality ===")
@@ -1192,7 +1388,7 @@ def analyse_s2_quality(cfg: dict):
     if not os.path.exists(pixel_dir):
         print(f"  [WARN] {pixel_dir} not found — skipping S2 quality analysis")
         return None
-
+ 
     all_fields = []
     for yr in cfg["years"]:
         # Try field summary first (lighter)
@@ -1215,15 +1411,15 @@ def analyse_s2_quality(cfg: dict):
             fld["year"] = yr
             all_fields.append(fld)
             print(f"  {yr}: {len(fld)} fields from pixel parquet")
-
+ 
     if not all_fields:
         return None
     fields = pd.concat(all_fields, ignore_index=True)
-
+ 
     if "n_clean_obs_field" not in fields.columns:
         print("  [WARN] n_clean_obs_field column not found — skipping quality plot")
         return fields
-
+ 
     # Clean observations histogram (2021 vs 2022)
     fig, ax = plt.subplots(figsize=(7, 4))
     for yr in cfg["years"]:
@@ -1239,20 +1435,278 @@ def analyse_s2_quality(cfg: dict):
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     savefig(fig, "s2_clean_obs.png", cfg)
-
+ 
     for yr in cfg["years"]:
         sub = fields[fields["year"] == yr]
         print(f"  {yr}: median clean obs = {sub['n_clean_obs_field'].median():.0f}, "
               f"mean = {sub['n_clean_obs_field'].mean():.1f}, "
               f"5th pct = {sub['n_clean_obs_field'].quantile(0.05):.0f}")
-
+ 
     return fields
-
-
+ 
+ 
+# ===========================================================================
+# Section 7 — Erosion risk (potential & P-combined) from the result files
+# ===========================================================================
+ 
+def _weighted_quantile(values, weights, q: float) -> float:
+    """Area-weighted quantile (q in [0, 1])."""
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    order = np.argsort(v)
+    v, w = v[order], w[order]
+    cw = np.cumsum(w)
+    if cw[-1] == 0:
+        return float("nan")
+    return float(v[np.searchsorted(cw, q * cw[-1])])
+ 
+ 
+def _wmean_by(df: pd.DataFrame, value_col: str, by: str) -> pd.DataFrame:
+    """Area-weighted mean of ``value_col`` grouped by ``by`` (drops NaN)."""
+    d = df.dropna(subset=[value_col]).copy()
+    d["_w"] = d[value_col] * d["area_ha"]
+    g = d.groupby(by).agg(_w=("_w", "sum"), area_ha=("area_ha", "sum"))
+    g[value_col] = g["_w"] / g["area_ha"]
+    return g.drop(columns="_w").reset_index()
+ 
+ 
+def _plot_risk_histograms(cfg: dict, per_year: dict, thr: float):
+    """Area-weighted histograms of potential & P-combined risk, per year."""
+    years = [y for y in cfg["years"] if y in per_year]
+    metrics = [("pot_risk", "Potential"), ("ers_risk_P", "P-combined")]
+    ncol = max(len(years), 1)
+    fig, axes = plt.subplots(len(metrics), ncol,
+                             figsize=(5 * ncol, 7), squeeze=False)
+    for r, (col, name) in enumerate(metrics):
+        for c, yr in enumerate(years):
+            ax = axes[r][c]
+            sub = per_year[yr].dropna(subset=[col])
+            if sub.empty:
+                ax.set_visible(False)
+                continue
+            hi = _weighted_quantile(sub[col], sub["area_ha"], 0.99)
+            hi = hi if hi and hi > 0 else float(sub[col].max() or 1)
+            ax.hist(np.clip(sub[col], 0, hi), weights=sub["area_ha"],
+                    bins=40, color=_year_color(yr), alpha=0.85,
+                    edgecolor="white")
+            ax.axvline(thr, color="red", ls="--", lw=0.9,
+                       label=f"{thr:g} t ha⁻¹ y⁻¹")
+            ax.set_title(f"{name} — {yr}")
+            ax.set_xlabel("t ha⁻¹ y⁻¹")
+            if c == 0:
+                ax.set_ylabel("Area (ha)")
+            ax.legend(fontsize=8)
+    fig.suptitle("Erosion-risk distribution (area-weighted) — area of interest",
+                 y=1.01)
+    fig.tight_layout()
+    savefig(fig, "erosion_risk_histograms.png", cfg)
+ 
+ 
+def _plot_risk_by_tillage(cfg: dict, per_year: dict):
+    """Bar chart: area-weighted mean P-combined risk by tillage class."""
+    till_order = ["Pflug", "Mulch", "Direkt"]
+    years = [y for y in cfg["years"] if y in per_year]
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    bar_w = 0.38
+    x = np.arange(len(till_order))
+    any_data = False
+    for i, yr in enumerate(years):
+        res = per_year[yr].dropna(subset=["ers_risk_P"])
+        if res.empty or res["Bodenbearbeitung"].isna().all():
+            continue
+        g = (_wmean_by(res, "ers_risk_P", "Bodenbearbeitung")
+             .set_index("Bodenbearbeitung"))
+        vals = [g["ers_risk_P"].get(t, np.nan) for t in till_order]
+        ax.bar(x + (i - 0.5) * bar_w, vals, width=bar_w,
+               color=_year_color(yr), label=YEAR_LABELS[yr])
+        any_data = True
+    if not any_data:
+        plt.close(fig)
+        return
+    ax.set_xticks(x)
+    ax.set_xticklabels(till_order)
+    ax.set_ylabel("Mean P-combined risk (t ha⁻¹ y⁻¹)")
+    ax.set_title("P-combined erosion risk by tillage — Seeland district")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    savefig(fig, "erosion_risk_by_tillage.png", cfg)
+ 
+ 
+def _gemeinde_choropleth(cfg: dict, region: gpd.GeoDataFrame, gem_stats: dict,
+                         value_col: str, label: str, fname: str):
+    """Choropleth of ``value_col`` per municipality, one panel per year.
+ 
+    Needs ``gemeinde_boundaries_path`` with a name field matching the result
+    files' ``Gemeinde`` column. Skips gracefully (stats/plots already produced)
+    if the file or a name match is unavailable.
+    """
+    bnd_path = cfg.get("gemeinde_boundaries_path")
+    if not bnd_path:
+        print(f"  [INFO] gemeinde_boundaries_path not set — skipping {fname} map")
+        return
+    bnd_path = _expand(bnd_path)
+    if not os.path.exists(bnd_path):
+        print(f"  [WARN] {bnd_path} not found — skipping {fname} map")
+        return
+    name_field = cfg.get("gemeinde_name_field", "name")
+    try:
+        gem = gpd.read_file(bnd_path, layer='tlm_hoheitsgebiet')
+    except Exception as e:
+        print(f"  [WARN] could not read {bnd_path} ({e}) — skipping {fname} map")
+        return
+    if name_field not in gem.columns:
+        print(f"  [WARN] name field '{name_field}' not in boundaries "
+              f"(have {gem.columns.tolist()[:12]}) — skipping {fname} map")
+        return
+ 
+    region_geom = region.to_crs(gem.crs).union_all()
+    gem = gem[gem.intersects(region_geom)].copy()
+    if gem.empty:
+        print(f"  [WARN] no municipalities intersect region — skipping {fname} map")
+        return
+    gem["_key"] = gem[name_field].astype(str).str.strip()
+ 
+    years = [y for y in cfg["years"] if y in gem_stats]
+    if not years:
+        return
+    allvals = pd.concat([gem_stats[y][value_col] for y in years])
+    vmin = float(np.nanmin(allvals))
+    vmax = float(np.nanpercentile(allvals, 98))
+    if not np.isfinite(vmax) or vmax <= vmin:
+        vmax = float(np.nanmax(allvals))
+ 
+    ncol = max(len(years), 1)
+    fig, axes = plt.subplots(1, ncol, figsize=(6 * ncol, 6), squeeze=False)
+    axes = axes[0]
+    region_gem_crs = region.to_crs(gem.crs)
+    for ax, yr in zip(axes, years):
+        st = gem_stats[yr].copy()
+        st["_key"] = st["Gemeinde"].astype(str).str.strip()
+        merged = gem.merge(st[["_key", value_col]], on="_key", how="left")
+        n_match = int(merged[value_col].notna().sum())
+        print(f"  {fname} {yr}: {n_match}/{len(gem)} municipalities matched")
+        merged.plot(column=value_col, ax=ax, cmap="YlOrRd",
+                    vmin=vmin, vmax=vmax, edgecolor="white", linewidth=0.3,
+                    legend=True, missing_kwds={"color": "lightgrey"})
+        region_gem_crs.boundary.plot(ax=ax, color="black", linewidth=0.8)
+        ax.set_title(f"{yr}")
+        ax.set_axis_off()
+    fig.suptitle(f"{label} by municipality — area of interest", y=1.02)
+    fig.tight_layout()
+    savefig(fig, f"{fname}.png", cfg)
+ 
+ 
+def analyse_erosion_risk(cfg: dict, region: gpd.GeoDataFrame):
+    """Describe potential and P-combined erosion risk over the area of interest.
+ 
+    Both come straight from the per-farm × crop result files:
+      - ``pot_risk``   = Pot_Erosionsrisiko_t_ha_y (potential, no C/P)
+      - ``ers_risk_P`` = actual risk with the P-factor applied
+    Restricted to farms within the region. Produces stats, area-weighted
+    histograms, a by-tillage bar chart, per-crop CSVs, and (if municipality
+    boundaries are configured) choropleth maps.
+    """
+    print("\n=== Section 7: Erosion risk — potential & P-combined ===")
+    thr = cfg.get("erosion_risk_threshold_t_ha_y", 2.0)
+ 
+    per_year = {}    # year -> tidy frame [..., area_ha, pot_risk, ers_risk_P]
+    gem_pot = {}     # year -> per-municipality area-weighted pot_risk
+    gem_p = {}       # year -> per-municipality area-weighted ers_risk_P
+ 
+    for yr in cfg["years"]:
+        res = _load_erosion_results(cfg, yr)
+        if res is None or res.empty:
+            continue
+        has_pot = res["pot_risk"].notna().any()
+        has_p = res["ers_risk_P"].notna().any()
+        if not (has_pot or has_p):
+            print(f"  [WARN] {yr}: no Pot_Erosionsrisiko_t_ha_y / ers_risk_P columns")
+            continue
+ 
+        farm_ids = _region_farm_ids(cfg, region, yr)
+        if farm_ids is not None:
+            before = res["betr_ID"].nunique()
+            res = res[res["betr_ID"].isin(farm_ids)]
+            print(f"  {yr}: {res['betr_ID'].nunique()}/{before} farms within region")
+            if res.empty:
+                print(f"  [WARN] {yr}: no result rows fall within the region")
+                continue
+ 
+        res = res.assign(area_ha=res["Flaeche"] / 1e4)
+        per_year[yr] = res
+ 
+        total_area = res["area_ha"].sum()
+        print(f"  {yr}: {len(res)} polygons, {total_area:.0f} ha")
+        for col, name in [("pot_risk", "potential"), ("ers_risk_P", "P-combined")]:
+            sub = res.dropna(subset=[col])
+            if sub.empty:
+                continue
+            wm = np.average(sub[col], weights=sub["area_ha"])
+            med = _weighted_quantile(sub[col], sub["area_ha"], 0.5)
+            at_risk = sub.loc[sub[col] > thr, "area_ha"].sum()
+            print(f"    {name}: area-wt mean = {wm:.2f}, median = {med:.2f}, "
+                  f"max = {sub[col].max():.1f} t/ha/y; "
+                  f">{thr:g} on {at_risk:.0f} ha "
+                  f"({100 * at_risk / sub['area_ha'].sum():.1f}%)")
+ 
+        # Breakdowns of P-combined risk by tillage and by Tal/Berg
+        if has_p:
+            for grp_col in ["Bodenbearbeitung", "Region"]:
+                if res[grp_col].isna().all():
+                    continue
+                g = _wmean_by(res.dropna(subset=["ers_risk_P"]),
+                              "ers_risk_P", grp_col)
+                print(f"    P-combined by {grp_col}:")
+                for _, row in g.iterrows():
+                    print(f"      {row[grp_col]}: {row['ers_risk_P']:.2f} t/ha/y "
+                          f"({row['area_ha']:.0f} ha)")
+ 
+        # Per-municipality aggregation for maps
+        if res["Gemeinde"].notna().any():
+            gg = res.dropna(subset=["Gemeinde"])
+            if has_pot:
+                gem_pot[yr] = _wmean_by(gg, "pot_risk", "Gemeinde")
+            if has_p:
+                gem_p[yr] = _wmean_by(gg, "ers_risk_P", "Gemeinde")
+ 
+        # Per-crop summary CSV
+        rows = []
+        for crop, d in res.groupby("crop"):
+            row = {"crop": crop, "area_ha": d["area_ha"].sum(), "n_poly": len(d)}
+            for col in ["pot_risk", "ers_risk_P"]:
+                dd = d.dropna(subset=[col])
+                row[f"mean_{col}"] = (np.average(dd[col], weights=dd["area_ha"])
+                                      if not dd.empty else np.nan)
+            rows.append(row)
+        by_crop = (pd.DataFrame(rows)
+                   .sort_values("area_ha", ascending=False).head(20))
+        out_path = os.path.join(cfg["out_dir"], f"erosion_risk_by_crop_{yr}.csv")
+        by_crop.to_csv(out_path, index=False)
+        print(f"  Saved {out_path}")
+ 
+    if not per_year:
+        print("  [WARN] No erosion-risk data produced")
+        return None
+ 
+    _plot_risk_histograms(cfg, per_year, thr)
+    _plot_risk_by_tillage(cfg, per_year)
+ 
+    if gem_pot:
+        _gemeinde_choropleth(cfg, region, gem_pot, "pot_risk",
+                             "Potential erosion risk (t ha⁻¹ y⁻¹)",
+                             "map_pot_risk")
+    if gem_p:
+        _gemeinde_choropleth(cfg, region, gem_p, "ers_risk_P",
+                             "P-combined erosion risk (t ha⁻¹ y⁻¹)",
+                             "map_ers_risk_P")
+ 
+    return per_year
+ 
+ 
 # ===========================================================================
 # Summary text
 # ===========================================================================
-
+ 
 def write_summary(cfg: dict):
     """Write a short summary text file collecting all printed stats."""
     # This is a placeholder — the script prints stats as it goes.
@@ -1260,12 +1714,12 @@ def write_summary(cfg: dict):
     print(f"\n{'='*60}")
     print(f"All figures saved to {cfg['out_dir']}/")
     print(f"{'='*60}")
-
-
+ 
+ 
 # ===========================================================================
 # Main
 # ===========================================================================
-
+ 
 def main():
     parser = argparse.ArgumentParser(description="Area analysis: Seeland 2021 vs 2022")
     parser.add_argument("--skip-overview", action="store_true",
@@ -1276,61 +1730,69 @@ def main():
                         help="Skip pixel-output quality section")
     parser.add_argument("--skip-ei", action="store_true",
                         help="Skip EI analysis")
+    parser.add_argument("--skip-risk", action="store_true",
+                        help="Skip Section 7 (potential & P-combined erosion risk)")
     parser.add_argument("--region", type=str, default=None,
                         help="Override region file path")
     parser.add_argument("--out-dir", type=str, default=None,
                         help="Override output directory")
     args = parser.parse_args()
-
+ 
     cfg = dict(CONFIG)
     if args.region:
         cfg["region_path"] = args.region
     if args.out_dir:
         cfg["out_dir"] = args.out_dir
     _ensure_dir(cfg["out_dir"])
-
+ 
     # Load region
     print("Loading region boundary ...")
     region = load_region(cfg)
     region_2056 = region.to_crs("EPSG:2056")
     print(f"  Region area: {region_2056.union_all().area / 1e6:.1f} km²")
-
+ 
     # Section 0: Study area overview
     if not args.skip_overview:
         overview = analyse_study_area(cfg, region)
     else:
         print("\n[SKIP] Study area overview (--skip-overview)")
-
+ 
     # Section 1: Climate
     meteo_results = None
     if not args.skip_meteo:
         meteo_results = analyse_climate(cfg, region)
     else:
         print("\n[SKIP] Climate analysis (--skip-meteo)")
-
+ 
     # Section 2: Crops
     crop_stats = analyse_crops(cfg, region)
-
+ 
     # Section 3: Tillage
     tillage_data = analyse_tillage(cfg, region)
-
-    # Section 4: Reference C-factors
-    bridge = analyse_reference_cfactors(cfg, region, crop_stats)
-
+ 
+    # Section 4: Reported C-factors (from erosion-risk result files)
+    reported_c = analyse_reference_cfactors(cfg, region)
+ 
     # Section 5: EI
     if not args.skip_ei:
         ei_data = analyse_ei(cfg, region)
     else:
         print("\n[SKIP] EI analysis (--skip-ei)")
-
+ 
     # Section 6: S2 quality
     if not args.skip_s2:
         s2_fields = analyse_s2_quality(cfg)
     else:
         print("\n[SKIP] S2 quality analysis (--skip-s2)")
-
+ 
+    # Section 7: Erosion risk (potential & P-combined)
+    if not args.skip_risk:
+        risk_data = analyse_erosion_risk(cfg, region)
+    else:
+        print("\n[SKIP] Erosion-risk analysis (--skip-risk)")
+ 
     write_summary(cfg)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
