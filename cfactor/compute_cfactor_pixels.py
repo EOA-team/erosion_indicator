@@ -738,3 +738,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python compire_cfactor_pixels --region seeland.gpkg --years 2021 2022 --gpu --geotiff
