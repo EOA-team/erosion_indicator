@@ -22,6 +22,10 @@ A. WITHIN a product, ACROSS the years  -> how stable is each product 2021->2022?
    A'. ALSO compares stability of all 3 products on common (betr_ID, crop).
 B. WITHIN a year, ACROSS the products  -> where/why do they disagree
    (by crop, by elevation / Tal-Berg, by municipality), and which runs higher.
+D. TILLAGE-STRATIFIED breakdown (Pflug vs Mulch).
+E. FC TIME SERIES from extract_fc_pixels.py (the actual per-pixel gap-filled
+   FC in the region), year-to-year overlay -- overall and small-multiples
+   per crop. Context for why C may differ across years.
 C. SYNTHESIS -> headline strengths / weaknesses / patterns + a decision cheat-sheet.
 
 Sign conventions on every plot
@@ -42,6 +46,7 @@ Usage
     python compare_products.py --years 2021 2022
     python compare_products.py --skip-maps          # skip the heavy pixel maps
     python compare_products.py --skip-r             # empirical vs ML only
+    python compare_products.py --skip-fc            # skip the FC time-series section
 
 NB: paths below mirror ``analyse_area.py``. Edit CONFIG to match your machine.
 This script only *reads* the products; it never recomputes them.
@@ -135,6 +140,23 @@ CONFIG = {
     # The R product's crop label is ALWAYS Nutzung_DE_KatNutz, independent of
     # this setting.
     "crop_label_method": "lnf",
+
+    # --- FC time-series analysis (section E) -----------------------------
+    # Output of extract_fc_pixels.py (Stage A + A½ + GP, no C). This is the
+    # ACTUAL per-pixel gap-filled FC of pixels in the region -- NOT the
+    # calibration sample. The directory holds:
+    #   - year=YYYY/lnf_code=NNN/part-*.parquet  (per-pixel x per-DOAY grid)
+    #   - fc_fields_{year}.parquet               (per-field per-DOAY summary)
+    # Section E reads the small per-field summary by default; flip
+    # `fc_use_per_pixel` to True to load the full per-pixel grid instead.
+    "fc_pixels_dir":     "../cfactor/output/fc_pixels",
+    "fc_use_per_pixel":  False,
+    # How many crops to show in the per-crop small-multiples grid.
+    # Ranked by number of unique (poly_id, yr) fields (i.e. sample size).
+    "fc_top_n_crops":    12,
+    # Minimum per-(crop, year) field count for a crop panel to be plotted.
+    "fc_min_samples_per_crop": 30,
+
     "out_dir":          "figures_compare",
 }
 
@@ -370,6 +392,114 @@ def load_r_results(cfg: dict, year: int) -> pd.DataFrame | None:
     })
     out = out.dropna(subset=["Flaeche", "C_fact_detail"])
     return out[out["Flaeche"] > 0]
+
+
+def load_fc_timeseries(cfg: dict, lnf_bridge: dict, years) -> pd.DataFrame | None:
+    """Per-field per-DOAY gap-filled FC time series, region-restricted.
+
+    Data source is the output of ``extract_fc_pixels.py`` (the standalone
+    extractor that runs Stage A + A½ + GP from ``compute_cfactor_pixels.py``
+    but persists the FC grid instead of integrating to C). This is the
+    ACTUAL FC of pixels in the region -- NOT the calibration sample.
+
+    By default we read the per-field summary parquet
+    (``fc_fields_{year}.parquet``); set ``cfg['fc_use_per_pixel'] = True`` to
+    read the full hive-partitioned per-pixel grid instead (much heavier but
+    lets you compute pixel-level IQRs).
+
+    Returns
+    -------
+    DataFrame [yr, poly_id, lnf_code, time, doay, pv, npv, fc_total]
+        Per-field-per-DOAY when ``fc_use_per_pixel`` is False; per-pixel-per-
+        DOAY otherwise. Returns None if the directory or per-year files are
+        missing.
+
+    Notes
+    -----
+    The extractor was run with the same region.gpkg as this script, so every
+    pixel is already inside the region. ``lnf_bridge`` is used only as a
+    sanity filter -- rows whose ``poly_id`` falls outside the bridge are
+    dropped with an informational message.
+    """
+    fc_dir = cfg.get("fc_pixels_dir")
+    if not fc_dir:
+        print("  [INFO] fc_pixels_dir not configured -- skipping FC section")
+        return None
+    fc_dir = _expand(fc_dir)
+    if not os.path.isdir(fc_dir):
+        print(f"  [WARN] FC pixels dir not found at {fc_dir} -- skipping FC section")
+        print(f"         Generate it with `python extract_fc_pixels.py "
+              f"--region <region.gpkg> --years {' '.join(map(str, years))}`")
+        return None
+
+    use_pixel = bool(cfg.get("fc_use_per_pixel", False))
+    parts = []
+    for year in years:
+        if use_pixel:
+            ydir = os.path.join(fc_dir, f"year={year}")
+            if not os.path.isdir(ydir):
+                print(f"  [WARN] {ydir} not found -- year {year} missing "
+                      "from per-pixel grid")
+                continue
+            cols = ["poly_id", "lnf_code", "x", "y", "time", "doay",
+                    "pv", "npv", "fc_total"]
+            df = pd.read_parquet(ydir, columns=cols)
+            print(f"  {year}: {len(df):,} per-pixel rows, "
+                  f"{df['poly_id'].nunique():,} fields, "
+                  f"{df['doay'].nunique()} DOAYs")
+        else:
+            fld_path = os.path.join(fc_dir, f"fc_fields_{year}.parquet")
+            if not os.path.exists(fld_path):
+                print(f"  [WARN] {fld_path} not found -- "
+                      f"year {year} missing from per-field summary")
+                continue
+            # Per-field schema -> standardise to the same column names as
+            # the per-pixel schema for downstream code (no per-field "x, y").
+            fld = pd.read_parquet(fld_path)
+            df = pd.DataFrame({
+                "poly_id":  fld["poly_id"],
+                "lnf_code": fld["lnf_code"],
+                "time":     fld["time"],
+                "doay":     fld["doay"],
+                "pv":       fld["pv_mean"],
+                "npv":      fld["npv_mean"],
+                "fc_total": fld["fc_total_mean"],
+                "n_pixels": fld.get("n_pixels", 1),
+            })
+            print(f"  {year}: {len(df):,} per-field rows, "
+                  f"{df['poly_id'].nunique():,} fields, "
+                  f"{df['doay'].nunique()} DOAYs")
+        df["yr"] = int(year)
+        parts.append(df)
+    if not parts:
+        return None
+    df_fc = pd.concat(parts, ignore_index=True)
+
+    # Sanity filter against the bridge. Normally a no-op (extractor ran on
+    # the same region) -- loud if it isn't.
+    region_polys = set()
+    for y in years:
+        lb = lnf_bridge.get(y)
+        if lb is not None and "poly_id" in lb.columns:
+            region_polys |= set(pd.to_numeric(lb["poly_id"], errors="coerce")
+                                  .dropna().astype(int).tolist())
+    if region_polys:
+        df_fc["poly_id"] = pd.to_numeric(df_fc["poly_id"], errors="coerce").astype("Int64")
+        keep = df_fc["poly_id"].astype("Int64").isin(region_polys)
+        if not keep.all():
+            print(f"  [INFO] {(~keep).sum():,}/{len(df_fc):,} rows have a "
+                  f"poly_id outside the bridge region -- dropped (likely "
+                  f"a region mismatch between the extractor and this script)")
+            df_fc = df_fc[keep]
+
+    if df_fc.empty:
+        print("  [WARN] No FC rows after region filter")
+        return None
+
+    df_fc["time"]     = pd.to_datetime(df_fc["time"])
+    df_fc["lnf_code"] = pd.to_numeric(df_fc["lnf_code"], errors="coerce").astype("Int64")
+    df_fc["doay"]     = pd.to_numeric(df_fc["doay"], errors="coerce").astype("Int64")
+    return df_fc.reset_index(drop=True)
 
 
 # ===========================================================================
@@ -1951,6 +2081,245 @@ def across_year_by_tillage_transition(cfg: dict, y0: int, y1: int,
     savefig(fig, f"acrossyear_{y0}_{y1}_meanDC_by_tillage_transition.png", cfg)
 
 
+# ===========================================================================
+# E. FC TIME SERIES (calibration sample, 2021 vs 2022, overall + per-crop)
+# ===========================================================================
+
+# Day-of-agricultural-year (DOAY) reference: 1 July of yr-1 == DOAY 1.
+# Month tick positions are the DOAY of the 1st of each month, computed once.
+_AGRI_MONTHS = [("Jul", 1), ("Aug", 32), ("Sep", 63), ("Oct", 93),
+                ("Nov", 124), ("Dec", 154), ("Jan", 185), ("Feb", 216),
+                ("Mar", 244), ("Apr", 275), ("May", 305), ("Jun", 336)]
+
+
+def _agri_month_ticks():
+    """(positions, labels) for a DOAY x-axis."""
+    labs, pos = zip(*[(m, d) for m, d in _AGRI_MONTHS])
+    return list(pos), list(labs)
+
+
+def _fc_summary_by_doay(df: pd.DataFrame,
+                        group_cols: list[str],
+                        value_cols: list[str]) -> pd.DataFrame:
+    """Per (group, doay): mean, p25, p75, n_pixels for each value_col.
+
+    n_pixels = unique (poly_id, x, y) count, but the parquet has been
+    deduplicated upstream so just len(group) is fine here.
+    """
+    rows = []
+    for keys, g in df.groupby(group_cols + ["doay"], dropna=False):
+        keys = (keys,) if not isinstance(keys, tuple) else keys
+        rec = dict(zip(group_cols + ["doay"], keys))
+        rec["n"] = int(len(g))
+        for v in value_cols:
+            s = pd.to_numeric(g[v], errors="coerce").dropna()
+            if s.empty:
+                rec[f"{v}_mean"] = np.nan
+                rec[f"{v}_p25"]  = np.nan
+                rec[f"{v}_p75"]  = np.nan
+            else:
+                rec[f"{v}_mean"] = float(s.mean())
+                rec[f"{v}_p25"]  = float(s.quantile(0.25))
+                rec[f"{v}_p75"]  = float(s.quantile(0.75))
+        rows.append(rec)
+    return pd.DataFrame(rows).sort_values(group_cols + ["doay"]).reset_index(drop=True)
+
+
+def _plot_fc_panel(ax, summ_df: pd.DataFrame, value: str,
+                   years: list[int], ylabel: str, title: str | None = None,
+                   show_xticks: bool = True, show_legend: bool = True,
+                   show_n: bool = False):
+    """One panel: mean+IQR vs DOAY, one curve per year."""
+    for y in years:
+        d = summ_df[summ_df["yr"] == y].sort_values("doay")
+        if d.empty:
+            continue
+        c = YEAR_COLORS.get(y, "#888888")
+        ax.fill_between(d["doay"], d[f"{value}_p25"], d[f"{value}_p75"],
+                        color=c, alpha=0.18, linewidth=0)
+        lbl = f"{y}"
+        if show_n:
+            lbl = f"{y} (n={int(d['n'].median()):,}/doay)"
+        ax.plot(d["doay"], d[f"{value}_mean"], color=c, lw=1.6, label=lbl)
+    pos, labs = _agri_month_ticks()
+    ax.set_xlim(1, 365)
+    if show_xticks:
+        ax.set_xticks(pos)
+        ax.set_xticklabels(labs, fontsize=8)
+    else:
+        ax.set_xticks(pos)
+        ax.set_xticklabels([])
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.grid(True, axis="y", alpha=0.25, linewidth=0.5)
+    if title:
+        ax.set_title(title, fontsize=9)
+    if show_legend:
+        ax.legend(loc="best", fontsize=8, frameon=False)
+
+
+def plot_fc_overall(df_fc: pd.DataFrame, cfg: dict, summ: "Summary") -> None:
+    """Overall mean+IQR FC curves by DOAY, both years overlaid.
+
+    3 stacked panels: pv (live veg.), npv (residue), fc_total (= (pv+npv)*100).
+    """
+    years = sorted(df_fc["yr"].unique().tolist())
+    value_cols = ["pv", "npv", "fc_total"]
+    summ_df = _fc_summary_by_doay(df_fc, ["yr"], value_cols)
+    _savecsv(summ_df, f"fc_timeseries_overall_{'_'.join(map(str, years))}.csv", cfg)
+
+    fig, axes = plt.subplots(3, 1, figsize=(8.5, 7.0), sharex=True)
+    _plot_fc_panel(axes[0], summ_df, "pv", years, "PV (live veg.)",
+                   show_xticks=False, show_legend=True, show_n=True)
+    _plot_fc_panel(axes[1], summ_df, "npv", years, "NPV (residue)",
+                   show_xticks=False, show_legend=False)
+    _plot_fc_panel(axes[2], summ_df, "fc_total", years, "FC total (%)",
+                   show_xticks=True, show_legend=False)
+    axes[0].set_title(f"FC time series, gap-filled per-field summary over the region "
+                      f"({', '.join(map(str, years))}) -- mean +/- IQR by DOAY",
+                      fontsize=10)
+    axes[2].set_xlabel("Day of agricultural year (1 Jul = DOAY 1)", fontsize=9)
+    fig.tight_layout()
+    savefig(fig, f"fc_timeseries_overall_{'_'.join(map(str, years))}.png", cfg)
+
+    # Headline numbers in the summary
+    summ.add("")
+    summ.add("FC time series, REGION (extract_fc_pixels output, overall):")
+    for y in years:
+        d = summ_df[summ_df["yr"] == y]
+        if d.empty:
+            continue
+        peak_doay = int(d.loc[d["fc_total_mean"].idxmax(), "doay"])
+        peak_val  = float(d["fc_total_mean"].max())
+        ann_mean  = float(d["fc_total_mean"].mean())
+        n_med     = int(d["n"].median())
+        summ.add(f"  {y}: mean FC_total over year = {ann_mean:5.1f}%,  "
+                 f"peak = {peak_val:5.1f}% at DOAY {peak_doay:3d},  "
+                 f"~{n_med:,} pixels/DOAY")
+    if len(years) == 2:
+        d0 = summ_df[summ_df["yr"] == years[0]].set_index("doay")["fc_total_mean"]
+        d1 = summ_df[summ_df["yr"] == years[1]].set_index("doay")["fc_total_mean"]
+        common = d0.index.intersection(d1.index)
+        if len(common) > 0:
+            delta = (d1.loc[common] - d0.loc[common]).mean()
+            summ.add(f"  mean(FC_total {years[1]}) - mean(FC_total {years[0]}) "
+                     f"= {delta:+.2f} pp (averaged over common DOAYs)")
+
+
+def plot_fc_per_crop(df_fc: pd.DataFrame, cfg: dict,
+                     crop_by_lnf: dict, crop_by_poly: dict | None,
+                     summ: "Summary") -> None:
+    """Small-multiples grid of FC_total curves, one panel per top-N crop.
+
+    Top-N selected by total number of unique (poly_id, yr) samples;
+    crops with < ``cfg['fc_min_samples_per_crop']`` samples in EITHER year
+    are dropped.
+    """
+    years = sorted(df_fc["yr"].unique().tolist())
+    top_n = int(cfg.get("fc_top_n_crops", 12))
+    min_n = int(cfg.get("fc_min_samples_per_crop", 30))
+
+    # Label rows with a crop string. crop_by_poly is a per-year dict; iterate
+    # per year, label, and concat -- consistent with how _label_field_crops
+    # treats the per-year poly map.
+    parts = []
+    for y in years:
+        sub = df_fc[df_fc["yr"] == y].copy()
+        if sub.empty:
+            continue
+        sub["poly_id"] = sub["poly_id"].astype("Int64")
+        sub["crop"] = _label_field_crops(
+            sub, crop_by_lnf,
+            (crop_by_poly if crop_by_poly else None),
+            cfg, poly_col="poly_id", lnf_col="lnf_code", year=y,
+        )
+        parts.append(sub)
+    if not parts:
+        print("  [WARN] No FC rows to label per crop")
+        return
+    df_fc_lab = pd.concat(parts, ignore_index=True)
+    df_fc_lab["crop"] = df_fc_lab["crop"].astype(str).str.strip().replace(
+        {"nan": "", "None": "", "<NA>": ""})
+    df_fc_lab = df_fc_lab[df_fc_lab["crop"].ne("")]
+
+    # Rank by sample size = unique (poly_id, yr) count across years.
+    counts = (df_fc_lab[["crop", "poly_id", "yr"]]
+              .drop_duplicates()
+              .groupby("crop").size().rename("n_samples")
+              .sort_values(ascending=False))
+    # Require enough samples per (crop, year) -- otherwise IQR is noise.
+    per_yr = (df_fc_lab[["crop", "poly_id", "yr"]]
+              .drop_duplicates()
+              .groupby(["crop", "yr"]).size().unstack(fill_value=0))
+    keep = per_yr[(per_yr >= min_n).all(axis=1)].index
+    counts = counts.loc[counts.index.isin(keep)]
+    crops = counts.head(top_n).index.tolist()
+    if not crops:
+        summ.add(f"  [WARN] No crop has >= {min_n} samples in every year "
+                 f"-- skipping per-crop FC panels")
+        return
+    summ.add(f"  FC per-crop: showing top {len(crops)} of {len(counts)} crops "
+             f"with >= {min_n} samples per year")
+
+    summ_df = _fc_summary_by_doay(df_fc_lab[df_fc_lab["crop"].isin(crops)],
+                                  ["crop", "yr"], ["fc_total"])
+    _savecsv(summ_df, f"fc_timeseries_by_crop_{'_'.join(map(str, years))}.csv", cfg)
+
+    # Layout: 3 columns, ceil(N/3) rows
+    ncols = 3
+    nrows = int(np.ceil(len(crops) / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(4.2 * ncols, 2.6 * nrows),
+                             sharex=True, sharey=True)
+    axes = np.atleast_2d(axes)
+    pos, labs = _agri_month_ticks()
+    for i, crop in enumerate(crops):
+        ax = axes[i // ncols, i % ncols]
+        d_crop = summ_df[summ_df["crop"] == crop]
+        for y in years:
+            d = d_crop[d_crop["yr"] == y].sort_values("doay")
+            if d.empty:
+                continue
+            c = YEAR_COLORS.get(y, "#888888")
+            ax.fill_between(d["doay"], d["fc_total_p25"], d["fc_total_p75"],
+                            color=c, alpha=0.18, linewidth=0)
+            n_y = int(per_yr.loc[crop, y]) if crop in per_yr.index else 0
+            ax.plot(d["doay"], d["fc_total_mean"], color=c, lw=1.3,
+                    label=f"{y} (n={n_y})")
+        # Truncate long crop labels so they don't overflow the panel
+        title = crop if len(crop) <= 32 else crop[:30] + ".."
+        ax.set_title(title, fontsize=9)
+        ax.set_xlim(1, 365)
+        ax.set_xticks(pos)
+        ax.set_xticklabels(labs, fontsize=7, rotation=0)
+        ax.grid(True, axis="y", alpha=0.25, linewidth=0.5)
+        ax.legend(loc="upper right", fontsize=7, frameon=False)
+    # Hide any unused axes
+    for j in range(len(crops), nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+    # One y-label per row, one x-label on the bottom row
+    for r in range(nrows):
+        axes[r, 0].set_ylabel("FC total (%)", fontsize=9)
+    for c in range(ncols):
+        bot = min(nrows - 1, (len(crops) - 1) // ncols)
+        axes[bot, c].set_xlabel("DOAY", fontsize=8)
+    fig.suptitle(f"FC_total time series by crop, region "
+                 f"({', '.join(map(str, years))}), mean +/- IQR",
+                 fontsize=11, y=1.005)
+    fig.tight_layout()
+    savefig(fig, f"fc_timeseries_by_crop_{'_'.join(map(str, years))}.png", cfg)
+
+
+def fc_timeseries_section(cfg: dict, lnf_bridge: dict,
+                          crop_by_lnf: dict, crop_by_poly: dict | None,
+                          summ: "Summary") -> None:
+    """Section E orchestrator: overall + per-crop FC curves, both years overlaid."""
+    df_fc = load_fc_timeseries(cfg, lnf_bridge, cfg["years"])
+    if df_fc is None or df_fc.empty:
+        return
+    plot_fc_overall(df_fc, cfg, summ)
+    plot_fc_per_crop(df_fc, cfg, crop_by_lnf, crop_by_poly, summ)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Compare empirical / ML / previous C-factor products")
     ap.add_argument("--years", nargs="+", type=int, default=None)
@@ -1961,6 +2330,7 @@ def main():
     ap.add_argument("--skip-r", action="store_true", help="skip the R product entirely")
     ap.add_argument("--skip-maps", action="store_true", help="skip the heavy pixel maps")
     ap.add_argument("--skip-tillage", action="store_true", help="skip the tillage-stratified breakdown")
+    ap.add_argument("--skip-fc", action="store_true", help="skip the FC time-series breakdown")
     a = ap.parse_args()
 
     cfg = dict(CONFIG)
@@ -2052,6 +2422,11 @@ def main():
             across_year_by_tillage_transition(cfg, ys[0], ys[-1], tillage_map,
                                               lnf_bridge, crop_by_lnf,
                                               crop_by_poly, summ)
+
+    # E. FC time-series breakdown (calibration sample, region-restricted)
+    if not a.skip_fc:
+        summ.section("E. FC TIME SERIES (calibration sample, year-to-year)")
+        fc_timeseries_section(cfg, lnf_bridge, crop_by_lnf, crop_by_poly, summ)
 
     # C. synthesis
     synthesis(cfg, summ)
