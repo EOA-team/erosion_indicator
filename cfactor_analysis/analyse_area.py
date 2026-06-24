@@ -12,9 +12,9 @@ Produces figures and summary statistics characterising the study area:
   7. Erosion risk — potential & P-combined (stats, plots, municipality maps)
  
 Usage:
-    python analyse_area.py
-    python analyse_area.py --skip-meteo   # skip slow MeteoSwiss loading
-    python analyse_area.py --skip-s2      # skip pixel-output quality section
+    python area_analysis.py
+    python area_analysis.py --skip-meteo   # skip slow MeteoSwiss loading
+    python area_analysis.py --skip-s2      # skip pixel-output quality section
 """
 from __future__ import annotations
  
@@ -160,13 +160,26 @@ def region_bounds_32632(region: gpd.GeoDataFrame) -> tuple:
     return tuple(region.to_crs("EPSG:32632").total_bounds)
  
  
-def discover_meteo_tiles(cfg: dict, region: gpd.GeoDataFrame) -> list[tuple[int, int]]:
-    """Find (minx, maxy) tile keys overlapping the region, using the S2 grid."""
+def discover_meteo_tiles(cfg: dict, region: gpd.GeoDataFrame
+                         ) -> list[tuple[int, int, float]]:
+    """Find tiles overlapping the region with intersection-area weights.
+
+    Returns a list of ``(minx, maxy, weight_m2)`` tuples, where ``weight_m2``
+    is the area of intersection between the tile polygon and the region
+    (computed in the grid's CRS, typically metres). Tiles that only touch
+    the boundary (zero overlap area) are dropped.
+    """
     grid = gpd.read_file(_expand(cfg["s2_grid_path"]))
-    region_crs = region.to_crs(grid.crs)
-    hits = grid[grid.intersects(region_crs.union_all())]
-    # The grid has 'left' and 'top' columns matching the tile naming
-    return list(zip(hits["left"].astype(int), hits["top"].astype(int)))
+    region_geom = region.to_crs(grid.crs).union_all()
+    hits = grid[grid.intersects(region_geom)].copy()
+    # Intersection area as the per-tile weight (in CRS units, here m²)
+    hits["weight"] = hits.geometry.intersection(region_geom).area
+    hits = hits[hits["weight"] > 0]
+    return list(zip(
+        hits["left"].astype(int),
+        hits["top"].astype(int),
+        hits["weight"].astype(float),
+    ))
  
  
 def savefig(fig, name: str, cfg: dict, dpi: int = 180):
@@ -256,6 +269,26 @@ YEAR_LABELS = {2021: "2021", 2022: "2022"}
  
 def _year_color(yr: int) -> str:
     return YEAR_COLORS.get(yr, "#999999")
+
+
+# --- Agricultural year helpers --------------------------------------------
+# Agricultural year `year` runs 1 July (year-1) to 30 June (year).
+# These are used by the climate (meteo) section so figures span the
+# growing-season cycle rather than the calendar year.
+
+def _agri_year_range(year: int) -> tuple[str, str]:
+    """ISO start/end of agricultural year `year` (Jul (year-1) → Jun year)."""
+    return f"{year - 1}-07-01", f"{year}-06-30"
+
+
+def _agri_year_label(year: int) -> str:
+    """Compact label, e.g. 2021 → '2020/21'."""
+    return f"{year - 1}/{year % 100:02d}"
+
+
+# 1=July, 12=June — position within the agricultural year
+_AGRI_MONTH_ORDER = [7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6]
+_AGRI_MONTH_LABELS = ["J", "A", "S", "O", "N", "D", "J", "F", "M", "A", "M", "J"]
  
  
 # ===========================================================================
@@ -361,36 +394,31 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
     area_km2 = region_2056.union_all().area / 1e6
     print(f"  Region area: {area_km2:.1f} km²")
  
-    # --- Crop labels + crop1990 -> lv3 bridge (year-independent) ---
-    crop_labels = load_crop1990_labels(cfg)
-    bridge = crop1990_to_lnf_bridge(cfg)
-    label_to_lv3 = (bridge.drop_duplicates("crop_label")
-                    .set_index("crop_label")["Crop_Label_lv3"].to_dict())
-    code_to_name = {c: v["name"] for c, v in crop_labels.items()}
-    code_to_lv3 = {c: label_to_lv3.get(v["name"], "Other")
-                   for c, v in crop_labels.items()}
-
-    # --- Load crop rasters for every configured year ---
-    crop_rasters = {}  # year -> (data, meta, pix_area)
-    for yr in cfg["years"]:
-        try:
-            data, meta, pix_area = load_crop_raster(yr, region, cfg)
-            crop_rasters[yr] = (data, meta, pix_area)
-            print(f"  Crop raster ({yr}): {data.shape}, "
-                  f"pixel = {pix_area:.0f} m², "
-                  f"{np.count_nonzero(data)} classified pixels")
-        except FileNotFoundError as e:
-            print(f"  [WARN] {e}")
-
-    # --- Area stats from the first year's raster (drives the lv3 panel) ---
+    # --- Load crop raster for the first year ---
     yr0 = cfg["years"][0]
+    crop_labels = load_crop1990_labels(cfg)
+    try:
+        crop_data, crop_meta, pix_area = load_crop_raster(yr0, region, cfg)
+        print(f"  Crop raster ({yr0}): {crop_data.shape}, "
+              f"pixel = {pix_area:.0f} m², "
+              f"{np.count_nonzero(crop_data)} classified pixels")
+    except FileNotFoundError as e:
+        print(f"  [WARN] {e}")
+        crop_data = None
+ 
+    # --- Area stats from the raster ---
     total_ag_ha = 0
     lv3_summary = {}
-    n_crop_types = 0
-    arable_ha = grassland_ha = 0
-    if yr0 in crop_rasters:
-        data, _, pix_area = crop_rasters[yr0]
-        codes, counts = np.unique(data[data > 0], return_counts=True)
+    if crop_data is not None:
+        bridge = crop1990_to_lnf_bridge(cfg)
+        # crop1990 code → Crop_Label_lv3 (take most common lv3 per crop label)
+        label_to_lv3 = (bridge.drop_duplicates("crop_label")
+                        .set_index("crop_label")["Crop_Label_lv3"].to_dict())
+        code_to_name = {c: v["name"] for c, v in crop_labels.items()}
+        code_to_lv3 = {c: label_to_lv3.get(v["name"], "Other")
+                       for c, v in crop_labels.items()}
+ 
+        codes, counts = np.unique(crop_data[crop_data > 0], return_counts=True)
         for code, cnt in zip(codes, counts):
             ha = cnt * pix_area / 1e4
             lv3 = code_to_lv3.get(int(code), "Other")
@@ -399,29 +427,25 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
         n_crop_types = len(codes)
         arable_ha = lv3_summary.get("Arable Land", 0)
         grassland_ha = lv3_summary.get("Grassland", 0)
-        print(f"  Classified area ({yr0}): {total_ag_ha:.0f} ha, "
+        print(f"  Classified area: {total_ag_ha:.0f} ha, "
               f"{n_crop_types} crop types")
         for cat in sorted(lv3_summary, key=lv3_summary.get, reverse=True):
             print(f"    {cat}: {lv3_summary[cat]:.0f} ha "
                   f"({100 * lv3_summary[cat] / total_ag_ha:.1f}%)")
-
+ 
     # --- Elevation stats from tbl_nutzungsdaten + LNF gpkg ---
     elev_stats = _elevation_stats(cfg, region)
-
-    # --- Figure: 2x2 overview ---
-    #   row 1: (CH context)         (lv3 arable / grassland / other map)
-    #   row 2: (crop map year 1)    (crop map year 2)
-    from matplotlib.patches import Patch
-
-    fig, axes = plt.subplots(2, 2, figsize=(13, 12.5))
-    ax_ch = axes[0, 0]
-    ax_lv3 = axes[0, 1]
-    crop_years = cfg["years"][:2]
-    crop_axes = {yr: axes[1, i] for i, yr in enumerate(crop_years)}
-    # Hide any unused bottom-row cell (if only one year configured)
-    for j in range(len(crop_years), 2):
-        axes[1, j].set_visible(False)
-
+ 
+    # --- Figure: 3-panel overview ---
+    #   (1) Switzerland context with basemap
+    #   (2) per-crop map
+    #   (3) lv3 (arable / grassland / permanent / ...) classification
+    fig = plt.figure(figsize=(16, 5.5))
+    fig = plt.figure(figsize=(16, 6.5))
+    ax_ch = fig.add_axes([0.02, 0.20, 0.27, 0.72])
+    ax_crop = fig.add_axes([0.34, 0.20, 0.30, 0.72])
+    ax_lv3 = fig.add_axes([0.68, 0.20, 0.30, 0.72])
+ 
     lv3_rgb = {
         "Arable Land":                (232, 197, 71),
         "Grassland":                  (102, 187, 106),
@@ -429,29 +453,67 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
         "Ecological infrastructure":  (38, 166, 154),
         "Other":                      (189, 189, 189),
     }
-
-    # ---- Panel (0,0): Switzerland context map ----
+ 
+    # ---- Panel 1: Switzerland context map with basemap ----
     _plot_switzerland_context(ax_ch, region, cfg)
-
-    # ---- Panel (0,1): lv3 classification (year yr0) ----
+ 
+    # ---- Panel 2: per-crop map ----
+    region_2056.boundary.plot(ax=ax_crop, color="#333333", linewidth=1.2,
+                              linestyle="--", zorder=5)
+    if crop_data is not None:
+        tf = crop_meta["transform"]
+        h, w = crop_data.shape
+        extent = [tf.c, tf.c + tf.a * w, tf.f + tf.e * h, tf.f]
+ 
+        # per-crop RGB
+        rgb_crop = np.ones((h, w, 3), dtype=np.uint8) * 255
+        for code, info in crop_labels.items():
+            mask = crop_data == code
+            if mask.any():
+                rgb_crop[mask] = info["rgb"]
+        ax_crop.imshow(rgb_crop, extent=extent, origin="upper",
+                       interpolation="nearest")
+ 
+        # Compact legend: top crops by area, restricted to Arable Land /
+        # Grassland classes (skip forest, built-up, water, etc.)
+        from matplotlib.patches import Patch
+        crop_lv3 = {"Arable Land", "Grassland"}
+        codes, counts = np.unique(crop_data[crop_data > 0], return_counts=True)
+        order = np.argsort(counts)[::-1]
+        top_handles = []
+        for i in order:
+            code = int(codes[i])
+            if code not in crop_labels:
+                continue
+            if code_to_lv3.get(code) not in crop_lv3:
+                continue
+            top_handles.append(
+                Patch(facecolor=np.array(crop_labels[code]["rgb"]) / 255,
+                      label=code_to_name.get(code, str(code))))
+            if len(top_handles) >= 12:
+                break
+        ax_crop.legend(handles=top_handles, loc="upper center",
+                       bbox_to_anchor=(0.5, -0.12), fontsize=6,
+                       framealpha=0.9, title="Top crops", title_fontsize=7,
+                       ncol=3, columnspacing=1.0, handletextpad=0.4)
+    ax_crop.set_aspect("equal")
+    ax_crop.set_title(f"Crop map ({yr0})", fontsize=11)
+ 
+    # ---- Panel 3: lv3 classification ----
     region_2056.boundary.plot(ax=ax_lv3, color="#333333", linewidth=1.2,
                               linestyle="--", zorder=5)
-    if yr0 in crop_rasters:
-        data, meta, _ = crop_rasters[yr0]
-        tf = meta["transform"]
-        h, w = data.shape
-        extent_lv3 = [tf.c, tf.c + tf.a * w, tf.f + tf.e * h, tf.f]
-
+    if crop_data is not None:
         rgb_lv3 = np.ones((h, w, 3), dtype=np.uint8) * 255
         for code in crop_labels:
-            mask = data == code
+            mask = crop_data == code
             if not mask.any():
                 continue
             lv3 = code_to_lv3.get(code, "Other")
             rgb_lv3[mask] = lv3_rgb.get(lv3, lv3_rgb["Other"])
-        ax_lv3.imshow(rgb_lv3, extent=extent_lv3, origin="upper",
+        ax_lv3.imshow(rgb_lv3, extent=extent, origin="upper",
                       interpolation="nearest")
-
+ 
+        from matplotlib.patches import Patch
         lv3_handles = [
             Patch(facecolor=np.array(c) / 255,
                   label=f"{cat} ({lv3_summary.get(cat, 0):.0f} ha)")
@@ -462,72 +524,22 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
                       framealpha=0.9)
     ax_lv3.set_aspect("equal")
     ax_lv3.set_title(f"Land-use classification ({yr0})", fontsize=11)
-
-    # ---- Panels (1, *): per-crop maps, one per year ----
-    for yr, ax_crop in crop_axes.items():
-        region_2056.boundary.plot(ax=ax_crop, color="#333333", linewidth=1.2,
-                                  linestyle="--", zorder=5)
-        if yr in crop_rasters:
-            data, meta, _ = crop_rasters[yr]
-            tf = meta["transform"]
-            h, w = data.shape
-            extent = [tf.c, tf.c + tf.a * w, tf.f + tf.e * h, tf.f]
-            rgb_crop = np.ones((h, w, 3), dtype=np.uint8) * 255
-            for code, info in crop_labels.items():
-                mask = data == code
-                if mask.any():
-                    rgb_crop[mask] = info["rgb"]
-            ax_crop.imshow(rgb_crop, extent=extent, origin="upper",
-                           interpolation="nearest")
-        ax_crop.set_aspect("equal")
-        ax_crop.set_title(f"Crop map ({yr})", fontsize=11)
-
-    # Shared axis formatting for all Seeland-zoom panels
-    for ax in (ax_lv3, *crop_axes.values()):
+ 
+    # Shared axis formatting for the two zoom panels
+    for ax in (ax_crop, ax_lv3):
         ax.tick_params(labelsize=7)
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(
             lambda x, _: f"{x / 1e3:.0f}"))
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(
             lambda x, _: f"{x / 1e3:.0f}"))
-    for ax in crop_axes.values():
-        ax.set_xlabel("E (km)", fontsize=8)
-    if crop_axes:
-        list(crop_axes.values())[0].set_ylabel("N (km)", fontsize=8)
-    ax_lv3.set_ylabel("N (km)", fontsize=8)
-
-    # --- Shared crop legend: top crops by area combined across all years,
-    # restricted to Arable Land / Grassland classes ---
-    if crop_rasters:
-        crop_lv3 = {"Arable Land", "Grassland"}
-        combined_counts: dict[int, int] = {}
-        for yr, (data, _, _) in crop_rasters.items():
-            codes, counts = np.unique(data[data > 0], return_counts=True)
-            for c, n in zip(codes, counts):
-                combined_counts[int(c)] = combined_counts.get(int(c), 0) + int(n)
-        ordered = sorted(combined_counts.items(), key=lambda kv: kv[1],
-                         reverse=True)
-        top_handles = []
-        for code, _ in ordered:
-            if code not in crop_labels:
-                continue
-            if code_to_lv3.get(code) not in crop_lv3:
-                continue
-            top_handles.append(
-                Patch(facecolor=np.array(crop_labels[code]["rgb"]) / 255,
-                      label=code_to_name.get(code, str(code))))
-            if len(top_handles) >= 12:
-                break
-        if top_handles:
-            fig.legend(handles=top_handles, loc="lower center",
-                       bbox_to_anchor=(0.5, 0.0), fontsize=7,
-                       framealpha=0.9, title="Top crops (combined across years)",
-                       title_fontsize=8, ncol=6, columnspacing=1.2,
-                       handletextpad=0.5)
-
+    # crop panel x-label omitted (legend sits below it); lv3 keeps it
+    ax_lv3.set_xlabel("E (km)", fontsize=8)
+    ax_crop.set_ylabel("N (km)", fontsize=8)
+ 
     # --- Text box with key stats (on the lv3 panel) ---
     stats_text = f"District area: {area_km2:.0f} km²"
     if total_ag_ha > 0:
-        stats_text += f"\nClassified agric. land ({yr0}): {total_ag_ha:.0f} ha"
+        stats_text += f"\nClassified agric. land: {total_ag_ha:.0f} ha"
         stats_text += f"\n  Arable: {arable_ha:.0f} ha"
         stats_text += f"\n  Grassland: {grassland_ha:.0f} ha"
         stats_text += f"\n  Crop types: {n_crop_types}"
@@ -541,10 +553,7 @@ def analyse_study_area(cfg: dict, region: gpd.GeoDataFrame):
                 fontsize=8, verticalalignment="top",
                 bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
                           alpha=0.85, edgecolor="#CCCCCC"))
-
-    # Leave room at the bottom for the shared legend
-    fig.subplots_adjust(left=0.05, right=0.97, top=0.95, bottom=0.10,
-                        wspace=0.18, hspace=0.18)
+ 
     savefig(fig, "study_area_overview.png", cfg)
  
     # --- Elevation histogram ---
@@ -632,57 +641,105 @@ def _elevation_stats(cfg: dict, region: gpd.GeoDataFrame) -> dict | None:
           f"({stats['n_matched']} fields matched)")
     return stats
  
-def _load_meteo_var(var: str, year: int, tiles: list[tuple[int, int]],
-                    cfg: dict) -> xr.Dataset:
-    """Load and merge all tiles for one MeteoSwiss variable + year."""
-    base = _expand(cfg["meteo_base"])
-    # var names in config are like "RhiresD" — the folder name drops the D
-    # Pattern: MeteoSwiss_{var}_{minx}_{maxy}_{year}0101_{year}1231.zarr
-    # Folder:  {meteo_base}/{var_folder}/
-    # The var in filename includes the D suffix: e.g. RhiresD
-    var_folder = var.replace("D", "")  # Rhires, Tabs, Srel
-    datasets = []
-    for minx, maxy in tiles:
-        fname = f"MeteoSwiss_{var}_{minx}_{maxy}_{year}0101_{year}1231.zarr"
-        path = os.path.join(base, var_folder, fname)
-        if not os.path.exists(path):
-            # try with the folder name = var (with D)
-            path = os.path.join(base, var, fname)
-        if not os.path.exists(path):
-            continue
-        try:
-            ds = xr.open_zarr(path)
-            datasets.append(ds)
-        except Exception as e:
-            print(f"    [WARN] Cannot open {path}: {e}")
-    if not datasets:
-        return None
-    return xr.concat(datasets, dim="time") if len(datasets) > 1 else datasets[0]
- 
- 
 def _meteo_monthly_agg(var: str, year: int, tiles: list, cfg: dict,
                        agg: str = "sum") -> pd.Series | None:
-    """Return monthly aggregated values (mean over spatial tiles) for one var+year."""
-    ds = _load_meteo_var(var, year, tiles, cfg)
-    if ds is None:
+    """Return monthly aggregated values for AGRICULTURAL year ``year``.
+
+    The agricultural year covers 1 Jul (year-1) → 30 Jun (year). Per tile,
+    the previous and current calendar-year zarr files are opened, the
+    series is sliced to Jul–Jun, the spatial mean is taken (one tile in
+    memory at a time), and per-tile series are combined as an
+    area-weighted mean across tiles (weights from :func:`discover_meteo_tiles`).
+
+    Returned Series is indexed 1..12 = Jul..Jun, so callers can plot
+    against ``range(1, 13)`` together with ``_AGRI_MONTH_LABELS``.
+
+    The previous implementation concatenated all tiles' lazy zarr arrays
+    along ``time`` and used calendar years; the spatial-tile concat
+    triggered an outer-join on mismatched ``x,y`` coords and materialised
+    an enormous, mostly NaN array on ``.to_dataframe()`` — the cause of
+    the 9-hour hang and OOM kill.
+    """
+    base = _expand(cfg["meteo_base"])
+    # var names in config are like "RhiresD" — the folder name drops the D.
+    # Filename pattern: MeteoSwiss_{var}_{minx}_{maxy}_{year}0101_{year}1231.zarr
+    var_folder = var.replace("D", "")  # Rhires, Tabs, Srel
+    start, end = _agri_year_range(year)
+
+    def _open_tile_year(minx: int, maxy: int, yr: int) -> xr.DataArray | None:
+        fname = f"MeteoSwiss_{var}_{minx}_{maxy}_{yr}0101_{yr}1231.zarr"
+        path = os.path.join(base, var_folder, fname)
+        if not os.path.exists(path):
+            path = os.path.join(base, var, fname)
+        if not os.path.exists(path):
+            return None
+        try:
+            ds = xr.open_zarr(path)
+        except Exception as e:
+            print(f"    [WARN] Cannot open {path}: {e}")
+            return None
+        data_vars = list(ds.data_vars)
+        if len(data_vars) == 1:
+            return ds[data_vars[0]]
+        cands = [v for v in data_vars
+                 if var.replace("D", "").lower() in v.lower()]
+        return ds[cands[0]] if cands else ds[data_vars[0]]
+
+    series: list[xr.DataArray] = []
+    weights: list[float] = []
+    missing_prev = 0
+    for tile in tiles:
+        # Back-compat unpack: old (minx, maxy) tuples still work
+        if len(tile) == 3:
+            minx, maxy, w = tile
+        else:
+            minx, maxy = tile
+            w = 1.0
+
+        parts = []
+        prev_da = _open_tile_year(minx, maxy, year - 1)
+        if prev_da is not None:
+            parts.append(prev_da)
+        else:
+            missing_prev += 1
+        cur_da = _open_tile_year(minx, maxy, year)
+        if cur_da is not None:
+            parts.append(cur_da)
+        if not parts:
+            continue
+        # Same tile across years → identical x,y coords → safe to concat on time
+        da = xr.concat(parts, dim="time") if len(parts) > 1 else parts[0]
+        da = da.sel(time=slice(start, end))
+        if da.sizes.get("time", 0) == 0:
+            continue
+
+        # Spatial mean for this tile only — small, loads just this tile.
+        try:
+            tile_mean = (da.mean(dim=[d for d in da.dims if d != "time"])
+                           .compute())
+        except Exception as e:
+            print(f"    [WARN] Cannot reduce tile ({minx},{maxy}): {e}")
+            continue
+        series.append(tile_mean)
+        weights.append(float(w))
+
+    if missing_prev:
+        print(f"    [WARN] Previous-year zarr missing for {missing_prev} "
+              f"tile(s); their Jul–Dec {year - 1} contribution is omitted.")
+    if not series:
         return None
-    # Take spatial mean first, then monthly aggregate
-    data_vars = list(ds.data_vars)
-    if len(data_vars) == 1:
-        da = ds[data_vars[0]]
-    else:
-        # pick the one that looks like the main variable
-        candidates = [v for v in data_vars if var.replace("D", "").lower() in v.lower()]
-        da = ds[candidates[0]] if candidates else ds[data_vars[0]]
- 
-    spatial_mean = da.mean(dim=[d for d in da.dims if d != "time"])
-    df = spatial_mean.to_dataframe().reset_index()
+
+    stacked = xr.concat(series, dim="tile")
+    w_da = xr.DataArray(np.asarray(weights, dtype=float), dims="tile")
+    combined = stacked.weighted(w_da).mean(dim="tile")
+
+    df = combined.to_dataframe(name="val").reset_index()
     df["month"] = pd.to_datetime(df["time"]).dt.month
-    col = da.name
-    if agg == "sum":
-        monthly = df.groupby("month")[col].sum()
-    else:
-        monthly = df.groupby("month")[col].mean()
+    monthly = (df.groupby("month")["val"].sum() if agg == "sum"
+               else df.groupby("month")["val"].mean())
+    # Reorder to agricultural-year position: 1=Jul ... 12=Jun
+    monthly = monthly.reindex(_AGRI_MONTH_ORDER)
+    monthly.index = pd.RangeIndex(1, 13, name="agri_month")
     return monthly
  
  
@@ -703,41 +760,44 @@ def analyse_climate(cfg: dict, region: gpd.GeoDataFrame):
         spec = meteo_specs.get(var, {"agg": "mean", "label": var, "title": var})
         fig, ax = plt.subplots(figsize=(8, 4))
         for yr in cfg["years"]:
-            print(f"  Loading {var} {yr} ...")
+            agri = _agri_year_label(yr)
+            print(f"  Loading {var} {agri} (agri-year, Jul {yr-1}–Jun {yr}) ...")
             monthly = _meteo_monthly_agg(var, yr, tiles, cfg, agg=spec["agg"])
             if monthly is None:
-                print(f"    [WARN] No data for {var} {yr}")
+                print(f"    [WARN] No data for {var} {agri}")
                 continue
             results[(var, yr)] = monthly
             if spec["agg"] == "sum":
                 ax.bar(monthly.index + (cfg["years"].index(yr) - 0.5) * 0.35,
                        monthly.values, width=0.35,
-                       color=_year_color(yr), label=YEAR_LABELS[yr])
+                       color=_year_color(yr), label=agri)
             else:
                 ax.plot(monthly.index, monthly.values, "o-",
-                        color=_year_color(yr), label=YEAR_LABELS[yr])
+                        color=_year_color(yr), label=agri)
  
-        ax.set_xlabel("Month")
+        ax.set_xlabel("Month (agricultural year, Jul → Jun)")
         ax.set_ylabel(spec["label"])
         ax.set_title(spec["title"])
         ax.set_xticks(range(1, 13))
-        ax.set_xticklabels(["J", "F", "M", "A", "M", "J",
-                            "J", "A", "S", "O", "N", "D"])
+        ax.set_xticklabels(_AGRI_MONTH_LABELS)
         ax.legend()
         ax.grid(axis="y", alpha=0.3)
         savefig(fig, f"climate_{var}.png", cfg)
  
-    # Annual totals / means summary
+    # Annual totals / means summary (agricultural year)
     summary_lines = []
     for var in cfg["meteo_vars"]:
         spec = meteo_specs.get(var, {"agg": "mean", "label": var})
         for yr in cfg["years"]:
             key = (var, yr)
             if key in results:
-                val = results[key].sum() if spec["agg"] == "sum" else results[key].mean()
-                summary_lines.append(f"  {var} {yr}: {'total' if spec['agg'] == 'sum' else 'mean'} = {val:.1f}")
+                val = (results[key].sum() if spec["agg"] == "sum"
+                       else results[key].mean())
+                kind = "total" if spec["agg"] == "sum" else "mean"
+                summary_lines.append(
+                    f"  {var} {_agri_year_label(yr)}: {kind} = {val:.1f}")
     if summary_lines:
-        print("  Annual summary:")
+        print("  Annual summary (agricultural year):")
         for line in summary_lines:
             print(line)
     return results
