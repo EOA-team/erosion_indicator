@@ -242,6 +242,9 @@ Additional plot functions (weekly bare soil fraction per municipality, etc.) are
 FC predictions are stored as zarr at `~/mnt/eo-nas1/data/satellite/sentinel2/FC/`.  
 Weekly aggregated products are stored in `FC_mapping/CH_fraction_weekly_{yr}/`.
 
+> [!NOTE]
+> FC predictions were produced for all of Switzerland for 2021-2025. The `predict_FC_CH.py` script needs to be optimized (parallelised) to run faster over the whole time.
+
 ---
 
 ### 6. Rainfall Erosivity Index (`erosivity_index/`)
