@@ -1702,7 +1702,7 @@ def three_way_per_crop(cfg: dict, year: int, bridge: pd.DataFrame,
 
 def synthesis(cfg: dict, summ: Summary):
     """Plausibility per product/year + a short decision cheat-sheet."""
-    summ.section("C. SYNTHESIS -- strengths / weaknesses / decision hints")
+    summ.section("E. SYNTHESIS -- strengths / weaknesses / decision hints")
 
     summ.add("\nValue plausibility (per-pixel products) and reported range (R):")
     for year in cfg["years"]:
@@ -2312,7 +2312,7 @@ def plot_fc_per_crop(df_fc: pd.DataFrame, cfg: dict,
 def fc_timeseries_section(cfg: dict, lnf_bridge: dict,
                           crop_by_lnf: dict, crop_by_poly: dict | None,
                           summ: "Summary") -> None:
-    """Section E orchestrator: overall + per-crop FC curves, both years overlaid."""
+    """Section D orchestrator: overall + per-crop FC curves, both years overlaid."""
     df_fc = load_fc_timeseries(cfg, lnf_bridge, cfg["years"])
     if df_fc is None or df_fc.empty:
         return
@@ -2408,9 +2408,9 @@ def main():
                 three_way_per_crop(cfg, year, crop_bridge, lnf_bridge.get(year),
                                    crop_by_lnf, summ, crop_by_poly=crop_by_poly)
 
-    # D. tillage-stratified breakdown (needs R for the tillage map)
+    # C. tillage-stratified breakdown (needs R for the tillage map)
     if not a.skip_tillage and not a.skip_r:
-        summ.section("D. TILLAGE-STRATIFIED breakdown (Pflug vs Mulch)")
+        summ.section("C. TILLAGE-STRATIFIED breakdown (Pflug vs Mulch)")
         tillage_map = build_tillage_map(cfg, cfg["years"])
         if not a.skip_within:
             for year in cfg["years"]:
@@ -2423,12 +2423,12 @@ def main():
                                               lnf_bridge, crop_by_lnf,
                                               crop_by_poly, summ)
 
-    # E. FC time-series breakdown (calibration sample, region-restricted)
+    # D. FC time-series breakdown (calibration sample, region-restricted)
     if not a.skip_fc:
-        summ.section("E. FC TIME SERIES (calibration sample, year-to-year)")
+        summ.section("D. FC TIME SERIES (calibration sample, year-to-year)")
         fc_timeseries_section(cfg, lnf_bridge, crop_by_lnf, crop_by_poly, summ)
 
-    # C. synthesis
+    # E. synthesis
     synthesis(cfg, summ)
     summ.flush()
     print(f"\nDone. See {cfg['out_dir']}/")
