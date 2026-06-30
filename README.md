@@ -335,7 +335,8 @@ Based on a sample of pixels across Switzerland with known crop type and tillage 
 C_pixel = Σₜ exp(-β · fc_total(t)) · EI(t)  /  Σₜ EI(t)
 SLR(t) = exp(-β · fc_total(t)),    fc_total = (PV + NPV) × 100
 ```
-The full documentation on the development of these models, related code, and instructions for C-factor inference across Switzerland can be found in `Ledain_2026_Cfactor_documentation.pdf`.
+The full documentation on the development of these models, related code, and instructions for C-factor inference across Switzerland can be found in [`Ledain_2026_Cfactor_documentation.pdf`](https://zenodo.org/records/21061622?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6ImRiYjVlYTBlLTZmMzQtNGU4YS04YzIwLTg4MGVjMzA1ODk5ZiIsImRhdGEiOnt9LCJyYW5kb20iOiI4YjBiZTQwMmJjM2RjNmFiYTM3YTdjNzJiNDU3OTQ2OSJ9.UNCRjGFo5dDmr6Kfn5LtiCMeyJ5MhZksqqTcy-FLksfKTuoN818895y9m6AMz-lgxH38a19VLL1Ub7-DlZx5TQ) (also stored on the EO-NAS in the main folder of this project).
+
 
 
 ---
@@ -344,7 +345,7 @@ The full documentation on the development of these models, related code, and ins
 
 The C-factors produced by the ML and empirical function are compared to those obtained with the previous established method. A case study is performed for the district of Seeland, in Canton Bern. 
 
-Full description, code documentation and analysis is provided in `Ledain_2026_Cfactor_documentation.pdf`.
+Full description, code documentation and analysis is provided in [`Ledain_2026_Cfactor_documentation.pdf`](https://zenodo.org/records/21061622?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6ImRiYjVlYTBlLTZmMzQtNGU4YS04YzIwLTg4MGVjMzA1ODk5ZiIsImRhdGEiOnt9LCJyYW5kb20iOiI4YjBiZTQwMmJjM2RjNmFiYTM3YTdjNzJiNDU3OTQ2OSJ9.UNCRjGFo5dDmr6Kfn5LtiCMeyJ5MhZksqqTcy-FLksfKTuoN818895y9m6AMz-lgxH38a19VLL1Ub7-DlZx5TQ) (also stored on the EO-NAS in the main folder of this project).
 
 ---
 
